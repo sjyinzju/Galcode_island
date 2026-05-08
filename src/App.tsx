@@ -126,54 +126,21 @@ function App(): JSX.Element {
   // 子链所有 h-full / inset-0 单位都跟着正确
   return (
     <main className="relative h-[100dvh] w-screen overflow-hidden bg-slate-50 text-zinc-900 transition-colors dark:bg-[#0B1120] dark:text-zinc-100">
-      {/* Dynamic diffused light background */}
-      <motion.div
+      {/* 静态背景光晕。原本是 3 个 motion.div 跑无限 x/y/scale 动画 ——
+          scale 让 blur 层无法 cache，配合身后 backdrop-blur-2xl 玻璃层每帧
+          (64px filter + 40px backdrop) 双重模糊重算，GPU 永远停不下来 →
+          桌宠跟着抢 GPU 带宽变卡。改成静态后 backdrop-filter 整张缓存为
+          合成层，GPU 持续开销 ≈ 0。
+          18-22 秒一周期、低透明度的微小漂浮原本肉眼几乎察觉不到，去掉
+          视觉损失极小。 */}
+      <div
         className="pointer-events-none absolute inset-0"
         aria-hidden="true"
       >
-        {/* Sky blue blob — drifts slowly top-left */}
-        <motion.div
-          className="absolute -top-1/4 -left-1/4 h-[60%] w-[60%] rounded-full bg-sky-200/30 blur-3xl dark:bg-sky-400/15"
-          animate={{
-            x: [0, 30, -20, 15, 0],
-            y: [0, -20, 25, -10, 0],
-            scale: [1, 1.08, 0.95, 1.04, 1],
-          }}
-          transition={{
-            duration: 18,
-            repeat: Infinity,
-            ease: "easeInOut",
-          }}
-        />
-        {/* Orange-yellow accent blob — drifts slowly bottom-right */}
-        <motion.div
-          className="absolute -bottom-1/4 -right-1/4 h-[50%] w-[50%] rounded-full bg-amber-200/25 blur-3xl dark:bg-amber-400/10"
-          animate={{
-            x: [0, -25, 15, -10, 0],
-            y: [0, 20, -30, 15, 0],
-            scale: [1, 0.96, 1.06, 0.98, 1],
-          }}
-          transition={{
-            duration: 22,
-            repeat: Infinity,
-            ease: "easeInOut",
-          }}
-        />
-        {/* Secondary sky blue blob — center-right, larger, very subtle */}
-        <motion.div
-          className="absolute top-1/3 -right-1/6 h-[55%] w-[55%] rounded-full bg-sky-300/15 blur-3xl dark:bg-sky-500/8"
-          animate={{
-            x: [0, -18, 22, -8, 0],
-            y: [0, 15, -12, 20, 0],
-            scale: [1, 1.05, 0.97, 1.03, 1],
-          }}
-          transition={{
-            duration: 20,
-            repeat: Infinity,
-            ease: "easeInOut",
-          }}
-        />
-      </motion.div>
+        <div className="absolute -top-1/4 -left-1/4 h-[60%] w-[60%] rounded-full bg-sky-200/30 blur-3xl dark:bg-sky-400/15" />
+        <div className="absolute -bottom-1/4 -right-1/4 h-[50%] w-[50%] rounded-full bg-amber-200/25 blur-3xl dark:bg-amber-400/10" />
+        <div className="absolute top-1/3 -right-1/6 h-[55%] w-[55%] rounded-full bg-sky-300/15 blur-3xl dark:bg-sky-500/8" />
+      </div>
 
       {/* Glass container —— 桌面端 inset-2 浮起感；移动端贴边铺满，最大化可用区 */}
       <div className="absolute inset-0 overflow-hidden border border-white/60 bg-white/70 backdrop-blur-2xl sm:inset-2 sm:rounded-[22px] sm:shadow-[0_8px_40px_rgba(0,0,0,0.06)] dark:border-white/10 dark:bg-slate-800/60 dark:shadow-none">

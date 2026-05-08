@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { useActiveTab } from "../../hooks/useActiveTab";
+import { useActiveTabField } from "../../hooks/useActiveTab";
 import type { AgentStatus } from "../../types/agent";
 
 const OTHERS_GIFS: string[] = [
@@ -68,11 +68,14 @@ const SIZE_CLASSES: Record<PetSize, { wrap: string; img: string }> = {
   },
 };
 
-export function PetCharacter({ size = "default" }: PetCharacterProps): JSX.Element {
-  const tab = useActiveTab();
-  const uiState = tab.uiState;
-  const agentStatus = tab.agentStatus;
-  const mode = tab.mode;
+function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element {
+  // ③ 单字段订阅：原本 useActiveTab() 拿整 slice，cliBlocks/bubble/percent 等
+  // 任意字段变化都让 PetCharacter 重渲染。流式期 cliBlocks 每秒新增多次 → 桌宠
+  // 跟着每秒重渲染数十次。改为 useActiveTabField 后只订阅这三个真正影响视觉的
+  // 字段，无关字段抖动不再触发渲染。
+  const uiState = useActiveTabField("uiState");
+  const agentStatus = useActiveTabField("agentStatus");
+  const mode = useActiveTabField("mode");
 
   const visualState = useMemo(
     () => getVisualState(uiState, mode, agentStatus),
@@ -84,10 +87,13 @@ export function PetCharacter({ size = "default" }: PetCharacterProps): JSX.Eleme
   );
   const canSwapExpression = THINKING_STATUSES.has(agentStatus);
 
-  // Reset to default GIF whenever system state changes
+  // ① effect 依赖收窄：原本依赖 [visualState, uiState, agentStatus, mode]，
+  // 后三者跟着流式 status-changed 事件每秒变十几次 → setDisplayGif 反复重选
+  // 配合下面 <motion.img> 的 key 触发 unmount/remount → WKWebView 图像解码器
+  // 累积、释放跟不上 → 越播越慢。visualState 是这三者的稳定派生。
   useEffect(() => {
     setDisplayGif(pickRandomDefaultGif(visualState));
-  }, [visualState, uiState, agentStatus, mode]);
+  }, [visualState]);
 
   const handleClick = useCallback(() => {
     if (canSwapExpression) {
@@ -112,8 +118,11 @@ export function PetCharacter({ size = "default" }: PetCharacterProps): JSX.Eleme
       role="img"
       aria-label="桌宠角色"
     >
+      {/* ② 不带 key —— src 变化时 React 复用同一个 <img> DOM 节点（仅更新 src
+          属性），WKWebView 内部复用图像解码器；带 key 会 unmount 旧 + mount
+          新 → 旧解码器异步释放跟不上 → 越用越卡。
+          代价：跨 GIF 切换时不再有 motion 的 fade-in（仅组件首次挂载触发一次）。 */}
       <motion.img
-        key={displayGif}
         src={displayGif}
         alt="桌宠"
         initial={{ opacity: 0, scale: 0.85 }}
@@ -125,3 +134,8 @@ export function PetCharacter({ size = "default" }: PetCharacterProps): JSX.Eleme
     </motion.div>
   );
 }
+
+// ④ memo: PetCharacter 唯一外部 prop 是 size（稳定字符串字面量）。
+// 父级（MainView/RunningBubble/...）因 cliBlocks 等无关字段每秒重渲染时
+// 浅比较直接 hit cache，不再触发 PetCharacter 重新执行 render。
+export const PetCharacter = memo(PetCharacterImpl);
