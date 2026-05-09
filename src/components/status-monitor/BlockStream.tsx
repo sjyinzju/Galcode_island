@@ -441,6 +441,27 @@ export function BlockStream(): JSX.Element | null {
     }
   }, [activeMatch]);
 
+  // Agent 流式输出时自动跟随到底部；用户向上滚动则暂停跟随，回到底部附近又重新启用。
+  // key={activeTabId} 切 tab 时容器重挂载，ref 重置默认 true，新 tab 会自动滚到底。
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [blocks]);
+
+  const handleScroll = (): void => {
+    const el = containerRef.current;
+    if (!el) return;
+    // 32px 容差：用户在底部附近的细微反向滚动不算"想看历史"
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distance < 32;
+  };
+
   if (blocks.length === 0) return null;
 
   // key={activeTabId}：切 tab 时强制滚动容器重挂载，scrollTop 自然清零，
@@ -449,6 +470,8 @@ export function BlockStream(): JSX.Element | null {
   return (
     <div
       key={activeTabId ?? "no-tab"}
+      ref={containerRef}
+      onScroll={handleScroll}
       className="flex h-full flex-col gap-2 overflow-y-auto px-1 py-1 text-xs leading-relaxed"
     >
       {blocks.map((block) => {
