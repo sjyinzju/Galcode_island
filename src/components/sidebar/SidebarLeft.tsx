@@ -18,6 +18,7 @@ import { useAboutStore } from "../../stores/useAboutStore";
 import { ProjectTree } from "./ProjectTree";
 import { HistoryList } from "./HistoryList";
 import { SearchPanel } from "./SearchPanel";
+import { GitPanel } from "./GitPanel";
 
 const isMacOS = typeof navigator !== "undefined"
   && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
@@ -176,6 +177,19 @@ export function SidebarLeft(): JSX.Element {
           }
         />
         <MenuButton
+          label="Git"
+          active={leftSidebarView === "git"}
+          onClick={() => setLeftSidebarView("git")}
+          icon={
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3.5 w-3.5">
+              <circle cx="4" cy="4" r="1.5" />
+              <circle cx="4" cy="12" r="1.5" />
+              <circle cx="12" cy="6" r="1.5" />
+              <path d="M4 5.5v5M5.5 4h5a2 2 0 012 2" strokeLinecap="round" />
+            </svg>
+          }
+        />
+        <MenuButton
           label="搜索"
           active={leftSidebarView === "search"}
           onClick={() => setLeftSidebarView("search")}
@@ -193,6 +207,8 @@ export function SidebarLeft(): JSX.Element {
         <HistoryList />
       ) : leftSidebarView === "search" ? (
         <SearchPanel />
+      ) : leftSidebarView === "git" ? (
+        <GitPanel />
       ) : (
         <ProjectTree />
       )}

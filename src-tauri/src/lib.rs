@@ -29,6 +29,9 @@ use ipc::commands::{
     select_project_folder, set_click_through, start_agent, stop_agent, translate_only,
     update_backend_preferences, update_llm_settings,
 };
+use ipc::git::{
+    git_commit, git_diff, git_discard, git_pull, git_push, git_stage, git_status, git_unstage,
+};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -192,6 +195,15 @@ pub fn run() {
             lan_get_storage,
             lan_set_storage,
             lan_remove_storage,
+            // Git 面板
+            git_status,
+            git_diff,
+            git_stage,
+            git_unstage,
+            git_commit,
+            git_push,
+            git_pull,
+            git_discard,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -4,8 +4,8 @@
 import { create } from "zustand";
 import type { CliBlock } from "../types/blocks";
 
-/// 左栏中部当前显示哪个视图：项目树 / 历史会话 / 搜索
-export type LeftSidebarView = "projects" | "history" | "search";
+/// 左栏中部当前显示哪个视图：项目树 / 历史会话 / Git / 搜索
+export type LeftSidebarView = "projects" | "history" | "git" | "search";
 
 interface UiState {
   /// 右栏当前打开的"块详情"。null 表示右栏收起。
