@@ -299,29 +299,42 @@ export const useTabsStore = create<TabsStoreState>()(
         nextActive = nextOrder[Math.max(0, idx - 1)] ?? nextOrder[0] ?? null;
       }
 
-      // 归档到 history：保留核心元数据 + 上次结果，丢弃 cliBlocks / pending* 等大字段
-      const summary =
-        (tab.lastUserPrompt && tab.lastUserPrompt.trim()) ||
-        (tab.task && tab.task.trim().slice(0, 80)) ||
-        tab.title ||
-        "新会话";
-      const archived: ArchivedSession = {
-        id: tab.id,
-        closedAt: Date.now(),
-        createdAt: tab.createdAt,
-        agent: tab.agent,
-        projectPath: tab.projectPath,
-        summary,
-        sessionId: tab.sessionId,
-        agentNativeSessionId: tab.agentNativeSessionId,
-        summaryTranslation: tab.summaryTranslation,
-        emotionText: tab.emotionText,
-        resultZh: tab.resultZh,
-        suggestionOptions: tab.suggestionOptions,
-      };
-      // 同 id 已在 history（极少见，比如 reattach 失败后重 close）→ 替换
-      const filtered = state.history.filter((h) => h.id !== archived.id);
-      const nextHistory = [archived, ...filtered].slice(0, HISTORY_LIMIT);
+      // 空会话不归档：从没启动过任务、没流式内容、没结果、没 backend session
+      // → 关闭时直接丢弃，避免 history 里堆满"新会话 / 未选择目录"的空壳
+      // 让 GlobalOverview / ProjectOverview / 历史面板列表保持有意义。
+      const hasContent =
+        (tab.lastUserPrompt && tab.lastUserPrompt.trim().length > 0) ||
+        tab.cliBlocks.length > 0 ||
+        Boolean(tab.summaryTranslation?.trim()) ||
+        Boolean(tab.resultZh?.trim()) ||
+        Boolean(tab.agentNativeSessionId);
+
+      let nextHistory = state.history;
+      if (hasContent) {
+        // 归档到 history：保留核心元数据 + 上次结果，丢弃 cliBlocks / pending* 等大字段
+        const summary =
+          (tab.lastUserPrompt && tab.lastUserPrompt.trim()) ||
+          (tab.task && tab.task.trim().slice(0, 80)) ||
+          tab.title ||
+          "新会话";
+        const archived: ArchivedSession = {
+          id: tab.id,
+          closedAt: Date.now(),
+          createdAt: tab.createdAt,
+          agent: tab.agent,
+          projectPath: tab.projectPath,
+          summary,
+          sessionId: tab.sessionId,
+          agentNativeSessionId: tab.agentNativeSessionId,
+          summaryTranslation: tab.summaryTranslation,
+          emotionText: tab.emotionText,
+          resultZh: tab.resultZh,
+          suggestionOptions: tab.suggestionOptions,
+        };
+        // 同 id 已在 history（极少见，比如 reattach 失败后重 close）→ 替换
+        const filtered = state.history.filter((h) => h.id !== archived.id);
+        nextHistory = [archived, ...filtered].slice(0, HISTORY_LIMIT);
+      }
 
       return {
         tabs: nextTabs,
@@ -442,6 +455,31 @@ export const useTabsStore = create<TabsStoreState>()(
     // 用归档元数据创建新 tab。**不复用原 id**：原 id 可能跟某个被 reattach
     // 出来的活跃 tab 撞 id；新 UUID 安全。后端 last_session_per_context 会
     // 按 (agent, cwd) 自动 resume，不依赖前端 runId。
+    //
+    // 合成几条 cliBlock 注入流式区：原始 prompt（用户气泡）+ 中文摘要回应。
+    // 这样恢复的 tab 看起来跟"刚跑完的会话"一致 —— MainView 直接走 StatusMonitor +
+    // ResultCard，而不会因为 cliBlocks 为空被当成"新空 tab"显示 ProjectOverview。
+    // archived 不持久化原始 cliBlocks（防 localStorage 撑爆），合成块只是"回顾"
+    // 视觉骨架；用户继续追问时新的真实 block 自然接在后面。
+    const synthesizedBlocks: CliBlock[] = [];
+    const promptText = archived.summary?.trim();
+    if (promptText) {
+      synthesizedBlocks.push({
+        id: `restored-prompt-${archived.id}`,
+        type: "user-prompt",
+        content: promptText,
+      });
+    }
+    const responseText =
+      (archived.resultZh || archived.summaryTranslation || "").trim();
+    if (responseText) {
+      synthesizedBlocks.push({
+        id: `restored-text-${archived.id}`,
+        type: "text",
+        content: responseText,
+      });
+    }
+
     const newId = get().createTab({
       title: archived.summary.slice(0, 40),
       agent: archived.agent,
@@ -453,6 +491,7 @@ export const useTabsStore = create<TabsStoreState>()(
       emotionText: archived.emotionText,
       resultZh: archived.resultZh,
       suggestionOptions: archived.suggestionOptions,
+      cliBlocks: synthesizedBlocks,
       // 有 summary 就让 ResultCard 直接显示上次结果
       mode: archived.summaryTranslation || archived.emotionText ? "complete" : "idle",
       uiState: archived.summaryTranslation || archived.emotionText ? "done" : "idle",

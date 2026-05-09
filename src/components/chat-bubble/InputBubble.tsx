@@ -4,6 +4,7 @@ import { invoke } from "../../lib/bridge";
 import { useAppStore } from "../../stores/useAppStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { useTabsStore } from "../../stores/useTabsStore";
+import { useActivityStore } from "../../stores/useActivityStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { PetCharacter } from "../pet-character/PetCharacter";
 
@@ -96,6 +97,12 @@ export function InputBubble(): JSX.Element {
       if (res?.sessionId) {
         update({ sessionId: res.sessionId });
       }
+      // start_agent 成功才计入当天活跃 —— 失败的尝试不该把今天点亮
+      useActivityStore.getState().recordActivity({
+        projectPath,
+        agent: tab.agent,
+        prompt: task.trim(),
+      });
     } catch (err) {
       addLogEntry({
         timestamp: Date.now(),

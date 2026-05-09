@@ -2,6 +2,7 @@ import { invoke } from "../../lib/bridge";
 import { useRef, useState, type KeyboardEvent } from "react";
 import { useAppStore } from "../../stores/useAppStore";
 import { useTabsStore } from "../../stores/useTabsStore";
+import { useActivityStore } from "../../stores/useActivityStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { motion, AnimatePresence } from "framer-motion";
 import { PetCharacter } from "../pet-character/PetCharacter";
@@ -66,6 +67,12 @@ export function ResultCard(): JSX.Element {
         sessionId: resumeHint,
       });
       if (res?.sessionId) update({ sessionId: res.sessionId });
+      // 计入当天活跃 —— 跟 InputBubble 启动路径口径一致
+      useActivityStore.getState().recordActivity({
+        projectPath: tab.projectPath,
+        agent: tab.agent,
+        prompt: opt,
+      });
     } catch (err) {
       addLogEntry({
         timestamp: Date.now(),

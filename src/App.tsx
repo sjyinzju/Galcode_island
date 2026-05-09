@@ -3,7 +3,6 @@ import { invoke, isTauri } from "./lib/bridge";
 import { useEffect, useMemo } from "react";
 import { MainView } from "./components/MainView";
 import { MobileTopBar } from "./components/MobileTopBar";
-import { WelcomeView } from "./components/welcome/WelcomeView";
 import { SettingsModal } from "./components/settings/SettingsModal";
 import { ProfileModal } from "./components/profile/ProfileModal";
 import { SidebarLeft } from "./components/sidebar/SidebarLeft";
@@ -17,12 +16,10 @@ import { useLanProjectsSync } from "./hooks/useLanProjectsSync";
 import { useTabsReattach } from "./hooks/useTabsReattach";
 import { useThemeHotkey } from "./hooks/useThemeHotkey";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
-import { useAppStore } from "./stores/useAppStore";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useProfileStore } from "./stores/useProfileStore";
 
 function App(): JSX.Element {
-  const isStarted = useAppStore((state) => state.isStarted);
   const mobileLeftDrawerOpen = useUiStore((s) => s.mobileLeftDrawerOpen);
   const closeMobileLeftDrawer = useUiStore((s) => s.closeMobileLeftDrawer);
 
@@ -74,12 +71,13 @@ function App(): JSX.Element {
 
   // 桌面端三栏；移动端 (<lg) 单栏 + 抽屉：
   //   - 顶部 MobileTopBar（汉堡 → 左栏抽屉 / 设置）
-  //   - 中部 MainView 占满
+  //   - 中部 MainView 占满；没活动 tab 时由 MainView 内部渲染 GlobalOverview，
+  //     有活动 tab 但流式区为空时渲染 ProjectOverview，让"未启动 / 空 tab"
+  //     场景也保持三栏布局而不是切到独立画面
   //   - SidebarLeft 在 <lg 时绝对定位 + translate-x 控制开合，背后加遮罩点击关闭
   //   - SidebarRight 在 <lg 时全屏覆盖（保留 detailBlock 详情体验）
   //   - 桌宠 / 立绘 / 结果卡 / 凉宫春日总结由 MainView 内部继续渲染，移动端不变
   const currentScreen = useMemo(() => {
-    if (!isStarted) return <WelcomeView />;
     return (
       <div className="relative flex h-full w-full flex-col lg:flex-row">
         {/* 移动端顶栏：汉堡 / 当前项目 / 设置 —— 桌面端隐藏 */}
@@ -119,7 +117,7 @@ function App(): JSX.Element {
         <InPageSearch />
       </div>
     );
-  }, [isStarted, mobileLeftDrawerOpen, closeMobileLeftDrawer]);
+  }, [mobileLeftDrawerOpen, closeMobileLeftDrawer]);
 
   // 100dvh 而非 100vh：移动浏览器底部地址栏会算进 100vh 但实际遮挡内容；
   // 100dvh = dynamic viewport height，浏览器栏显隐时自动 reflow，
@@ -147,7 +145,7 @@ function App(): JSX.Element {
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_18%,rgba(255,255,255,0.3),transparent_38%),radial-gradient(circle_at_88%_82%,rgba(0,0,0,0.04),transparent_30%)] dark:bg-[radial-gradient(circle_at_12%_18%,rgba(255,255,255,0.04),transparent_38%),radial-gradient(circle_at_88%_82%,rgba(255,255,255,0.02),transparent_30%)]" />
         <AnimatePresence mode="wait">
           <motion.div
-            key={isStarted ? "main" : "welcome"}
+            key="main"
             initial={{ opacity: 0, scale: 0.985 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.985 }}
