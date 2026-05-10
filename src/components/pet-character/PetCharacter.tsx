@@ -2,8 +2,12 @@ import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { useActiveTabField } from "../../hooks/useActiveTab";
 import type { AgentStatus } from "../../types/agent";
+import {
+  usePetAssetsStore,
+  type PetCategory,
+} from "../../stores/usePetAssetsStore";
 
-const OTHERS_GIFS: string[] = [
+const DEFAULT_OTHERS_GIFS: string[] = [
   "/pet/others/对手指.gif",
   "/pet/others/thinking_2.gif",
   "/pet/others/启动.gif",
@@ -22,7 +26,8 @@ function getVisualState(uiState: string, mode: string, agentStatus: AgentStatus)
   return "waiting";
 }
 
-function pickRandomDefaultGif(state: PetVisualState): string {
+/// 默认（内置）资源池：保留原有"按 visualState_N.gif 命名 + welcome 单张"规则。
+function pickDefaultGif(state: PetVisualState): string {
   if (state === "welcome") return "/pet/welcome/welcome.gif";
   const maxMap: Record<string, number> = {
     thinking: 2,
@@ -35,8 +40,40 @@ function pickRandomDefaultGif(state: PetVisualState): string {
   return `/pet/${state}/${state}_${n}.gif`;
 }
 
-function pickRandomOthersGif(): string {
-  return OTHERS_GIFS[Math.floor(Math.random() * OTHERS_GIFS.length)];
+function pickDefaultOthersGif(): string {
+  return DEFAULT_OTHERS_GIFS[Math.floor(Math.random() * DEFAULT_OTHERS_GIFS.length)]!;
+}
+
+/// PetVisualState → 自定义 store 类别（一一对应）。
+const VISUAL_TO_CATEGORY: Record<PetVisualState, PetCategory> = {
+  welcome: "welcome",
+  thinking: "thinking",
+  waiting: "waiting",
+  complete: "complete",
+  error: "error",
+};
+
+/// 在自定义模式下取一张图：
+///   - 若该类有图 → 随机一张（用 blobUrls 转出来的 ObjectURL）
+///   - 若该类暂时没图（不应发生，setEnabled 校验过；但用户可能在 enabled 期间删空再被
+///     auto-disable 之前的极短时间窗）→ fallback 到默认
+function pickCustomGif(
+  state: PetVisualState,
+  metaList: { id: string }[],
+  urlMap: Record<string, string>,
+): string {
+  if (metaList.length === 0) return pickDefaultGif(state);
+  const meta = metaList[Math.floor(Math.random() * metaList.length)]!;
+  return urlMap[meta.id] ?? pickDefaultGif(state);
+}
+
+function pickCustomOthersGif(
+  metaList: { id: string }[],
+  urlMap: Record<string, string>,
+): string {
+  if (metaList.length === 0) return pickDefaultOthersGif();
+  const meta = metaList[Math.floor(Math.random() * metaList.length)]!;
+  return urlMap[meta.id] ?? pickDefaultOthersGif();
 }
 
 const THINKING_STATUSES: ReadonlySet<AgentStatus> = new Set<AgentStatus>([
@@ -77,29 +114,58 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
   const agentStatus = useActiveTabField("agentStatus");
   const mode = useActiveTabField("mode");
 
+  // 自定义桌宠资源（开关 + 各类元数据 + ObjectURL 映射）
+  const customEnabled = usePetAssetsStore((s) => s.enabled);
+  const customAssets = usePetAssetsStore((s) => s.assets);
+  const customBlobUrls = usePetAssetsStore((s) => s.blobUrls);
+
   const visualState = useMemo(
     () => getVisualState(uiState, mode, agentStatus),
     [uiState, mode, agentStatus],
   );
 
-  const [displayGif, setDisplayGif] = useState<string>(() =>
-    pickRandomDefaultGif(visualState),
-  );
+  /// 用 ID 列表 + URL map 算一个稳定 token（每类拼成 "id1,id2,..."）
+  /// 让"用户上传 / 删除 / hydrate URL"这些写入也能触发当前 visualState 的重抽。
+  /// 不直接用 customAssets / customBlobUrls 引用做依赖，是因为它们引用每次 set
+  /// 都会变（即便 state 未涉及当前类别），会触发不必要的换图。
+  const customCategoryToken = useMemo(() => {
+    if (!customEnabled) return "default";
+    const cat = VISUAL_TO_CATEGORY[visualState];
+    return customAssets[cat]
+      .map((m) => `${m.id}:${customBlobUrls[m.id] ? "y" : "n"}`)
+      .join(",");
+  }, [customEnabled, visualState, customAssets, customBlobUrls]);
+
+  const [displayGif, setDisplayGif] = useState<string>(() => {
+    if (customEnabled) {
+      return pickCustomGif(visualState, customAssets[VISUAL_TO_CATEGORY[visualState]], customBlobUrls);
+    }
+    return pickDefaultGif(visualState);
+  });
   const canSwapExpression = THINKING_STATUSES.has(agentStatus);
 
-  // ① effect 依赖收窄：原本依赖 [visualState, uiState, agentStatus, mode]，
-  // 后三者跟着流式 status-changed 事件每秒变十几次 → setDisplayGif 反复重选
-  // 配合下面 <motion.img> 的 key 触发 unmount/remount → WKWebView 图像解码器
-  // 累积、释放跟不上 → 越播越慢。visualState 是这三者的稳定派生。
+  // ① effect 依赖收窄：visualState 是 ui/agent/mode 的稳定派生，避免流式刷新反复换图。
+  // 自定义模式下额外订阅 customCategoryToken，让"上传 / 删除 / hydrate" 事件
+  // 也能让当前画面切到刚加入的图。
   useEffect(() => {
-    setDisplayGif(pickRandomDefaultGif(visualState));
-  }, [visualState]);
+    if (customEnabled) {
+      const cat = VISUAL_TO_CATEGORY[visualState];
+      setDisplayGif(pickCustomGif(visualState, customAssets[cat], customBlobUrls));
+    } else {
+      setDisplayGif(pickDefaultGif(visualState));
+    }
+    // customAssets/customBlobUrls 通过 customCategoryToken 间接表达，避免因引用抖动多触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visualState, customEnabled, customCategoryToken]);
 
   const handleClick = useCallback(() => {
-    if (canSwapExpression) {
-      setDisplayGif(pickRandomOthersGif());
+    if (!canSwapExpression) return;
+    if (customEnabled) {
+      setDisplayGif(pickCustomOthersGif(customAssets.others, customBlobUrls));
+    } else {
+      setDisplayGif(pickDefaultOthersGif());
     }
-  }, [canSwapExpression]);
+  }, [canSwapExpression, customEnabled, customAssets, customBlobUrls]);
 
   const { wrap, img } = SIZE_CLASSES[size];
 
