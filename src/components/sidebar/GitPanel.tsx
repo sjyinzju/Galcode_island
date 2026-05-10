@@ -4,8 +4,11 @@
 //   - 进入面板 + 切 tab + 手动刷新 → invoke("git_status", { cwd })
 //   - 列表分三组：Staged / Changes / Untracked，每行 hover 出 stage/unstage/discard 操作
 //   - 点击文件 → invoke("git_diff", { cwd, path, staged, untracked }) → 弹出全屏 diff 浮层
-//   - Commit message 输入 + 提交：调用 git_commit；可选 stageAll
-//   - 顶部按钮：刷新 / pull / push；分支 + ahead/behind 标签
+//   - 底部按钮：仿 VSCode 二合一 ——
+//       有变更 → "提交"（按 stageAll 一次性提交；空 message 时 disabled）
+//       无变更但 ahead/behind ≠ 0 → "同步更改"（先 pull --ff-only 再 push）
+//       都没有 → 按钮 disabled，提示"已是最新"
+//   - 顶部工具栏：刷新 / 历史图表（toggle 切换中部内容为 GitHistoryGraph，淡入淡出过渡）
 //
 // 设计：仓库列表轮询不主动开（避免没人看的 tab 也轮询）；面板可见时挂一个 6s 间隔
 // 的 setInterval 自动刷新，足够同步外部 git 操作（用户切回来也能看到最新状态）。
@@ -15,6 +18,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "../../lib/bridge";
 import { useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
+import { GitDiffViewer } from "./GitDiffViewer";
+import { GitHistoryGraph } from "./GitHistoryGraph";
 
 interface GitFileEntry {
   path: string;
@@ -143,99 +148,7 @@ function FileRow({
   );
 }
 
-interface DiffViewerProps {
-  cwd: string;
-  file: GitFileEntry;
-  onClose: () => void;
-}
-
-/// diff 浮层：覆盖中栏，单色等宽，按 +/- 染色。
-function DiffViewer({ cwd, file, onClose }: DiffViewerProps): JSX.Element {
-  const [diff, setDiff] = useState<string>("");
-  const [empty, setEmpty] = useState<boolean>(false);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    invoke<GitDiffResult>("git_diff", {
-      cwd,
-      path: file.path,
-      staged: file.staged,
-      untracked: file.untracked,
-    })
-      .then((res) => {
-        if (cancelled) return;
-        setDiff(res.diff);
-        setEmpty(res.empty);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [cwd, file.path, file.staged, file.untracked]);
-
-  // 把 diff 文本拆成行，按前缀染色
-  const lines = useMemo(() => {
-    return diff.split("\n").map((line, i) => {
-      let cls = "text-zinc-300";
-      if (line.startsWith("+++") || line.startsWith("---")) cls = "text-zinc-400";
-      else if (line.startsWith("+")) cls = "bg-emerald-500/10 text-emerald-300";
-      else if (line.startsWith("-")) cls = "bg-rose-500/10 text-rose-300";
-      else if (line.startsWith("@@")) cls = "text-amber-300";
-      else if (line.startsWith("diff ")) cls = "text-sky-300";
-      return (
-        <div key={i} className={`px-2 ${cls}`}>
-          {line || " "}
-        </div>
-      );
-    });
-  }, [diff]);
-
-  return (
-    <div className="absolute inset-0 z-10 flex flex-col bg-white/95 backdrop-blur-md dark:bg-zinc-900/95">
-      <div className="flex shrink-0 items-center gap-2 border-b border-black/5 px-3 py-2 dark:border-white/5">
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="返回"
-          className="flex h-6 w-6 items-center justify-center rounded text-zinc-500 transition-colors hover:bg-black/5 hover:text-zinc-800 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-zinc-100"
-        >
-          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3 w-3">
-            <path d="M7.5 2.5L4 6l3.5 3.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </button>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[12px] font-medium text-zinc-800 dark:text-zinc-100">
-            {file.path}
-          </div>
-          <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
-            {file.staged ? "已暂存" : file.untracked ? "未跟踪" : "未暂存"}
-          </div>
-        </div>
-      </div>
-      <div className="min-h-0 flex-1 overflow-auto bg-zinc-900 font-mono text-[11px] leading-relaxed">
-        {loading ? (
-          <div className="p-4 text-center text-zinc-400">加载中…</div>
-        ) : error ? (
-          <div className="p-4 text-rose-400">读取失败：{error}</div>
-        ) : empty ? (
-          <div className="p-4 text-center text-zinc-400">无变更</div>
-        ) : (
-          <div className="py-1">{lines}</div>
-        )}
-      </div>
-    </div>
-  );
-}
+type ViewMode = "changes" | "history";
 
 export function GitPanel(): JSX.Element {
   const projectPath = useActiveTabField("projectPath");
@@ -248,6 +161,9 @@ export function GitPanel(): JSX.Element {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [viewingFile, setViewingFile] = useState<GitFileEntry | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("changes");
+  /// 用单调递增的 key 让历史图表知道何时该重新拉取（每次 commit / sync 后 +1）
+  const [historyReloadKey, setHistoryReloadKey] = useState<number>(0);
   // 切 tab 时上一份 status 立刻失效，避免短暂闪现旧仓库数据
   const requestSeqRef = useRef(0);
 
@@ -380,6 +296,7 @@ export function GitPanel(): JSX.Element {
         });
         setCommitMessage("");
         setActionFeedback(`已提交 ${res.commitHash.slice(0, 7)}：${res.summary}`);
+        setHistoryReloadKey((k) => k + 1);
       },
     );
   };
@@ -409,6 +326,7 @@ export function GitPanel(): JSX.Element {
         }
         if (messages.length === 0) messages.push("已是最新");
         setActionFeedback(messages.join(" · "));
+        setHistoryReloadKey((k) => k + 1);
       },
     );
 
@@ -483,23 +401,21 @@ export function GitPanel(): JSX.Element {
           </button>
           <button
             type="button"
-            onClick={() => void doSync()}
-            disabled={busyAction !== null}
-            title="先 pull 再 push（VSCode 风格的同步更改）"
-            className="flex h-6 flex-1 items-center justify-center gap-1 rounded text-[11px] text-sky-600 transition-colors hover:bg-sky-400/10 disabled:opacity-50 dark:text-sky-300 dark:hover:bg-sky-300/10"
+            onClick={() => setViewMode((m) => (m === "history" ? "changes" : "history"))}
+            title={viewMode === "history" ? "返回更改列表" : "查看提交历史图"}
+            className={`flex h-6 flex-1 items-center justify-center gap-1 rounded text-[11px] transition-colors ${
+              viewMode === "history"
+                ? "bg-sky-400/15 text-sky-700 dark:bg-sky-400/15 dark:text-sky-200"
+                : "text-zinc-500 hover:bg-black/5 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-zinc-200"
+            }`}
           >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className={`h-3 w-3 ${busyAction === "sync" ? "animate-spin" : ""}`}>
-              <path d="M2.5 8a5.5 5.5 0 019.6-3.6M13.5 8a5.5 5.5 0 01-9.6 3.6" strokeLinecap="round" />
-              <path d="M11.5 2v2.5h-2.5M4.5 14v-2.5h2.5" strokeLinecap="round" strokeLinejoin="round" />
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
+              <circle cx="4" cy="3.5" r="1.4" />
+              <circle cx="4" cy="12.5" r="1.4" />
+              <circle cx="11.5" cy="8" r="1.4" />
+              <path d="M4 5v6M5.4 3.5h4.7a2 2 0 012 2v0.5M5.4 12.5h4.7a2 2 0 002-2V10" strokeLinecap="round" />
             </svg>
-            同步更改
-            {status && (status.ahead > 0 || status.behind > 0) ? (
-              <span className="ml-0.5 font-mono text-[10px] opacity-80">
-                {status.behind > 0 ? `↓${status.behind}` : ""}
-                {status.ahead > 0 && status.behind > 0 ? " " : ""}
-                {status.ahead > 0 ? `↑${status.ahead}` : ""}
-              </span>
-            ) : null}
+            历史图表
           </button>
         </div>
       </div>
@@ -516,8 +432,13 @@ export function GitPanel(): JSX.Element {
         </div>
       ) : null}
 
-      {/* 文件列表 */}
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 py-2">
+      {/* 中部内容：changes 视图 与 history 视图 叠加，opacity 切换实现淡入淡出 */}
+      <div className="relative min-h-0 flex-1">
+        <div
+          className={`absolute inset-0 flex flex-col gap-3 overflow-y-auto px-2 py-2 transition-opacity duration-300 ${
+            viewMode === "changes" ? "opacity-100" : "pointer-events-none opacity-0"
+          }`}
+        >
         {totalFiles === 0 ? (
           <div className="flex flex-1 items-center justify-center text-center text-[11px] text-zinc-400 dark:text-zinc-500">
             工作区干净，暂无变更
@@ -619,49 +540,119 @@ export function GitPanel(): JSX.Element {
             </div>
           </div>
         ) : null}
-      </div>
+        </div>
 
-      {/* 提交区 */}
-      <div className="shrink-0 border-t border-black/5 px-2 py-2 dark:border-white/5">
-        <textarea
-          value={commitMessage}
-          onChange={(e) => setCommitMessage(e.target.value)}
-          placeholder="输入提交信息（Cmd/Ctrl + Enter 提交）"
-          rows={2}
-          onKeyDown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && commitMessage.trim()) {
-              e.preventDefault();
-              void doCommit();
-            }
-          }}
-          className="w-full resize-none rounded-md border border-white/40 bg-white/40 px-2 py-1.5 text-[12px] text-zinc-800 placeholder:text-zinc-400 focus:border-sky-400/45 focus:outline-none focus:ring-0 dark:border-white/10 dark:bg-zinc-800/40 dark:text-zinc-100 dark:placeholder:text-zinc-500"
-        />
-        <div className="mt-1 flex items-center justify-between gap-1.5">
-          <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-zinc-500 dark:text-zinc-400">
-            <input
-              type="checkbox"
-              checked={stageAllOnCommit}
-              onChange={(e) => setStageAllOnCommit(e.target.checked)}
-              className="h-3 w-3 accent-sky-500"
-            />
-            提交全部改动
-          </label>
-          <button
-            type="button"
-            onClick={() => void doCommit()}
-            disabled={!commitMessage.trim() || busyAction !== null}
-            className="rounded-md bg-sky-500/85 px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500 dark:disabled:bg-zinc-700 dark:disabled:text-zinc-500"
-          >
-            {busyAction === "commit" ? "提交中…" : "提交"}
-          </button>
+        {/* 历史图表视图：与 changes 叠在同一容器，不渲染时仍保持 mounted 让淡出动画完整 */}
+        <div
+          className={`absolute inset-0 flex flex-col transition-opacity duration-300 ${
+            viewMode === "history" ? "opacity-100" : "pointer-events-none opacity-0"
+          }`}
+        >
+          {projectPath ? (
+            <GitHistoryGraph cwd={projectPath} reloadKey={historyReloadKey} />
+          ) : null}
         </div>
       </div>
 
-      {/* diff 浮层 */}
+      {/* 提交 / 同步区 —— 仿 VSCode 单按钮二合一：
+          - 有任何改动 → 显示"提交"，需要 commit message；按 stageAll 一次性提交
+          - 没改动但 ahead/behind ≠ 0 → 显示"同步更改"
+          - 全都没有 → 按钮 disabled，仅作占位 */}
+      {(() => {
+        const ahead = status?.ahead ?? 0;
+        const behind = status?.behind ?? 0;
+        const canSync = totalFiles === 0 && (ahead > 0 || behind > 0);
+        const showSync = canSync;
+        const buttonLabel = showSync
+          ? busyAction === "sync"
+            ? "同步中…"
+            : "同步更改"
+          : busyAction === "commit"
+            ? "提交中…"
+            : "提交";
+        const buttonDisabled = busyAction !== null
+          || (showSync ? false : (totalFiles === 0 || !commitMessage.trim()));
+        const buttonOnClick = (): void => {
+          if (showSync) void doSync();
+          else void doCommit();
+        };
+
+        return (
+          <div className="shrink-0 border-t border-black/5 px-2 py-2 dark:border-white/5">
+            <textarea
+              value={commitMessage}
+              onChange={(e) => setCommitMessage(e.target.value)}
+              placeholder={
+                showSync
+                  ? "工作区干净 — 按下方按钮可推/拉同步"
+                  : "输入提交信息（Cmd/Ctrl + Enter 提交）"
+              }
+              rows={2}
+              disabled={showSync}
+              onKeyDown={(e) => {
+                if (showSync) return;
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && commitMessage.trim()) {
+                  e.preventDefault();
+                  void doCommit();
+                }
+              }}
+              className={`w-full resize-none rounded-md border border-white/40 bg-white/40 px-2 py-1.5 text-[12px] text-zinc-800 placeholder:text-zinc-400 focus:border-sky-400/45 focus:outline-none focus:ring-0 dark:border-white/10 dark:bg-zinc-800/40 dark:text-zinc-100 dark:placeholder:text-zinc-500 ${
+                showSync ? "cursor-not-allowed opacity-60" : ""
+              }`}
+            />
+            <div className="mt-1 flex items-center justify-between gap-1.5">
+              {showSync ? (
+                <span className="shrink-0 font-mono text-[10px] text-zinc-500 dark:text-zinc-400">
+                  {behind > 0 ? `↓${behind}` : ""}
+                  {ahead > 0 && behind > 0 ? " " : ""}
+                  {ahead > 0 ? `↑${ahead}` : ""}
+                </span>
+              ) : (
+                <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+                  <input
+                    type="checkbox"
+                    checked={stageAllOnCommit}
+                    onChange={(e) => setStageAllOnCommit(e.target.checked)}
+                    className="h-3 w-3 accent-sky-500"
+                  />
+                  提交全部改动
+                </label>
+              )}
+              <button
+                type="button"
+                onClick={buttonOnClick}
+                disabled={buttonDisabled}
+                className="flex items-center gap-1 rounded-md bg-sky-500/85 px-3 py-1 text-[11px] font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500 dark:disabled:bg-zinc-700 dark:disabled:text-zinc-500"
+              >
+                {showSync ? (
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={`h-3 w-3 ${busyAction === "sync" ? "animate-spin" : ""}`}>
+                    <path d="M2.5 8a5.5 5.5 0 019.6-3.6M13.5 8a5.5 5.5 0 01-9.6 3.6" strokeLinecap="round" />
+                    <path d="M11.5 2v2.5h-2.5M4.5 14v-2.5h2.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                ) : null}
+                {buttonLabel}
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* diff 浮层 —— 工作区 / 暂存区 / 未跟踪都走 git_diff */}
       {viewingFile && projectPath ? (
-        <DiffViewer
-          cwd={projectPath}
-          file={viewingFile}
+        <GitDiffViewer
+          title={viewingFile.path}
+          subtitle={
+            viewingFile.staged ? "已暂存" : viewingFile.untracked ? "未跟踪" : "未暂存"
+          }
+          loaderKey={`workdir:${viewingFile.path}:${viewingFile.staged}:${viewingFile.untracked}`}
+          loader={() =>
+            invoke<GitDiffResult>("git_diff", {
+              cwd: projectPath,
+              path: viewingFile.path,
+              staged: viewingFile.staged,
+              untracked: viewingFile.untracked,
+            })
+          }
           onClose={() => setViewingFile(null)}
         />
       ) : null}

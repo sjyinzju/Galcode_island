@@ -323,6 +323,142 @@ pub fn git_pull(cwd: String) -> Result<GitPullResult, String> {
     Ok(GitPullResult { stdout, stderr })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommit {
+    pub hash: String,
+    pub short_hash: String,
+    pub author: String,
+    /// Unix epoch 秒，前端做相对时间显示
+    pub timestamp: i64,
+    /// 父 commit 的完整 hash 列表；空数组 = root commit；2+ = merge commit
+    pub parents: Vec<String>,
+    pub subject: String,
+    /// 该 commit 上面挂的 ref（branch / tag），用于像 VSCode 一样在节点旁打标签
+    pub refs: Vec<String>,
+}
+
+/// 取最近 `limit` 条提交（默认 200，上限 1000，避免一次拉爆）。
+/// 用 `--all` + `--date-order` 让分支线在前端图里能正确展开。
+/// 字段间用 ASCII 0x1F (Unit Separator) 分隔，避免 subject 里的特殊字符干扰解析。
+#[tauri::command]
+pub fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
+    let n = limit.unwrap_or(200).min(1000);
+    let n_arg = format!("-n{n}");
+    let fmt = "--pretty=format:%H\u{1f}%h\u{1f}%an\u{1f}%at\u{1f}%P\u{1f}%D\u{1f}%s";
+    let (ok, stdout, stderr) = run_git(
+        &cwd,
+        &["log", "--all", "--date-order", n_arg.as_str(), fmt],
+    )?;
+    if !ok {
+        return Err(stderr.trim().to_string());
+    }
+    let mut commits: Vec<GitCommit> = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(7, '\u{1f}').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let parents: Vec<String> = parts[4]
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        // %D 输出形如 "HEAD -> main, origin/main, tag: v1.0"，按逗号拆分后清理 prefix
+        let refs: Vec<String> = if parts[5].is_empty() {
+            Vec::new()
+        } else {
+            parts[5]
+                .split(", ")
+                .map(|r| {
+                    r.trim()
+                        .trim_start_matches("HEAD -> ")
+                        .trim_start_matches("tag: ")
+                        .to_string()
+                })
+                .filter(|r| !r.is_empty() && r != "HEAD")
+                .collect()
+        };
+        commits.push(GitCommit {
+            hash: parts[0].to_string(),
+            short_hash: parts[1].to_string(),
+            author: parts[2].to_string(),
+            timestamp: parts[3].parse().unwrap_or(0),
+            parents,
+            refs,
+            subject: parts[6].to_string(),
+        });
+    }
+    Ok(commits)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFile {
+    /// 仓库根相对路径（重命名时取目标路径）
+    pub path: String,
+    /// 一字符状态码：M / A / D / R / C / T / U
+    pub status: String,
+}
+
+/// 列出某个 commit 修改了哪些文件 + 各自的状态。
+/// 用 `git show --name-status --format=`：清空 commit header，只剩状态行，
+/// 每行形如 `M\tpath` 或 `R100\told\tnew`。
+#[tauri::command]
+pub fn git_show_commit_files(cwd: String, hash: String) -> Result<Vec<CommitFile>, String> {
+    let (ok, stdout, stderr) = run_git(
+        &cwd,
+        &["show", "--name-status", "--format=", hash.as_str()],
+    )?;
+    if !ok {
+        return Err(stderr.trim().to_string());
+    }
+    let mut files: Vec<CommitFile> = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.is_empty() {
+            continue;
+        }
+        // 状态码首字符（R100/C50 等取首字母 R/C）
+        let status = parts[0]
+            .chars()
+            .next()
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        // 重命名 / 复制时取最后一段为目标路径；普通 1-tuple 时也是最后一段
+        let path = parts.last().copied().unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+        files.push(CommitFile { path, status });
+    }
+    Ok(files)
+}
+
+/// 取某个 commit 中某个文件的 diff（含 `diff --git` 头）。
+/// 用 `git show --format= <hash> -- <path>`：format= 把 commit message 部分清空，
+/// 直接输出 raw diff。前面可能有一行空行 / 空 patch，前端按 diff 染色一致。
+#[tauri::command]
+pub fn git_show_file_diff(cwd: String, hash: String, path: String) -> Result<GitDiff, String> {
+    let (_ok, stdout, _stderr) = run_git(
+        &cwd,
+        &[
+            "show",
+            "--format=",
+            hash.as_str(),
+            "--",
+            path.as_str(),
+        ],
+    )?;
+    let empty = stdout.trim().is_empty();
+    Ok(GitDiff { diff: stdout, empty })
+}
+
 /// 丢弃工作区某个文件的改动（`git checkout -- <path>`，未跟踪文件改用删除）。
 #[tauri::command]
 pub fn git_discard(cwd: String, path: String, untracked: Option<bool>) -> Result<(), String> {
