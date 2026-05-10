@@ -115,7 +115,7 @@ export interface ArchivedSession {
 
 const HISTORY_LIMIT = 100;
 
-interface TabsStoreState {
+export interface TabsStoreState {
   tabs: Record<string, TabState>;
   /// TabBar 显示顺序；新建的追加到末尾；关闭时从这里 splice
   order: string[];

@@ -68,6 +68,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // 安装完成后用 process.relaunch() 重启 webview
         .plugin(tauri_plugin_process::init())
+        // 系统级通知：任务结束时弹原生通知（前端调 sendNotification）
+        .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(AppState::new()))
         .manage(Arc::new(agent::runtime::RuntimeState::default()))
         .manage(Arc::new(lan::LanRuntimeState::default()))

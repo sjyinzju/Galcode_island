@@ -14,6 +14,7 @@ import { useCliStream } from "./hooks/useCliStream";
 import { useInPageSearchHotkey } from "./hooks/useInPageSearchHotkey";
 import { useLanProjectsSync } from "./hooks/useLanProjectsSync";
 import { useTabsReattach } from "./hooks/useTabsReattach";
+import { useTaskCompletionNotifier } from "./hooks/useTaskCompletionNotifier";
 import { useThemeHotkey } from "./hooks/useThemeHotkey";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
 import { useSettingsStore } from "./stores/useSettingsStore";
@@ -30,6 +31,7 @@ function App(): JSX.Element {
   useInPageSearchHotkey();
   useLanProjectsSync();
   useUpdateBootstrap();
+  useTaskCompletionNotifier();
 
   useEffect(() => {
     // 浏览器（局域网客户端）模式：不要把自己 zustand 里可能为空的 settings 推给后端
