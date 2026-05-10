@@ -15,8 +15,9 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useEffect, useRef } from "react";
-import { useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
+import { useEffect, useRef, useState } from "react";
+import { useActiveTabActions, useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
+import { useTabsStore } from "../../stores/useTabsStore";
 import { useUiStore, type ActiveMatch } from "../../stores/useUiStore";
 import type { CliBlock } from "../../types/blocks";
 import { countOccurrences, highlightText } from "./highlight";
@@ -133,6 +134,12 @@ function statusBadge(status?: string): { label: string; cls: string } {
 
 /// 用户原始 prompt：右对齐蓝色气泡，跟 agent 输出（左侧）形成对话感。
 /// 不走 markdown — 用户输入通常是单行中文，pre-wrap 保留换行就够。
+///
+/// hover 时气泡左侧出现 3 个动作按钮（复制 / 编辑重发 / 删除）：
+///   - 复制：navigator.clipboard.writeText(content)；2s 内显示"已复制"
+///   - 编辑重发：把内容回填到 InputBubble 的 textarea + focus，让用户改完手动启动
+///     （故意**不自动启动**，避免用户误触造成意外发起）
+///   - 删除：从该 tab 的 cliBlocks 视图里移除；不会影响 agent 后端会话历史
 function UserPromptBlock({
   block,
   hl,
@@ -141,9 +148,100 @@ function UserPromptBlock({
   hl: HighlightCtx;
 }): JSX.Element | null {
   const content = block.content?.trim();
+  const removeCliBlock = useTabsStore((s) => s.removeCliBlock);
+  const activeTabId = useActiveTabId();
+  const { update } = useActiveTabActions();
+  const bumpInputFocus = useUiStore((s) => s.bumpInputFocus);
+  const [copied, setCopied] = useState(false);
+
+  // 复制反馈：2s 后回到默认图标。useEffect 而不是 setTimeout 闭包，避免组件卸载时野定时器
+  useEffect(() => {
+    if (!copied) return;
+    const id = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(id);
+  }, [copied]);
+
   if (!content) return null;
+
+  const handleCopy = async (): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+    } catch {
+      /* 某些 webview 没 clipboard 权限时失败；不弹错——用户能看出图标没变就当失败 */
+    }
+  };
+
+  const handleEdit = (): void => {
+    // 同时切回 idle 状态：MainView 在 done/error/running 状态下渲染的是 ResultCard /
+    // RunningBubble 而非 InputBubble，光改 task 字段用户看不到回填。把 uiState/mode/
+    // agentStatus 都切回 idle 强制让 InputBubble 重新挂载，bumpInputFocus 触发
+    // textarea focus；流式 cliBlocks 不动，聊天历史保留。
+    update({
+      task: content,
+      uiState: "idle",
+      mode: "idle",
+      agentStatus: "idle",
+    });
+    bumpInputFocus();
+  };
+
+  const handleDelete = (): void => {
+    if (!activeTabId) return;
+    if (!window.confirm("从视图中移除这条提问？\n（仅清屏展示，不会影响 agent 已记住的会话上下文）")) {
+      return;
+    }
+    removeCliBlock(activeTabId, block.id);
+  };
+
   return (
-    <div className="flex justify-end">
+    <div className="group flex items-end justify-end gap-1">
+      {/* 操作按钮 — hover 才出现，避免平时干扰阅读 */}
+      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <button
+          type="button"
+          onClick={() => void handleCopy()}
+          aria-label="复制"
+          title={copied ? "已复制" : "复制"}
+          className={`flex h-6 w-6 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-black/5 dark:text-zinc-500 dark:hover:bg-white/5 ${
+            copied ? "text-emerald-500 dark:text-emerald-400" : ""
+          }`}
+        >
+          {copied ? (
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3 w-3">
+              <path d="M2.5 6.5L5 9l4.5-5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
+              <rect x="3" y="3" width="6.5" height="7" rx="1" />
+              <path d="M5 3V2.5a1 1 0 011-1h3.5a1 1 0 011 1v6.5a1 1 0 01-1 1H9.5" />
+            </svg>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={handleEdit}
+          aria-label="编辑后重发"
+          title="编辑后重发（填回输入框）"
+          className="flex h-6 w-6 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-sky-400/15 hover:text-sky-600 dark:text-zinc-500 dark:hover:text-sky-300"
+        >
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
+            <path d="M2 10l1-3 5-5 2 2-5 5-3 1z" strokeLinejoin="round" />
+            <path d="M7 3l2 2" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          onClick={handleDelete}
+          aria-label="从视图删除"
+          title="从视图中移除（不影响后端会话历史）"
+          className="flex h-6 w-6 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-rose-400/15 hover:text-rose-500 dark:text-zinc-500 dark:hover:text-rose-400"
+        >
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
+            <path d="M2.5 4h7M5 6.5v2M7 6.5v2M3.5 4l.5 5.5h4l.5-5.5M4.5 4V2.5h3V4" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
       <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-sky-400/35 bg-sky-400/15 px-3 py-1.5 text-[13px] leading-relaxed text-zinc-800 shadow-sm dark:border-sky-300/30 dark:bg-sky-400/15 dark:text-zinc-100">
         {highlightText(content, hl.query, block.id, "content", hl.activeMatch)}
       </div>

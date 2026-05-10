@@ -8,8 +8,8 @@
 
 | # | 任务 | 状态 | 验证方式 |
 |---|---|---|---|
-| 1 | **任务结束系统通知 + 角标** | ✅ 已完成（待用户验证 + 提交） | tsc ✅ cargo ✅；用户手动验：跑长任务切窗口看通知/Dock |
-| 2 | user-prompt 行悬浮操作（复制/编辑重发/删除） | 待办（等 Task 1 提交后再开） | tsc + 手动：hover 看按钮，点重发回填到输入气泡 |
+| 1 | **任务结束系统通知 + 角标** | ✅ 已完成（dev 模式 macOS 通知不弹是签名限制，release 流程会签名） | tsc ✅ cargo ✅；Dock badge 在 dev 模式实测可见 |
+| 2 | user-prompt 行悬浮操作（复制/编辑重发/删除） | ✅ 已完成（待用户验证 + 提交） | tsc ✅；用户手动验：hover 看按钮 / 复制成功有打勾反馈 / 重发回填 + focus / 删除 confirm |
 | 3 | 错误归因 + 一键修复 | 待办 | tsc + 手动：构造常见错误（API key 错/CLI 缺）观察归因卡片 |
 | 4 | BlockStream 虚拟滚动 | 待办 | tsc + 手动：跑出 500+ block，滚动流畅；切 tab 不丢位置 |
 | 5 | AI 生成 commit message | 待办 | tsc + cargo + 手动：staged 后点按钮，看到生成的 commit |
@@ -35,6 +35,20 @@
 - **跨平台约定（2026-05-11 用户明确）**：项目两端用户都不少，所有 UX 优化默认 mac+win 都覆盖；
   做完单平台后想到的"另一端怎么办"也属于该任务的覆盖度，要补完整。
 - Task 2 暂不开始，等用户验证 / 提交 Task 1 后下次会话再做。
+
+### 2026-05-11 会话 #2（用户 commit Task 1 后继续）
+- 完成 Task 2：user-prompt 行悬浮操作
+  - `src/stores/useTabsStore.ts` 加 `removeCliBlock(id, blockId)` action
+  - `src/stores/useUiStore.ts` 加 `inputFocusRequest` 计数器 + `bumpInputFocus()`
+  - `src/components/chat-bubble/InputBubble.tsx` 加 textareaRef + 监听 `inputFocusRequest`，
+    变化时 focus 输入框并把光标移到末尾
+  - `src/components/status-monitor/BlockStream.tsx` 的 `UserPromptBlock` 加 hover 操作组：
+    - 复制：`navigator.clipboard.writeText` + 2s 内打勾反馈
+    - 编辑重发：把内容回填到 active tab.task + 触发 InputBubble focus（**不自动启动**，避免误触）
+    - 删除：window.confirm 警告"仅清屏不影响后端会话" + 调 `removeCliBlock`
+  - 跨平台：clipboard API / window.confirm 都 mac+win 支持；hover 在两端鼠标 OK，
+    触摸设备上 hover 不友好的 fallback 留给"手机端手势"那项 TODO
+  - tsc 通过；用户手动验：hover 出按钮、复制看到打勾、编辑回填 textarea 自动 focus、删除 confirm 流程
 
 ## 关键技术依赖（实施前要核实/补齐）
 

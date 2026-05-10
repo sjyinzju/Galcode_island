@@ -145,6 +145,9 @@ export interface TabsStoreState {
   appendCliBlock: (id: string, block: CliBlock) => void;
   upsertCliBlock: (id: string, block: CliBlock) => void;
   clearCliBlocks: (id: string) => void;
+  /// 从指定 tab 的流式视图里移除单个 block（按 block.id）。
+  /// 仅影响前端展示，不会清掉后端 agent 的会话上下文 —— UI 上仅做"我看的视图"层操作。
+  removeCliBlock: (id: string, blockId: string) => void;
 
   /// 多 tab 路由辅助：根据后端事件 payload 的 runId 找到 tab id；
   /// runId 直接对应 tab.id，所以这里其实就是看 tabs[runId] 是否存在。
@@ -436,6 +439,17 @@ export const useTabsStore = create<TabsStoreState>()(
       const tab = state.tabs[id];
       if (!tab) return state;
       return { tabs: { ...state.tabs, [id]: { ...tab, cliBlocks: [] } } };
+    });
+  },
+
+  removeCliBlock: (id, blockId) => {
+    set((state) => {
+      const tab = state.tabs[id];
+      if (!tab) return state;
+      const next = tab.cliBlocks.filter((b) => b.id !== blockId);
+      // 找不到该 id 时数组引用不变 —— 别走 set 避免无意义 rehydrate / 监听抖动
+      if (next.length === tab.cliBlocks.length) return state;
+      return { tabs: { ...state.tabs, [id]: { ...tab, cliBlocks: next } } };
     });
   },
 

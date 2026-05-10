@@ -40,6 +40,12 @@ interface UiState {
   closeInPageSearch: () => void;
   setSearchQuery: (q: string) => void;
   setActiveMatch: (m: ActiveMatch | null) => void;
+
+  /// 单调递增计数器，bump 一次让 InputBubble useEffect 监听到差异 → focus 输入框。
+  /// 用 counter 而不是 boolean，避免"已 focus 的状态写不动" —— 多次请求 focus 都能触发。
+  inputFocusRequest: number;
+  /// 触发输入框 focus（编辑重发场景：把 user-prompt 内容回填到 task 后调）
+  bumpInputFocus: () => void;
 }
 
 /// 当前焦点匹配：定位"哪个块的哪个字段的第几次出现"
@@ -71,4 +77,7 @@ export const useUiStore = create<UiState>((set) => ({
     set({ inPageSearchOpen: false, searchQuery: "", activeMatch: null }),
   setSearchQuery: (q) => set({ searchQuery: q }),
   setActiveMatch: (m) => set({ activeMatch: m }),
+
+  inputFocusRequest: 0,
+  bumpInputFocus: () => set((s) => ({ inputFocusRequest: s.inputFocusRequest + 1 })),
 }));

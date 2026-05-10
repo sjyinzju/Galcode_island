@@ -5,6 +5,7 @@ import { useAppStore } from "../../stores/useAppStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useActivityStore } from "../../stores/useActivityStore";
+import { useUiStore } from "../../stores/useUiStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { PetCharacter } from "../pet-character/PetCharacter";
 
@@ -33,6 +34,23 @@ export function InputBubble(): JSX.Element {
   // 中文输入法 composition 期间不要把 Enter 当发送 — 双保险用 keydown.isComposing
   // + composition* 事件标记
   const isComposingRef = useRef(false);
+
+  // textarea ref：让外部（user-prompt block 的"编辑重发"按钮）可以 focus 进来
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const inputFocusRequest = useUiStore((s) => s.inputFocusRequest);
+  // counter 一变就 focus + 把光标移到末尾，方便用户立刻继续敲
+  useEffect(() => {
+    if (inputFocusRequest === 0) return;
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    const len = el.value.length;
+    try {
+      el.setSelectionRange(len, len);
+    } catch {
+      /* 某些非常老的 webview 可能不支持，无关紧要 */
+    }
+  }, [inputFocusRequest]);
 
   useEffect(() => {
     if (agentStatus === "idle") {
@@ -167,6 +185,7 @@ export function InputBubble(): JSX.Element {
             </div>
 
             <textarea
+              ref={textareaRef}
               value={task}
               onChange={(e) => update({ task: e.target.value })}
               placeholder="和团长对话……  (Enter 发送，Shift+Enter 换行)"
