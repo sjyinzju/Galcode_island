@@ -459,24 +459,52 @@ pub fn git_show_file_diff(cwd: String, hash: String, path: String) -> Result<Git
     Ok(GitDiff { diff: stdout, empty })
 }
 
-/// 用 LLM 基于 staged diff 生成中文 conventional commit message。
-/// 流程：拿 `git diff --cached` → 喂给 LLM → 返回干净字符串给前端填到 commit 输入框。
+/// 用 LLM 基于工作区所有改动生成中文 conventional commit message。
+/// 不再要求 staged —— 跟前端简化后的工作流一致：提交时永远 git add -A，
+/// 所以"将被提交的改动" = 全部 tracked 改动 + 全部未跟踪文件。
+///
+/// 流程：
+///   1. `git diff HEAD` 拿全部 tracked 改动（staged + unstaged 合并视图）
+///   2. `git ls-files --others --exclude-standard` 拿未跟踪文件名（不读内容，
+///      新文件可能很大，列文件名 + 后缀让 LLM 推断类型已经够用）
+///   3. 拼成给 LLM 的输入 → spawn_blocking 调 LLM
 ///
 /// 走 async + spawn_blocking：LLM 调用是同步阻塞 IO（几秒），不挪到 blocking pool
 /// 会卡 Tauri IPC 线程，导致同时段所有 IPC 都不响应。
 #[tauri::command]
 pub async fn git_generate_commit_message(cwd: String) -> Result<String, String> {
-    // 第一阶段：拿 staged diff（同步 git 命令，毫秒级，留在调用线程）
-    let (ok, diff, stderr) = run_git(&cwd, &["diff", "--cached"])?;
-    // git diff 有时即使非 0 退出也带 stdout（如二进制文件提示），只在 stdout 完全空时报错
-    if diff.trim().is_empty() {
-        if !ok && !stderr.trim().is_empty() {
-            return Err(stderr.trim().to_string());
-        }
-        return Err("没有 staged 改动——请先暂存要提交的文件".to_string());
+    // 1) tracked 改动（含 staged + unstaged，相对 HEAD）
+    let (ok, mut diff, stderr) = run_git(&cwd, &["diff", "HEAD"])?;
+    if !ok && diff.trim().is_empty() && !stderr.trim().is_empty() {
+        return Err(stderr.trim().to_string());
     }
 
-    // 第二阶段：把 LLM 调用挪到 blocking pool，反正是 reqwest::blocking
+    // 2) 未跟踪文件名列表（不读内容）—— 用 ls-files 比 status 简洁
+    let (_ok_un, untracked_out, _e) = run_git(
+        &cwd,
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
+    let untracked: Vec<&str> = untracked_out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if diff.trim().is_empty() && untracked.is_empty() {
+        return Err("工作区没有任何改动，没什么可生成的".to_string());
+    }
+
+    // 把未跟踪文件作为附录拼到 diff 末尾，让 LLM 知道有哪些新文件被加进来
+    if !untracked.is_empty() {
+        diff.push_str("\n\n# === 新增文件（未跟踪，未列内容）===\n");
+        for f in untracked {
+            diff.push_str("# new file: ");
+            diff.push_str(f);
+            diff.push('\n');
+        }
+    }
+
+    // 3) 调 LLM
     let cfg = crate::llm::client::load_llm_config().ok_or_else(|| {
         "LLM 未配置——请去全局设置里填 Base URL / API Key / Model".to_string()
     })?;

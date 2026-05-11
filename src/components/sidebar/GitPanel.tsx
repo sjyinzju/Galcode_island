@@ -79,21 +79,12 @@ function statusInfo(file: GitFileEntry): { label: string; cls: string } {
 interface FileRowProps {
   file: GitFileEntry;
   onClick: () => void;
-  onPrimaryAction: () => void;
-  /// 主操作的图标 + tooltip（stage 区显示"撤销"，未 stage 区显示"暂存"）
-  primaryActionLabel: string;
-  primaryActionIcon: JSX.Element;
+  /// 仅剩"放弃改动"——stage / unstage 已从 UI 移除（提交时永远 add -A，
+  /// 用户不需要在 commit 前显式 stage）
   onDiscard?: () => void;
 }
 
-function FileRow({
-  file,
-  onClick,
-  onPrimaryAction,
-  primaryActionLabel,
-  primaryActionIcon,
-  onDiscard,
-}: FileRowProps): JSX.Element {
+function FileRow({ file, onClick, onDiscard }: FileRowProps): JSX.Element {
   const info = statusInfo(file);
   // 只显示 basename 作为主标题，目录路径作副标题
   const idx = file.path.lastIndexOf("/");
@@ -113,9 +104,9 @@ function FileRow({
           <div className="truncate text-[10px] text-zinc-400 dark:text-zinc-500">{dir}</div>
         ) : null}
       </div>
-      {/* hover 操作区 */}
-      <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-        {onDiscard ? (
+      {/* hover 操作区 —— 仅"放弃改动"按钮 */}
+      {onDiscard ? (
+        <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
           <button
             type="button"
             onClick={(e) => {
@@ -130,20 +121,8 @@ function FileRow({
               <path d="M2.5 4h7M5 6.5v2M7 6.5v2M3.5 4l.5 5.5h4l.5-5.5M4.5 4V2.5h3V4" strokeLinecap="round" />
             </svg>
           </button>
-        ) : null}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onPrimaryAction();
-          }}
-          aria-label={primaryActionLabel}
-          title={primaryActionLabel}
-          className="flex h-5 w-5 items-center justify-center rounded text-zinc-500 hover:bg-sky-400/15 hover:text-sky-600 dark:text-zinc-400 dark:hover:text-sky-300"
-        >
-          {primaryActionIcon}
-        </button>
-      </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -157,7 +136,6 @@ export function GitPanel(): JSX.Element {
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [commitMessage, setCommitMessage] = useState<string>("");
-  const [stageAllOnCommit, setStageAllOnCommit] = useState<boolean>(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [viewingFile, setViewingFile] = useState<GitFileEntry | null>(null);
@@ -210,22 +188,20 @@ export function GitPanel(): JSX.Element {
     return () => window.clearTimeout(id);
   }, [actionFeedback]);
 
-  const groups = useMemo(() => {
-    const staged: GitFileEntry[] = [];
-    const changes: GitFileEntry[] = [];
-    const untracked: GitFileEntry[] = [];
-    if (status) {
-      for (const f of status.files) {
-        if (f.untracked) untracked.push(f);
-        else if (f.staged) staged.push(f);
-        // 同一个文件既可能 staged 又可能在工作区有改动 —— 这里先按 staged 优先；
-        // 工作区那一侧也产生一行 unstaged 改动
-        if (!f.untracked && f.workStatus !== " " && f.workStatus !== "." && f.workStatus !== "?") {
-          changes.push(f);
-        }
-      }
+  // 仿 VSCode：所有改动（modified / added / deleted / untracked）统一在一个分组里，
+  // 类型靠左侧 M/A/D/U 状态徽标区分。同一 path 即使 staged + unstaged 双行也只显示一次。
+  const files = useMemo(() => {
+    if (!status) return [] as GitFileEntry[];
+    const seen = new Set<string>();
+    const out: GitFileEntry[] = [];
+    for (const f of status.files) {
+      if (seen.has(f.path)) continue;
+      seen.add(f.path);
+      out.push(f);
     }
-    return { staged, changes, untracked };
+    // 按文件路径字典序排序——稳定输出，跟 VSCode 一致
+    out.sort((a, b) => a.path.localeCompare(b.path));
+    return out;
   }, [status]);
 
   const handleAction = async (
@@ -246,18 +222,8 @@ export function GitPanel(): JSX.Element {
     }
   };
 
-  const stageFile = (path: string): Promise<void> =>
-    handleAction(`stage:${path}`, async () => {
-      if (!projectPath) return;
-      await invoke("git_stage", { cwd: projectPath, paths: [path] });
-    });
-
-  const unstageFile = (path: string): Promise<void> =>
-    handleAction(`unstage:${path}`, async () => {
-      if (!projectPath) return;
-      await invoke("git_unstage", { cwd: projectPath, paths: [path] });
-    });
-
+  /// 唯一保留的文件级操作：放弃单文件改动。stage / unstage 已从 UI 移除——
+  /// 提交时永远 git add -A，用户不再需要"先暂存再提交"的两步式工作流。
   const discardFile = (file: GitFileEntry): Promise<void> =>
     handleAction(`discard:${file.path}`, async () => {
       if (!projectPath) return;
@@ -272,27 +238,16 @@ export function GitPanel(): JSX.Element {
       });
     });
 
-  const stageAll = (): Promise<void> =>
-    handleAction("stage:all", async () => {
-      if (!projectPath) return;
-      await invoke("git_stage", { cwd: projectPath, paths: [] });
-    });
-
-  const unstageAll = (): Promise<void> =>
-    handleAction("unstage:all", async () => {
-      if (!projectPath) return;
-      await invoke("git_unstage", { cwd: projectPath, paths: [] });
-    });
-
   const doCommit = async (): Promise<void> => {
     if (!projectPath || !commitMessage.trim()) return;
     await handleAction(
       "commit",
       async () => {
+        // stageAll 永远 true：提交工作流不再分"先暂存再提交"两步。
         const res = await invoke<GitCommitResult>("git_commit", {
           cwd: projectPath,
           message: commitMessage,
-          stageAll: stageAllOnCommit,
+          stageAll: true,
         });
         setCommitMessage("");
         setActionFeedback(`已提交 ${res.commitHash.slice(0, 7)}：${res.summary}`);
@@ -370,10 +325,7 @@ export function GitPanel(): JSX.Element {
     );
   }
 
-  const totalFiles = (status?.files.length ?? 0);
-  const stagedCount = groups.staged.length;
-  const changesCount = groups.changes.length;
-  const untrackedCount = groups.untracked.length;
+  const totalFiles = files.length;
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
@@ -460,95 +412,23 @@ export function GitPanel(): JSX.Element {
           </div>
         ) : null}
 
-        {stagedCount > 0 ? (
+        {/* 仿 VSCode：所有改动统一在一个"更改"分组里，类型用左侧 M/A/D/U 徽标区分；
+            按 path 去重，按字典序排序。提交时永远 git add -A，用户无需分组操作。 */}
+        {totalFiles > 0 ? (
           <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between px-1">
               <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500">
-                已暂存 {stagedCount}
-              </span>
-              <button
-                type="button"
-                onClick={() => void unstageAll()}
-                disabled={busyAction !== null}
-                className="text-[10px] text-zinc-400 transition-colors hover:text-amber-500 disabled:opacity-50 dark:text-zinc-500 dark:hover:text-amber-400"
-              >
-                全部撤销
-              </button>
-            </div>
-            <div className="flex flex-col gap-1">
-              {groups.staged.map((file) => (
-                <FileRow
-                  key={`s:${file.path}`}
-                  file={{ ...file, staged: true }}
-                  onClick={() => setViewingFile({ ...file, staged: true })}
-                  onPrimaryAction={() => void unstageFile(file.path)}
-                  primaryActionLabel="撤销暂存"
-                  primaryActionIcon={
-                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-2.5 w-2.5">
-                      <path d="M2 6h8M2 6l3-3M2 6l3 3" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  }
-                />
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        {changesCount > 0 ? (
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center justify-between px-1">
-              <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500">
-                改动 {changesCount}
-              </span>
-              <button
-                type="button"
-                onClick={() => void stageAll()}
-                disabled={busyAction !== null}
-                className="text-[10px] text-zinc-400 transition-colors hover:text-sky-500 disabled:opacity-50 dark:text-zinc-500 dark:hover:text-sky-400"
-              >
-                全部暂存
-              </button>
-            </div>
-            <div className="flex flex-col gap-1">
-              {groups.changes.map((file) => (
-                <FileRow
-                  key={`c:${file.path}`}
-                  file={{ ...file, staged: false }}
-                  onClick={() => setViewingFile({ ...file, staged: false })}
-                  onPrimaryAction={() => void stageFile(file.path)}
-                  primaryActionLabel="暂存"
-                  primaryActionIcon={
-                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-2.5 w-2.5">
-                      <path d="M6 2v8M2 6h8" strokeLinecap="round" />
-                    </svg>
-                  }
-                  onDiscard={() => void discardFile({ ...file, staged: false })}
-                />
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        {untrackedCount > 0 ? (
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center justify-between px-1">
-              <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500">
-                未跟踪 {untrackedCount}
+                更改 {totalFiles}
               </span>
             </div>
             <div className="flex flex-col gap-1">
-              {groups.untracked.map((file) => (
+              {files.map((file) => (
                 <FileRow
-                  key={`u:${file.path}`}
+                  key={file.path}
                   file={file}
-                  onClick={() => setViewingFile(file)}
-                  onPrimaryAction={() => void stageFile(file.path)}
-                  primaryActionLabel="暂存"
-                  primaryActionIcon={
-                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-2.5 w-2.5">
-                      <path d="M6 2v8M2 6h8" strokeLinecap="round" />
-                    </svg>
-                  }
+                  // 文件点击查看 diff —— 用工作区视角（staged=false 让 git_diff 走
+                  // git diff 而非 git diff --cached，等价于"我会提交的所有改动"）
+                  onClick={() => setViewingFile({ ...file, staged: false })}
                   onDiscard={() => void discardFile(file)}
                 />
               ))}
@@ -594,18 +474,18 @@ export function GitPanel(): JSX.Element {
 
         return (
           <div className="shrink-0 border-t border-black/5 px-2 py-2 dark:border-white/5">
-            {/* AI 生成 commit message：仅 commit 模式 + 有 staged 文件时可点。
+            {/* AI 生成 commit message：仅 commit 模式 + 有任何改动时可点。
                 disabled 时 tooltip 解释原因，避免用户疑惑"为什么不能点" */}
             {!showSync && (
               <div className="mb-1 flex items-center justify-end">
                 <button
                   type="button"
                   onClick={() => void doGenerateCommitMessage()}
-                  disabled={busyAction !== null || stagedCount === 0}
+                  disabled={busyAction !== null || totalFiles === 0}
                   title={
-                    stagedCount === 0
-                      ? "请先暂存至少一个文件，再让 AI 基于 staged diff 生成"
-                      : "基于已暂存的 diff 让 LLM 生成 conventional commit message"
+                    totalFiles === 0
+                      ? "工作区没有任何改动，先动两笔代码再来生成"
+                      : "基于工作区所有改动让 LLM 生成 conventional commit message"
                   }
                   className="flex items-center gap-1 rounded border border-sky-400/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 transition-colors hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40 dark:border-sky-300/30 dark:bg-sky-400/10 dark:text-sky-300 dark:hover:bg-sky-400/20"
                 >
@@ -645,15 +525,10 @@ export function GitPanel(): JSX.Element {
                   {ahead > 0 ? `↑${ahead}` : ""}
                 </span>
               ) : (
-                <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-zinc-500 dark:text-zinc-400">
-                  <input
-                    type="checkbox"
-                    checked={stageAllOnCommit}
-                    onChange={(e) => setStageAllOnCommit(e.target.checked)}
-                    className="h-3 w-3 accent-sky-500"
-                  />
-                  提交全部改动
-                </label>
+                // 占位：让"提交"按钮保持右对齐；总数提示放这里给用户感知影响范围
+                <span className="shrink-0 text-[10px] text-zinc-400 dark:text-zinc-500">
+                  {totalFiles > 0 ? `将提交 ${totalFiles} 个文件的改动` : ""}
+                </span>
               )}
               <button
                 type="button"
