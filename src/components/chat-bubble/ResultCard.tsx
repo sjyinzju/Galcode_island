@@ -6,6 +6,7 @@ import { useActivityStore } from "../../stores/useActivityStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { motion, AnimatePresence } from "framer-motion";
 import { PetCharacter } from "../pet-character/PetCharacter";
+import { ErrorDiagnosisCard } from "../status-monitor/ErrorDiagnosisCard";
 
 export function ResultCard(): JSX.Element {
   const tab = useActiveTab();
@@ -17,6 +18,9 @@ export function ResultCard(): JSX.Element {
   const emotionText = tab.emotionText;
   const summaryTranslation = tab.summaryTranslation;
   const suggestionOptions = tab.suggestionOptions;
+  // 错误模式下喂给归因卡片的原始错误文本：优先 bubble（agent://error 写入的最准消息），
+  // 其次 summaryTranslation（LLM finalize 失败时填的错误描述），再退到 emotionText
+  const errorMessage = (tab.bubble || tab.summaryTranslation || tab.emotionText || "").trim();
 
   // ResultCard 内嵌的"继续追问"输入框 —— 跟选项按钮并存，让用户能直接打字而不必
   // 等回 InputBubble。组件态而非 tab.task：tab.task 是 InputBubble 的草稿，
@@ -168,11 +172,18 @@ export function ResultCard(): JSX.Element {
             )}
 
             {/* ===== 中部：Summary —— max-h cap + 内部滚动；自然高度。
-                移动端 35vh 大约给 8-10 行；桌面端无上限保持原视觉。 ===== */}
-            {summaryTranslation && (
+                移动端 35vh 大约给 8-10 行；桌面端无上限保持原视觉。
+                错误模式下隐藏 summary，下方归因卡片做替代展示，避免错误文本重复出现两次。 ===== */}
+            {summaryTranslation && !isError && (
               <div className="max-h-[35vh] overflow-y-auto overscroll-contain px-1 text-[14px] leading-relaxed text-zinc-600 sm:max-h-none sm:overflow-visible sm:text-sm dark:text-zinc-300">
                 {summaryTranslation}
               </div>
+            )}
+
+            {/* 错误归因卡片：仅 isError 时显示，提供友好标题 + 详情折叠 + 一键修复按钮。
+                跟 BlockStream 里 type=error 块用同一个组件，UI 一致，仅 variant=card 略大 */}
+            {isError && errorMessage && (
+              <ErrorDiagnosisCard message={errorMessage} variant="card" />
             )}
 
             {/* ===== 底部：Suggestion 选项 + 输入框（不滚） ===== */}

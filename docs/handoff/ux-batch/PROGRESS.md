@@ -9,8 +9,8 @@
 | # | 任务 | 状态 | 验证方式 |
 |---|---|---|---|
 | 1 | **任务结束系统通知 + 角标** | ✅ 已完成（dev 模式 macOS 通知不弹是签名限制，release 流程会签名） | tsc ✅ cargo ✅；Dock badge 在 dev 模式实测可见 |
-| 2 | user-prompt 行悬浮操作（复制/编辑重发/删除） | ✅ 已完成（待用户验证 + 提交） | tsc ✅；用户手动验：hover 看按钮 / 复制成功有打勾反馈 / 重发回填 + focus / 删除 confirm |
-| 3 | 错误归因 + 一键修复 | 待办 | tsc + 手动：构造常见错误（API key 错/CLI 缺）观察归因卡片 |
+| 2 | user-prompt 行悬浮操作（复制/编辑重发/删除） | ✅ 已完成（已 commit） | tsc ✅；用户手动验 OK |
+| 3 | 错误归因 + 一键修复 | ✅ 已完成（待用户验证 + 提交） | tsc ✅；BlockStream ErrorLine + ResultCard 错误模式两处都接归因 |
 | 4 | BlockStream 虚拟滚动 | 待办 | tsc + 手动：跑出 500+ block，滚动流畅；切 tab 不丢位置 |
 | 5 | AI 生成 commit message | 待办 | tsc + cargo + 手动：staged 后点按钮，看到生成的 commit |
 | 6 | Diff viewer 升级（syntax highlight + 行号 + hunk 折叠） | 待办 | tsc + 手动：看不同语言文件的 diff，浅色/暗色都能看 |
@@ -49,6 +49,24 @@
   - 跨平台：clipboard API / window.confirm 都 mac+win 支持；hover 在两端鼠标 OK，
     触摸设备上 hover 不友好的 fallback 留给"手机端手势"那项 TODO
   - tsc 通过；用户手动验：hover 出按钮、复制看到打勾、编辑回填 textarea 自动 focus、删除 confirm 流程
+
+### 2026-05-11 会话 #3（用户 commit Task 2 后继续）
+- 完成 Task 3：错误归因 + 一键修复
+  - **覆盖度补强教训**：开始时方向选了"只改 BlockStream ErrorLine"，但实测用户最常遇到
+    的启动失败错误走 IPC throw 路径、显示在 ResultCard 不在 BlockStream。用户测试发现归因没出现 →
+    扩补 ResultCard 错误模式同样接入归因；这是"做完一项的完整覆盖度"，跟 Task 1 给 Win 加 fallback 一样
+  - 新建 `src/lib/errorDiagnose.ts`：纯函数模块，7 类模式（CLI 缺 / 鉴权 / 余额 / 网络 /
+    并发 / 会话未就绪 / 进程崩溃）+ 兜底；返回 `{ title, detail, actions, severity, kind }`
+  - 新建 `src/components/status-monitor/ErrorDiagnosisCard.tsx`：公共组件，两 variant
+    （inline / card），含 8 种 action handler（open-settings / open-backend-login /
+    verify-backend / resend-prompt / reset-tab / open-link / copy-error / copy-with-context）
+  - `src/components/status-monitor/BlockStream.tsx`：ErrorLine 改成薄包装 ErrorDiagnosisCard，
+    通过 renderRawMessage prop 保留 cmd+f 高亮；清掉之前 inline 在 BlockStream 里的所有 handler
+  - `src/components/chat-bubble/ResultCard.tsx`：错误模式下渲染 ErrorDiagnosisCard 替代 summary
+    显示（避免错误文本重复），保留 emotion 气泡（凉宫风角色感）
+  - **跨平台**：clipboard / window.confirm / plugin-opener / *_login_open IPC 都 mac+win 通用
+  - **错误展示路径盘点**：确认 RunningBubble / StderrBlock / ProjectOverview / 桌宠 emotion 都
+    无需接入（理由见 PROGRESS 表格）；两条主要错误路径（启动失败 / turn 中 emit）都已覆盖
 
 ## 关键技术依赖（实施前要核实/补齐）
 

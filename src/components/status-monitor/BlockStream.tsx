@@ -21,6 +21,7 @@ import { useTabsStore } from "../../stores/useTabsStore";
 import { useUiStore, type ActiveMatch } from "../../stores/useUiStore";
 import type { CliBlock } from "../../types/blocks";
 import { countOccurrences, highlightText } from "./highlight";
+import { ErrorDiagnosisCard } from "./ErrorDiagnosisCard";
 
 /// 子组件公共的高亮上下文 prop —— 没 query 时所有子组件渲染行为退化为原状。
 interface HighlightCtx {
@@ -477,13 +478,17 @@ function StatusLine({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.E
   );
 }
 
+/// type=error 的 cliBlock：薄包装 ErrorDiagnosisCard 的 inline variant。
+/// 把 cmd+f 高亮的渲染通过 renderRawMessage 注入，让"详情"展开后仍能 highlight。
 function ErrorLine({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
   const msg = block.message?.trim();
   if (!msg) return null;
   return (
-    <div className="rounded-md border border-rose-400/40 bg-rose-50/60 px-2 py-1 text-[11px] text-rose-700 dark:border-rose-300/30 dark:bg-rose-400/10 dark:text-rose-300">
-      {highlightText(msg, hl.query, block.id, "message", hl.activeMatch)}
-    </div>
+    <ErrorDiagnosisCard
+      message={msg}
+      variant="inline"
+      renderRawMessage={(m) => highlightText(m, hl.query, block.id, "message", hl.activeMatch)}
+    />
   );
 }
 
