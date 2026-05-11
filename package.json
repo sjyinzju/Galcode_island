@@ -12,6 +12,8 @@
     "preview": "vite preview",
     "tauri": "node scripts/run-tauri.mjs",
     "typecheck": "tsc -b --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "check:rust": "node scripts/run-cargo.mjs check",
     "fmt:rust": "node scripts/run-cargo.mjs fmt",
     "lint:rust": "node scripts/run-cargo.mjs clippy --all-targets -- -D warnings",
@@ -48,6 +50,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "^6.0.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^4.1.6"
   }
 }

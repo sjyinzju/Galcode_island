@@ -90,7 +90,33 @@ const PATTERN_CLI_MISSING: PatternEntry = {
   }),
 };
 
-/// 鉴权 / 未登录 / 401
+/// LLM API（用于"凉宫风总结 / 翻译"那一层）的鉴权失败 ——
+/// 跟 backend agent CLI 自身的登录问题完全无关。错误消息典型形如：
+///   "LLM 总结生成失败: LLM HTTP 401 Unauthorized: ... api key ... invalid"
+///   "LLM 翻译失败: LLM HTTP 401 ..."
+/// 必须放在 PATTERN_AUTH 之前，否则会被通用 401 模式抢先匹配，让用户白白去登录 agent。
+const PATTERN_LLM_AUTH: PatternEntry = {
+  test: (m) =>
+    /\bLLM\b.*(401|unauthor|auth\w*\s*fail|invalid)/i.test(m) ||
+    /(总结|翻译|summary|translate|finalize).*(LLM|api[\s_-]?key).*(401|unauthor|fail|invalid)/i.test(m) ||
+    /api[\s_-]?key:?\s*\*+.*?(invalid|expired)/i.test(m),
+  build: (_msg, _agent) => ({
+    title: "LLM API Key 无效或过期",
+    detail:
+      "应用调 LLM 做凉宫风总结 / 翻译时被服务商拒了——是 LLM 那一层的 api key 出问题，" +
+      "跟 Claude Code / Codex / OpenCode 等 backend 的登录无关。去 LLM 设置里检查 api key、" +
+      "base url 和 provider 是否匹配；换 key 后保存即可。",
+    actions: [
+      { label: "打开 LLM 设置", kind: "open-settings", target: "llm", primary: true },
+      { label: "验证连接", kind: "verify-backend" },
+      { label: "复制错误 + 上下文", kind: "copy-with-context" },
+    ],
+    severity: "error",
+    kind: "llm-auth",
+  }),
+};
+
+/// 鉴权 / 未登录 / 401（backend agent CLI 自身的登录失败）
 const PATTERN_AUTH: PatternEntry = {
   test: (m) =>
     /未登录|not logged in|unauthor/i.test(m) ||
@@ -213,9 +239,11 @@ const PATTERN_PROCESS_DIED: PatternEntry = {
   }),
 };
 
-/// 模式表 —— 按"匹配优先级"排序：越具体的越靠前，避免被泛模式抢先匹配
+/// 模式表 —— 按"匹配优先级"排序：越具体的越靠前，避免被泛模式抢先匹配。
+/// PATTERN_LLM_AUTH 必须在 PATTERN_AUTH 之前：两者都含 401，但 LLM 一层有独特的关键字。
 const PATTERNS: PatternEntry[] = [
   PATTERN_CLI_MISSING,
+  PATTERN_LLM_AUTH,
   PATTERN_AUTH,
   PATTERN_QUOTA,
   PATTERN_CONCURRENT,
