@@ -301,6 +301,21 @@ export function GitPanel(): JSX.Element {
     );
   };
 
+  /// 让 LLM 基于 staged diff 生成 commit message —— 跟"AI 工作台"产品定位契合。
+  /// 后端守护：staged 空 / LLM 未配置 都会返回 Err，handleAction 自动转 setError 展示。
+  /// 前端 disabled 条件再加一道：stagedCount === 0 时按钮变灰 + tooltip 提示。
+  const doGenerateCommitMessage = async (): Promise<void> => {
+    if (!projectPath) return;
+    await handleAction(
+      "generate-commit",
+      async () => {
+        const msg = await invoke<string>("git_generate_commit_message", { cwd: projectPath });
+        setCommitMessage(msg);
+        setActionFeedback("✓ AI 生成完成，可直接编辑或点提交");
+      },
+    );
+  };
+
   /// VSCode 风格的"同步更改"：先 pull --ff-only 再 push，一键双向。
   /// 上游不存在 / 没有改动等情况用 status 里的 ahead/behind 决定走哪一支：
   ///   - 没有 upstream → 仅 push（git 会自动提示设置 upstream，失败时把 stderr 透出去）
@@ -579,13 +594,35 @@ export function GitPanel(): JSX.Element {
 
         return (
           <div className="shrink-0 border-t border-black/5 px-2 py-2 dark:border-white/5">
+            {/* AI 生成 commit message：仅 commit 模式 + 有 staged 文件时可点。
+                disabled 时 tooltip 解释原因，避免用户疑惑"为什么不能点" */}
+            {!showSync && (
+              <div className="mb-1 flex items-center justify-end">
+                <button
+                  type="button"
+                  onClick={() => void doGenerateCommitMessage()}
+                  disabled={busyAction !== null || stagedCount === 0}
+                  title={
+                    stagedCount === 0
+                      ? "请先暂存至少一个文件，再让 AI 基于 staged diff 生成"
+                      : "基于已暂存的 diff 让 LLM 生成 conventional commit message"
+                  }
+                  className="flex items-center gap-1 rounded border border-sky-400/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 transition-colors hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40 dark:border-sky-300/30 dark:bg-sky-400/10 dark:text-sky-300 dark:hover:bg-sky-400/20"
+                >
+                  <svg viewBox="0 0 16 16" fill="currentColor" className={`h-3 w-3 ${busyAction === "generate-commit" ? "animate-spin" : ""}`}>
+                    <path d="M8 1.5l1.3 3.4L12.7 6 9.3 7.1 8 10.5 6.7 7.1 3.3 6l3.4-1.1L8 1.5zM12.5 9.5l.7 1.8 1.8.5-1.8.5-.7 1.7-.7-1.7-1.8-.5 1.8-.5.7-1.8z" />
+                  </svg>
+                  {busyAction === "generate-commit" ? "生成中…" : "AI 生成"}
+                </button>
+              </div>
+            )}
             <textarea
               value={commitMessage}
               onChange={(e) => setCommitMessage(e.target.value)}
               placeholder={
                 showSync
                   ? "工作区干净 — 按下方按钮可推/拉同步"
-                  : "输入提交信息（Cmd/Ctrl + Enter 提交）"
+                  : "输入提交信息（Cmd/Ctrl + Enter 提交），或点上方「AI 生成」"
               }
               rows={2}
               disabled={showSync}

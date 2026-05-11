@@ -245,6 +245,124 @@ pub fn translate_en_to_zh(cfg: &LlmConfig, text: &str) -> Result<String, String>
     chat_completion(cfg, prompt::translate_en_to_zh_system(), text, Some(false))
 }
 
+/// 给 LLM 用的 diff 字符长度上限。大 diff（几千行）一股脑塞 LLM 会触发服务商
+/// max tokens 限制 / 响应慢 / 费钱；把超长部分中间截掉，保留头尾让 LLM 拿主旨。
+const COMMIT_MSG_DIFF_LIMIT: usize = 8000;
+
+/// 用于 LLM commit message 生成的 diff 预处理：
+///   - 短于 limit → 原样返回
+///   - 长于 limit → 保留 头 2/3 + "（中间省略 N 字符）" + 尾 1/3，确保 LLM 能看到
+///     diff 的开头（典型 hunk header + import 变化）和结尾（典型函数体改动）
+///
+/// 用 char 而不是 byte 计数，避免在多字节 UTF-8 字符中间切断造成乱码。
+pub fn truncate_diff_for_llm(diff: &str, max_chars: usize) -> String {
+    let total: Vec<char> = diff.chars().collect();
+    if total.len() <= max_chars {
+        return diff.to_string();
+    }
+    // 保留头部 2/3 + 尾部 1/3；中间用占位提示总省略了多少字符
+    let head_size = (max_chars * 2) / 3;
+    let tail_size = max_chars - head_size;
+    let omitted = total.len() - head_size - tail_size;
+    let head: String = total[..head_size].iter().collect();
+    let tail: String = total[total.len() - tail_size..].iter().collect();
+    format!(
+        "{}\n\n... (省略中间 {} 字符) ...\n\n{}",
+        head, omitted, tail
+    )
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_diff_for_llm;
+
+    #[test]
+    fn short_diff_is_unchanged() {
+        let short = "abcdef";
+        assert_eq!(truncate_diff_for_llm(short, 100), short);
+    }
+
+    #[test]
+    fn diff_at_exact_limit_is_unchanged() {
+        let s: String = "x".repeat(100);
+        assert_eq!(truncate_diff_for_llm(&s, 100), s);
+    }
+
+    #[test]
+    fn diff_longer_than_limit_is_truncated_with_omission_marker() {
+        let s: String = "y".repeat(500);
+        let out = truncate_diff_for_llm(&s, 100);
+        assert!(out.contains("省略中间"));
+        // 头 + 尾保留共 max_chars 个字符；占位文本"... (省略中间 N 字符) ..."另算
+        assert!(out.len() > 100);
+        // 头部应该是 'y'（66 个）开头，尾部也是 'y'（34 个）结尾
+        assert!(out.starts_with("yyyy"));
+        assert!(out.ends_with("yyyy"));
+    }
+
+    #[test]
+    fn truncation_omitted_count_is_correct() {
+        let s: String = "z".repeat(1000);
+        let out = truncate_diff_for_llm(&s, 100);
+        // 1000 - 100 = 900 被省略
+        assert!(out.contains("省略中间 900"));
+    }
+
+    #[test]
+    fn multibyte_chars_not_split_in_middle() {
+        // 用中文（每字符 3 字节）确保 char 边界而不是 byte 边界切断
+        let chinese: String = "中".repeat(500);
+        let out = truncate_diff_for_llm(&chinese, 60);
+        // 输出能正常作为 UTF-8 字符串使用 = 没切到字符中间
+        assert!(out.contains("中"));
+        assert!(out.contains("省略中间"));
+        // 字节计算来自 char 数：60 个"中"被保留 → ≥180 bytes（不算占位）
+        let chars_count = out.chars().count();
+        assert!(chars_count > 60); // 含占位文本
+    }
+
+    #[test]
+    fn head_tail_split_is_two_thirds_one_third() {
+        let s: String = "a".repeat(300);
+        let out = truncate_diff_for_llm(&s, 90);
+        // max=90 → head=60, tail=30；查 omitted 数：300-90 = 210
+        assert!(out.contains("省略中间 210"));
+    }
+}
+
+/// 基于 staged diff 让 LLM 生成中文 conventional commit message。
+/// 调用方负责先验证 diff 非空 + 已加载 LlmConfig。
+pub fn generate_commit_message(cfg: &LlmConfig, diff: &str) -> Result<String, String> {
+    if diff.trim().is_empty() {
+        return Err("diff 为空，不能生成 commit message".to_string());
+    }
+    let truncated = truncate_diff_for_llm(diff, COMMIT_MSG_DIFF_LIMIT);
+    let system = "你是 git commit 助手。根据用户给的 staged diff 生成一条简洁的中文 \
+conventional commit message。要求：\n\
+- 第一行格式：<type>: <subject>，subject 中文，30 字以内\n\
+- type 必须从这些里选：feat / fix / refactor / docs / test / style / chore / perf\n\
+- 若改动复杂可在第三行起加正文，每行不超过 80 字，正文也用中文\n\
+- 不要 markdown 代码块包裹（不要 ```），直接输出 commit 内容\n\
+- 不要解释、不要前后多余的话、不要在前面写 \"好的\" \"以下是\" 之类\n\
+- 不要输出任何评论 / 思考过程，只输出最终 commit 文本";
+    let user = format!("以下是 staged diff：\n\n{}", truncated);
+    // commit message 生成是机械任务，强制关思考模式——避免某些 reasoning model 把
+    // 一行 commit 当 reasoning 跑几十秒
+    let raw = chat_completion(cfg, system, &user, Some(false))?;
+    // 兜底清理：万一 LLM 没听话裹了 ```，剥掉
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```text")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return Err("LLM 返回空消息".to_string());
+    }
+    Ok(cleaned)
+}
+
 /// LLM 输出契约用 snake_case（见 prompt 模板里要求的 JSON 结构），
 /// 这里直接默认 snake_case，不要加 rename_all。
 #[derive(Debug, Clone, Serialize, Deserialize)]

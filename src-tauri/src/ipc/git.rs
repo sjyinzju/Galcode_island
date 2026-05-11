@@ -459,6 +459,32 @@ pub fn git_show_file_diff(cwd: String, hash: String, path: String) -> Result<Git
     Ok(GitDiff { diff: stdout, empty })
 }
 
+/// 用 LLM 基于 staged diff 生成中文 conventional commit message。
+/// 流程：拿 `git diff --cached` → 喂给 LLM → 返回干净字符串给前端填到 commit 输入框。
+///
+/// 走 async + spawn_blocking：LLM 调用是同步阻塞 IO（几秒），不挪到 blocking pool
+/// 会卡 Tauri IPC 线程，导致同时段所有 IPC 都不响应。
+#[tauri::command]
+pub async fn git_generate_commit_message(cwd: String) -> Result<String, String> {
+    // 第一阶段：拿 staged diff（同步 git 命令，毫秒级，留在调用线程）
+    let (ok, diff, stderr) = run_git(&cwd, &["diff", "--cached"])?;
+    // git diff 有时即使非 0 退出也带 stdout（如二进制文件提示），只在 stdout 完全空时报错
+    if diff.trim().is_empty() {
+        if !ok && !stderr.trim().is_empty() {
+            return Err(stderr.trim().to_string());
+        }
+        return Err("没有 staged 改动——请先暂存要提交的文件".to_string());
+    }
+
+    // 第二阶段：把 LLM 调用挪到 blocking pool，反正是 reqwest::blocking
+    let cfg = crate::llm::client::load_llm_config().ok_or_else(|| {
+        "LLM 未配置——请去全局设置里填 Base URL / API Key / Model".to_string()
+    })?;
+    tokio::task::spawn_blocking(move || crate::llm::client::generate_commit_message(&cfg, &diff))
+        .await
+        .map_err(|e| format!("LLM 任务调度失败: {e}"))?
+}
+
 /// 丢弃工作区某个文件的改动（`git checkout -- <path>`，未跟踪文件改用删除）。
 #[tauri::command]
 pub fn git_discard(cwd: String, path: String, untracked: Option<bool>) -> Result<(), String> {
