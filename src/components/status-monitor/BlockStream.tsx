@@ -15,13 +15,15 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useActiveTabActions, useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useUiStore, type ActiveMatch } from "../../stores/useUiStore";
 import type { CliBlock } from "../../types/blocks";
 import { countOccurrences, highlightText } from "./highlight";
 import { ErrorDiagnosisCard } from "./ErrorDiagnosisCard";
+import { isNearBottom } from "./scrollUtils";
 
 /// 子组件公共的高亮上下文 prop —— 没 query 时所有子组件渲染行为退化为原状。
 interface HighlightCtx {
@@ -523,6 +525,14 @@ function BlockRenderer({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JS
   }
 }
 
+/// 单个 block 行的初始高度估计——只在 virtualizer 还没 measure 真实高度时用，
+/// 之后会被 ResizeObserver 自动校正。给个偏小的中位数让首屏渲染快一点，
+/// 实际高度从 30px (短文本) 到 500+px (大 diff) 都有。
+const ESTIMATED_BLOCK_HEIGHT = 80;
+/// overscan：屏幕上下各多渲染几个 block，让快速滚动时不会出现白屏，
+/// 也让用户在 ErrorLine 上展开"详情"后短距离滚走再回来还能保留 state。
+const VIRTUAL_OVERSCAN = 8;
+
 export function BlockStream(): JSX.Element | null {
   const blocks = useActiveTabField("cliBlocks");
   const activeTabId = useActiveTabId();
@@ -533,73 +543,113 @@ export function BlockStream(): JSX.Element | null {
 
   const hl: HighlightCtx = searchQuery ? { query: searchQuery, activeMatch } : NO_HIGHLIGHT;
 
-  // 每个 block 的 wrapper ref，用于 cmd+f 命中时 scrollIntoView
-  const refs = useRef<Record<string, HTMLDivElement | null>>({});
-
-  useEffect(() => {
-    if (!activeMatch) return;
-    const node = refs.current[activeMatch.blockId];
-    if (node) {
-      node.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
-  }, [activeMatch]);
-
-  // Agent 流式输出时自动跟随到底部；用户向上滚动则暂停跟随，回到底部附近又重新启用。
-  // key={activeTabId} 切 tab 时容器重挂载，ref 重置默认 true，新 tab 会自动滚到底。
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  // 虚拟列表滚动容器：parentRef 给 useVirtualizer 用，stickToBottomRef 跟踪
+  // "用户是否仍在底部附近"——key={activeTabId} 让切 tab 时整个容器重挂载，
+  // virtualizer 自然 reset，stickToBottomRef 也回到 true。
+  const parentRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
 
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    if (stickToBottomRef.current) {
-      el.scrollTop = el.scrollHeight;
+  /// blockId → 数组下标的反向索引，加速 cmd+f 跳转时的查找（O(1) 替代 findIndex 的 O(N)）。
+  /// 流式期间 blocks 数组每次都换引用，useMemo 会重建——但重建本身是 O(N) 跟 findIndex 一样，
+  /// 多次查找时仍有节省。
+  const blockIdToIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    for (let i = 0; i < blocks.length; i += 1) {
+      const b = blocks[i];
+      if (b) m.set(b.id, i);
     }
+    return m;
   }, [blocks]);
 
+  const virtualizer = useVirtualizer({
+    count: blocks.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => ESTIMATED_BLOCK_HEIGHT,
+    overscan: VIRTUAL_OVERSCAN,
+    // 用 block.id 当 key 让 React reconcile 稳定——blocks 数组中间插入 / 替换时不会破坏
+    // 不相关 row 的内部 state（ErrorLine expanded / UserPromptBlock copied flash）
+    getItemKey: (index) => blocks[index]?.id ?? String(index),
+  });
+
+  // cmd+f 命中跳转：把按 ref scrollIntoView 改成 virtualizer.scrollToIndex —— virtualize
+  // 后那个 block 可能不在 DOM 里，scrollIntoView 失效。useLayoutEffect 比 useEffect 早一帧，
+  // 让滚动跟搜索结果显示同步（避免视觉上"先停一下才跳"）。
+  useLayoutEffect(() => {
+    if (!activeMatch) return;
+    const idx = blockIdToIndex.get(activeMatch.blockId);
+    if (idx === undefined) return;
+    virtualizer.scrollToIndex(idx, { align: "center", behavior: "smooth" });
+  }, [activeMatch, blockIdToIndex, virtualizer]);
+
+  // Auto-scroll-to-bottom：流式 block 到达时，若用户没向上滚走，自动跟到最新。
+  // 用 scrollToIndex(length-1, align:end) 让 virtualizer 帮我们处理动态高度——比直接
+  // 设 scrollTop=scrollHeight 更准，因为 virtualizer 知道实际渲染高度。
+  useEffect(() => {
+    if (blocks.length === 0) return;
+    if (!stickToBottomRef.current) return;
+    virtualizer.scrollToIndex(blocks.length - 1, { align: "end" });
+  }, [blocks, virtualizer]);
+
   const handleScroll = (): void => {
-    const el = containerRef.current;
+    const el = parentRef.current;
     if (!el) return;
-    // 32px 容差：用户在底部附近的细微反向滚动不算"想看历史"
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distance < 32;
+    stickToBottomRef.current = isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight);
   };
 
   if (blocks.length === 0) return null;
 
-  // key={activeTabId}：切 tab 时强制滚动容器重挂载，scrollTop 自然清零，
-  // 不需要手动持久化 / 恢复滚动位置（每个 tab 独立流，回到该 tab 看见的就是
-  // 那个 tab 当下的全量 blocks 列表）。
+  const virtualItems = virtualizer.getVirtualItems();
+  const totalSize = virtualizer.getTotalSize();
+
+  // key={activeTabId}：切 tab 时强制滚动容器 + virtualizer 重挂载，scrollTop 自然清零，
+  // stickToBottomRef 回到 true（重新挂载默认值），切回该 tab 时自动滚到底。
   return (
     <div
       key={activeTabId ?? "no-tab"}
-      ref={containerRef}
+      ref={parentRef}
       onScroll={handleScroll}
-      className="flex h-full flex-col gap-2 overflow-y-auto px-1 py-1 text-xs leading-relaxed"
+      className="h-full overflow-y-auto px-1 py-1 text-xs leading-relaxed"
     >
-      {blocks.map((block) => {
-        const clickable = shouldOpenDetailOnClick(block.type);
-        const isOpenInRight = detailBlockId === block.id;
-        const wrapperCls = [
-          clickable ? "cursor-pointer transition-all hover:translate-x-0.5" : "",
-          isOpenInRight ? "ring-1 ring-sky-400/50 rounded-md" : "",
-        ]
-          .filter(Boolean)
-          .join(" ");
-        return (
-          <div
-            key={block.id}
-            ref={(el) => {
-              refs.current[block.id] = el;
-            }}
-            onClick={clickable ? () => setDetailBlock(block) : undefined}
-            className={wrapperCls}
-            title={clickable ? "点击在右栏查看完整内容" : undefined}
-          >
-            <BlockRenderer block={block} hl={hl} />
-          </div>
-        );
-      })}
+      {/* 撑出整个虚拟列表的总高度（让滚动条比例正确）；内部 row 用 absolute 定位 */}
+      <div style={{ height: totalSize, position: "relative", width: "100%" }}>
+        {virtualItems.map((vRow) => {
+          const block = blocks[vRow.index];
+          if (!block) return null;
+          const clickable = shouldOpenDetailOnClick(block.type);
+          const isOpenInRight = detailBlockId === block.id;
+          const wrapperCls = [
+            clickable ? "cursor-pointer transition-all hover:translate-x-0.5" : "",
+            isOpenInRight ? "ring-1 ring-sky-400/50 rounded-md" : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return (
+            <div
+              key={vRow.key}
+              data-index={vRow.index}
+              // measureElement：把这个 DOM 节点挂到 ResizeObserver，virtualizer
+              // 自动测量它的实际高度并更新内部高度表；动态高度 block (长 diff / 短 status)
+              // 都能正确占位，不需要我们手动 measure
+              ref={virtualizer.measureElement}
+              onClick={clickable ? () => setDetailBlock(block) : undefined}
+              className={wrapperCls}
+              title={clickable ? "点击在右栏查看完整内容" : undefined}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                transform: `translateY(${vRow.start}px)`,
+                // 原来用 flex-col gap-2 实现 row 间距；virtualize 后子元素 absolute 定位，
+                // gap 失效——用 paddingBottom 模拟 8px 间距，measureElement 会把这部分算进总高度
+                paddingBottom: "8px",
+              }}
+            >
+              <BlockRenderer block={block} hl={hl} />
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
