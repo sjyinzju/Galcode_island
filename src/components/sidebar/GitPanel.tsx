@@ -16,6 +16,7 @@
 // 样式遵循 ProjectTree / HistoryList：圆角卡片、白底/暗色玻璃感、灰边。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence } from "framer-motion";
 import { invoke } from "../../lib/bridge";
 import { useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
 import { GitDiffViewer } from "./GitDiffViewer";
@@ -549,25 +550,31 @@ export function GitPanel(): JSX.Element {
         );
       })()}
 
-      {/* diff 浮层 —— 工作区 / 暂存区 / 未跟踪都走 git_diff */}
-      {viewingFile && projectPath ? (
-        <GitDiffViewer
-          title={viewingFile.path}
-          subtitle={
-            viewingFile.staged ? "已暂存" : viewingFile.untracked ? "未跟踪" : "未暂存"
-          }
-          loaderKey={`workdir:${viewingFile.path}:${viewingFile.staged}:${viewingFile.untracked}`}
-          loader={() =>
-            invoke<GitDiffResult>("git_diff", {
-              cwd: projectPath,
-              path: viewingFile.path,
-              staged: viewingFile.staged,
-              untracked: viewingFile.untracked,
-            })
-          }
-          onClose={() => setViewingFile(null)}
-        />
-      ) : null}
+      {/* diff 浮层 —— 工作区 / 暂存区 / 未跟踪都走 git_diff。
+          AnimatePresence 让 GitDiffViewer 的 exit 动画（淡出 + 左移）有机会播完。
+          注意 key 必须稳定（不绑 file.path），切换文件时同一 viewer 重 load，
+          不要 unmount → remount 重放动画。 */}
+      <AnimatePresence>
+        {viewingFile && projectPath ? (
+          <GitDiffViewer
+            key="workdir-diff"
+            title={viewingFile.path}
+            subtitle={
+              viewingFile.staged ? "已暂存" : viewingFile.untracked ? "未跟踪" : "未暂存"
+            }
+            loaderKey={`workdir:${viewingFile.path}:${viewingFile.staged}:${viewingFile.untracked}`}
+            loader={() =>
+              invoke<GitDiffResult>("git_diff", {
+                cwd: projectPath,
+                path: viewingFile.path,
+                staged: viewingFile.staged,
+                untracked: viewingFile.untracked,
+              })
+            }
+            onClose={() => setViewingFile(null)}
+          />
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }

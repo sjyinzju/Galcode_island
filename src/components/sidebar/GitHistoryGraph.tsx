@@ -10,6 +10,7 @@
 // 后续如需扩展，FileRow 那一套 hover-action 模式可复用。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence } from "framer-motion";
 import { invoke } from "../../lib/bridge";
 import { GitDiffViewer } from "./GitDiffViewer";
 
@@ -501,22 +502,25 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
         })}
       </div>
 
-      {/* commit diff 浮层：覆盖整个图表区域 */}
-      {viewingCommitFile ? (
-        <GitDiffViewer
-          title={viewingCommitFile.path}
-          subtitle={`${viewingCommitFile.shortHash} · 此提交中的变更`}
-          loaderKey={`commit:${viewingCommitFile.hash}:${viewingCommitFile.path}`}
-          loader={() =>
-            invoke<GitDiffResult>("git_show_file_diff", {
-              cwd,
-              hash: viewingCommitFile.hash,
-              path: viewingCommitFile.path,
-            })
-          }
-          onClose={() => setViewingCommitFile(null)}
-        />
-      ) : null}
+      {/* commit diff 浮层：portal 到 body，溢出 sidebar 宽度，淡入淡出 */}
+      <AnimatePresence>
+        {viewingCommitFile ? (
+          <GitDiffViewer
+            key="commit-diff"
+            title={viewingCommitFile.path}
+            subtitle={`${viewingCommitFile.shortHash} · 此提交中的变更`}
+            loaderKey={`commit:${viewingCommitFile.hash}:${viewingCommitFile.path}`}
+            loader={() =>
+              invoke<GitDiffResult>("git_show_file_diff", {
+                cwd,
+                hash: viewingCommitFile.hash,
+                path: viewingCommitFile.path,
+              })
+            }
+            onClose={() => setViewingCommitFile(null)}
+          />
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
