@@ -522,6 +522,254 @@ pub async fn git_generate_commit_message(cwd: String) -> Result<String, String> 
         .map_err(|e| format!("LLM 任务调度失败: {e}"))?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranch {
+    /// 短名（如 "main" 或 "origin/main"）—— 直接拿来当 git checkout 的目标
+    pub name: String,
+    /// 是否当前分支（HEAD 指向）；列表里只会有 0 或 1 个
+    pub current: bool,
+    /// 是否远端跟踪分支（refs/remotes/...），用于 UI 标灰 + checkout 时建本地 tracking
+    pub remote: bool,
+}
+
+/// 解析 `git for-each-ref` 输出。提到顶层方便单测；每行格式：
+///   `<HEAD_marker>\t<refname:short>\t<refname>`
+/// HEAD_marker 为 "*" 表示当前分支、" " 表示其它。
+/// 跳过 refs/remotes/origin/HEAD 这种"指向默认分支的别名"，避免在列表里重复。
+/// 注意：不同 git 版本对 refs/remotes/origin/HEAD 的 short name 输出不一致：
+///   - 老版本 → "origin/HEAD"
+///   - 新版本 → "origin"
+/// 所以必须用 **full refname** 末尾的 "/HEAD" 判断，而不是 short 名。
+fn parse_branches_output(stdout: &str) -> Vec<GitBranch> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let marker = parts[0];
+        let short = parts[1].trim();
+        let full = parts[2].trim();
+        if short.is_empty() || full.is_empty() {
+            continue;
+        }
+        // 用 full ref 判断 —— 跨 git 版本稳定，覆盖 short="origin" / "origin/HEAD" 两种形态
+        if full.ends_with("/HEAD") {
+            continue;
+        }
+        out.push(GitBranch {
+            name: short.to_string(),
+            current: marker == "*",
+            remote: full.starts_with("refs/remotes/"),
+        });
+    }
+    out
+}
+
+/// 把 git checkout 的英文 stderr 翻成用户能看懂的中文（保留英文原文方便排查）。
+/// 这里收 git 命令最常见的几种失败，匹配关键短语；其它直接透传原文。
+fn translate_checkout_error(stderr: &str) -> String {
+    let lower = stderr.to_lowercase();
+    if lower.contains("would be overwritten by checkout")
+        || lower.contains("would be overwritten by merge")
+    {
+        return format!(
+            "工作区有未提交改动，切换分支会覆盖这些文件。\n\
+             请先提交或暂存（git stash）你的改动，再切换分支。\n\n\
+             原始错误：\n{stderr}"
+        );
+    }
+    if lower.contains("did not match any file(s) known to git")
+        || lower.contains("pathspec") && lower.contains("did not match")
+    {
+        return format!(
+            "找不到这个分支——可能是名字拼错或它已被删除。\n\n原始错误：\n{stderr}"
+        );
+    }
+    if lower.contains("you have unmerged paths") {
+        return format!(
+            "当前有未解决的合并冲突，git 拒绝切换分支。\n\
+             先把冲突解决并提交，或者放弃这次合并（git merge --abort）。\n\n\
+             原始错误：\n{stderr}"
+        );
+    }
+    if lower.contains("untracked working tree files") && lower.contains("overwritten") {
+        return format!(
+            "目标分支会覆盖你工作区里的未跟踪文件（同名）。\n\
+             先备份或删除这些文件再切换。\n\n\
+             原始错误：\n{stderr}"
+        );
+    }
+    stderr.to_string()
+}
+
+/// 列出所有 local 分支 + remote-tracking 分支。
+/// 用于"切换分支"下拉。current=true 标记当前 HEAD，remote=true 表示远端跟踪分支。
+#[tauri::command]
+pub fn git_list_branches(cwd: String) -> Result<Vec<GitBranch>, String> {
+    let (ok, stdout, stderr) = run_git(
+        &cwd,
+        &[
+            "for-each-ref",
+            "--format=%(HEAD)\t%(refname:short)\t%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    if !ok {
+        return Err(stderr.trim().to_string());
+    }
+    Ok(parse_branches_output(&stdout))
+}
+
+/// 切换分支。
+///   - local 分支（如 "feat/foo"）：直接 `git checkout feat/foo`
+///   - remote 分支（如 "origin/main"）：自动用 `-B <local>` 创建 / 重置本地 tracking 分支，
+///     避免直接 checkout origin/main 进入 detached HEAD。本地名取去掉第一段 remote 前缀后的剩余。
+/// 失败原因常见：工作区脏 / 有未提交冲突，把 stderr 透出去让前端展示，由用户决定先提交 / stash。
+#[tauri::command]
+pub fn git_checkout_branch(cwd: String, branch: String, remote: Option<bool>) -> Result<(), String> {
+    let branch = branch.trim().to_string();
+    if branch.is_empty() {
+        return Err("分支名不能为空".to_string());
+    }
+    let is_remote = remote.unwrap_or(false);
+    let result = if is_remote {
+        // 从 "origin/main" 推 local "main"；从 "origin/feat/x" 推 local "feat/x"
+        let local = branch.splitn(2, '/').nth(1).unwrap_or("").trim();
+        if local.is_empty() {
+            return Err(format!("无法从远端引用 {branch} 推断本地分支名"));
+        }
+        run_git(&cwd, &["checkout", "-B", local, branch.as_str()])?
+    } else {
+        run_git(&cwd, &["checkout", branch.as_str()])?
+    };
+    let (ok, _stdout, stderr) = result;
+    if !ok {
+        return Err(translate_checkout_error(stderr.trim()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::parse_branches_output;
+
+    #[test]
+    fn parses_local_and_remote_branches() {
+        let stdout = "\
+*\tmain\trefs/heads/main
+ \tdev\trefs/heads/dev
+ \torigin/main\trefs/remotes/origin/main
+ \torigin/dev\trefs/remotes/origin/dev
+";
+        let bs = parse_branches_output(stdout);
+        assert_eq!(bs.len(), 4);
+        assert_eq!(bs[0].name, "main");
+        assert!(bs[0].current);
+        assert!(!bs[0].remote);
+        assert_eq!(bs[1].name, "dev");
+        assert!(!bs[1].current);
+        assert!(!bs[1].remote);
+        assert_eq!(bs[2].name, "origin/main");
+        assert!(!bs[2].current);
+        assert!(bs[2].remote);
+    }
+
+    #[test]
+    fn skips_origin_head_alias() {
+        let stdout = "\
+ \torigin/main\trefs/remotes/origin/main
+ \torigin/HEAD\trefs/remotes/origin/HEAD
+";
+        let bs = parse_branches_output(stdout);
+        assert_eq!(bs.len(), 1);
+        assert_eq!(bs[0].name, "origin/main");
+    }
+
+    #[test]
+    fn skips_malformed_lines() {
+        // 缺字段 / 空行都跳过
+        let stdout = "\
+*\tmain\trefs/heads/main
+just one column
+*\t
+
+
+ \tdev\trefs/heads/dev
+";
+        let bs = parse_branches_output(stdout);
+        assert_eq!(bs.len(), 2);
+        assert_eq!(bs[0].name, "main");
+        assert_eq!(bs[1].name, "dev");
+    }
+
+    #[test]
+    fn detached_head_no_current() {
+        // detached HEAD 状态下 for-each-ref 不会给任何分支标 '*'
+        let stdout = "\
+ \tmain\trefs/heads/main
+ \tdev\trefs/heads/dev
+";
+        let bs = parse_branches_output(stdout);
+        assert!(bs.iter().all(|b| !b.current));
+    }
+
+    #[test]
+    fn skips_origin_short_alias_new_git_format() {
+        // 新版 git 把 refs/remotes/origin/HEAD 的 short name 缩成 "origin"
+        // （而不是 "origin/HEAD"）—— 必须靠 full ref 末尾 "/HEAD" 判断才能跳过
+        let stdout = "\
+*\tmain\trefs/heads/main
+ \torigin\trefs/remotes/origin/HEAD
+ \torigin/main\trefs/remotes/origin/main
+";
+        let bs = parse_branches_output(stdout);
+        assert_eq!(bs.len(), 2);
+        assert_eq!(bs[0].name, "main");
+        assert_eq!(bs[1].name, "origin/main");
+        // 确认没有 phantom "origin" 这一项
+        assert!(bs.iter().all(|b| b.name != "origin"));
+    }
+}
+
+#[cfg(test)]
+mod checkout_error_tests {
+    use super::translate_checkout_error;
+
+    #[test]
+    fn translates_dirty_worktree_overwrite() {
+        let stderr = "error: Your local changes to the following files would be overwritten by checkout: src/foo.ts\nPlease commit your changes or stash them before you switch branches.\nAborting";
+        let out = translate_checkout_error(stderr);
+        assert!(out.contains("工作区有未提交改动"));
+        assert!(out.contains("暂存") || out.contains("stash"));
+        // 保留英文原文方便排查
+        assert!(out.contains("would be overwritten"));
+    }
+
+    #[test]
+    fn translates_unknown_branch() {
+        let stderr = "error: pathspec 'nonexistent' did not match any file(s) known to git";
+        let out = translate_checkout_error(stderr);
+        assert!(out.contains("找不到这个分支"));
+    }
+
+    #[test]
+    fn translates_unmerged_paths() {
+        let stderr = "error: you have unmerged paths.\nPlease, fix them up in the work tree, and then use 'git add/rm <file>'";
+        let out = translate_checkout_error(stderr);
+        assert!(out.contains("未解决的合并冲突"));
+    }
+
+    #[test]
+    fn passes_through_unknown_errors() {
+        let stderr = "fatal: some weird git internal error";
+        let out = translate_checkout_error(stderr);
+        assert_eq!(out, stderr);
+    }
+}
+
 /// 丢弃工作区某个文件的改动（`git checkout -- <path>`，未跟踪文件改用删除）。
 #[tauri::command]
 pub fn git_discard(cwd: String, path: String, untracked: Option<bool>) -> Result<(), String> {

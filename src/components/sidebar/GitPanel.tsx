@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence } from "framer-motion";
 import { invoke } from "../../lib/bridge";
 import { useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
+import { BranchSwitcher } from "./BranchSwitcher";
 import { GitDiffViewer } from "./GitDiffViewer";
 import { GitHistoryGraph } from "./GitHistoryGraph";
 
@@ -141,10 +142,13 @@ export function GitPanel(): JSX.Element {
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [viewingFile, setViewingFile] = useState<GitFileEntry | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("changes");
-  /// 用单调递增的 key 让历史图表知道何时该重新拉取（每次 commit / sync 后 +1）
+  /// 用单调递增的 key 让历史图表知道何时该重新拉取（每次 commit / sync / 切分支后 +1）
   const [historyReloadKey, setHistoryReloadKey] = useState<number>(0);
   // 切 tab 时上一份 status 立刻失效，避免短暂闪现旧仓库数据
   const requestSeqRef = useRef(0);
+  // 分支切换浮窗：anchor 记录"切换分支"按钮的位置，让浮窗定位到按钮正下方
+  const [branchPickerAnchor, setBranchPickerAnchor] = useState<DOMRect | null>(null);
+  const branchBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const refresh = useCallback(async (): Promise<void> => {
     if (!projectPath) {
@@ -353,19 +357,33 @@ export function GitPanel(): JSX.Element {
             </span>
           )}
         </div>
+        {/* 工具栏：切换分支 / 历史图表 等分剩余宽度；刷新缩成纯图标固定在最右 */}
         <div className="flex items-center gap-0.5">
           <button
+            ref={branchBtnRef}
             type="button"
-            onClick={() => void refresh()}
-            disabled={loading}
-            title="刷新状态"
-            className="flex h-6 flex-1 items-center justify-center gap-1 rounded text-[11px] text-zinc-500 transition-colors hover:bg-black/5 hover:text-zinc-700 disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-zinc-200"
+            onClick={() => {
+              if (branchPickerAnchor) {
+                setBranchPickerAnchor(null);
+                return;
+              }
+              const rect = branchBtnRef.current?.getBoundingClientRect();
+              if (rect) setBranchPickerAnchor(rect);
+            }}
+            title="切换分支"
+            className={`flex h-6 flex-1 items-center justify-center gap-1 rounded text-[11px] transition-colors ${
+              branchPickerAnchor
+                ? "bg-sky-400/15 text-sky-700 dark:bg-sky-400/15 dark:text-sky-200"
+                : "text-zinc-500 hover:bg-black/5 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-zinc-200"
+            }`}
           >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}>
-              <path d="M2.5 8a5.5 5.5 0 019.6-3.6M13.5 8a5.5 5.5 0 01-9.6 3.6" strokeLinecap="round" />
-              <path d="M11.5 2v2.5h-2.5M4.5 14v-2.5h2.5" strokeLinecap="round" strokeLinejoin="round" />
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
+              <circle cx="4" cy="3.5" r="1.4" />
+              <circle cx="4" cy="12.5" r="1.4" />
+              <circle cx="12" cy="8" r="1.4" />
+              <path d="M4 5v6M5.5 3.5h5a2 2 0 012 2v1M5.5 12.5h5a2 2 0 002-2V9.5" strokeLinecap="round" />
             </svg>
-            刷新
+            切换分支
           </button>
           <button
             type="button"
@@ -384,6 +402,20 @@ export function GitPanel(): JSX.Element {
               <path d="M4 5v6M5.4 3.5h4.7a2 2 0 012 2v0.5M5.4 12.5h4.7a2 2 0 002-2V10" strokeLinecap="round" />
             </svg>
             历史图表
+          </button>
+          {/* 刷新：紧凑图标按钮，占固定 24px 宽，不与左侧两按钮抢空间 */}
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            disabled={loading}
+            title="刷新状态"
+            aria-label="刷新状态"
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-zinc-500 transition-colors hover:bg-black/5 hover:text-zinc-700 disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-white/5 dark:hover:text-zinc-200"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className={`h-3 w-3 ${loading ? "animate-spin" : ""}`}>
+              <path d="M2.5 8a5.5 5.5 0 019.6-3.6M13.5 8a5.5 5.5 0 01-9.6 3.6" strokeLinecap="round" />
+              <path d="M11.5 2v2.5h-2.5M4.5 14v-2.5h2.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
           </button>
         </div>
       </div>
@@ -572,6 +604,28 @@ export function GitPanel(): JSX.Element {
               })
             }
             onClose={() => setViewingFile(null)}
+          />
+        ) : null}
+      </AnimatePresence>
+
+      {/* 分支切换浮窗：fixed 定位到"切换分支"按钮下方，淡入淡出 */}
+      <AnimatePresence>
+        {branchPickerAnchor && projectPath ? (
+          <BranchSwitcher
+            key="branch-switcher"
+            cwd={projectPath}
+            anchorRect={{
+              left: branchPickerAnchor.left,
+              bottom: branchPickerAnchor.bottom,
+              right: branchPickerAnchor.right,
+            }}
+            onClose={() => setBranchPickerAnchor(null)}
+            onSwitched={() => {
+              setActionFeedback("分支已切换");
+              setHistoryReloadKey((k) => k + 1);
+              void refresh();
+            }}
+            onError={(msg) => setError(msg)}
           />
         ) : null}
       </AnimatePresence>

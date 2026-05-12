@@ -30,8 +30,9 @@ use ipc::commands::{
     update_backend_preferences, update_llm_settings,
 };
 use ipc::git::{
-    git_commit, git_diff, git_discard, git_generate_commit_message, git_log, git_pull, git_push,
-    git_show_commit_files, git_show_file_diff, git_stage, git_status, git_unstage,
+    git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
+    git_list_branches, git_log, git_pull, git_push, git_show_commit_files, git_show_file_diff,
+    git_stage, git_status, git_unstage,
 };
 use std::sync::Arc;
 
@@ -211,6 +212,8 @@ pub fn run() {
             git_show_commit_files,
             git_show_file_diff,
             git_generate_commit_message,
+            git_list_branches,
+            git_checkout_branch,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
