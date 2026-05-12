@@ -52,16 +52,27 @@ function commitFileStatusColor(status: string): string {
   }
 }
 
-interface LaneAssignment {
-  /// 当前 commit 圆点画在第几列
-  column: number;
-  /// 进入本行前的 lanes 状态（每个元素是该 lane 正等着的 commit hash）
-  prevLanes: (string | null)[];
-  /// 退出本行后的 lanes 状态
-  nextLanes: (string | null)[];
+/// lane 槽位：除了等待的 hash，还带一个 colorId，让"分支身份"在压缩后
+/// 仍能延续颜色。如果只用 idx 选色，压缩位置时颜色会跳变。
+interface LaneSlot {
+  hash: string;
+  colorId: number;
 }
 
-/// 用 5-6 种鲜艳色循环染色，跟 VSCode Git Graph 类似。透明度 0.95 让暗色背景下不刺眼。
+interface LaneAssignment {
+  /// 当前 commit 圆点画在 prevLanes 的第几列
+  column: number;
+  /// 进入本行前的 lanes 状态（已包含本行 commit 自己）
+  prevLanes: (LaneSlot | null)[];
+  /// 退出本行后的 lanes 状态（已压缩，去掉中间 null —— 让 lane 按需向左挤）
+  nextLanes: (LaneSlot | null)[];
+  /// commit 的某个 parent 已经在另一条 lane 上等待 → 视觉上从 commit 圆点
+  /// 画曲线流入那条 lane（同一 hash 不能让两条 lane 等，否则会有"幽灵 lane"）。
+  /// idx 是该 parent 在 nextLanes 中的列号，colorId 用来上色
+  mergeOutLanes: { idx: number; colorId: number }[];
+}
+
+/// 用 5-6 种鲜艳色循环染色，跟 VSCode Git Graph 类似。
 const LANE_COLORS = [
   "#38bdf8", // sky
   "#34d399", // emerald
@@ -71,48 +82,113 @@ const LANE_COLORS = [
   "#fb7185", // rose
 ];
 
-function laneColor(idx: number): string {
-  return LANE_COLORS[idx % LANE_COLORS.length] ?? LANE_COLORS[0]!;
+function laneColor(colorId: number): string {
+  return LANE_COLORS[colorId % LANE_COLORS.length] ?? LANE_COLORS[0]!;
 }
 
-/// 把 commits 列表算出每行的 lane 布局。返回 commits 等长的 LaneAssignment 数组。
-/// 算法：
-///   维护 lanes[] —— 每个槽位存"在该 lane 上等着出现的 commit hash"
-///   对每个 commit：
-///     1. 找它在 lanes 里的位置；找不到则塞入第一个空位（或追加新 lane）
-///     2. 记录 column = 找到的位置；prevLanes = 当前 lanes 的快照
-///     3. 把该位置替换为 parents[0]；没有 parents 则置 null
-///     4. parents[1..] 每个挨个去找空位放入（合并视为引出新 lane）
-///     5. 记录 nextLanes = 替换后的快照
+/// 按需展开的 lane 算法。核心思路：
+/// - lane 没东西时让位（每行末尾压缩，去掉中间 null）；下次复活时落在更靠左的位置
+/// - lane 颜色绑定到"分支身份"（colorId 跟 hash 走），跨行稳定，压缩后不跳色
+/// - 每个 hash 只能在一条 lane 上等待 —— 防止"幽灵 lane"贯穿到底
+///
+/// 每个 commit 的处理步骤：
+///   1. 在 lanes 中找自己（findOrAdd）拿到 column；记录 prevLanes 快照
+///   2. 清空当前 lane（commit 已被消化）
+///   3. parents[0]：
+///        - 已在另一条 lane 上等 → 不重复添加，记 mergeOutLane
+///        - 否则 → 当前 column 继承（沿用 commit 的 colorId，分支身份不变）
+///   4. parents[1..]：每个 parent
+///        - 已在另一条 lane 上等 → 记 mergeOutLane
+///        - 否则 → 新分支，分配新 colorId，放到 column 右侧（merge 视觉上向右分叉）
+///   5. limit 外的 parent 不入 lane —— 否则 lane 会贯穿到底
+///   6. 压缩 lanes（移除所有 null），让 lane 列号紧凑
 function computeLanes(commits: GitCommit[]): LaneAssignment[] {
-  const lanes: (string | null)[] = [];
+  const commitSet = new Set(commits.map((c) => c.hash));
+  const lanes: (LaneSlot | null)[] = [];
+  let nextColorId = 0;
+  /// 在 lanes 中找 hash 所在 lane 的 idx；不存在返回 -1
+  const findLane = (hash: string): number =>
+    lanes.findIndex((l) => l !== null && l.hash === hash);
+  /// 找 c.hash 在 lanes 中的位置；找不到则填第一个空位（或追加），并分配新 colorId
+  /// 用于 commit 自身入列 —— ref tip 类 commit 首次出现时走 push 分支
   const findOrAdd = (hash: string): number => {
-    const idx = lanes.indexOf(hash);
+    const idx = findLane(hash);
     if (idx >= 0) return idx;
+    const slot: LaneSlot = { hash, colorId: nextColorId++ };
     const empty = lanes.indexOf(null);
     if (empty >= 0) {
-      lanes[empty] = hash;
+      lanes[empty] = slot;
       return empty;
     }
-    lanes.push(hash);
+    lanes.push(slot);
+    return lanes.length - 1;
+  };
+  /// merge 引入的 parent[1..] 专用：强制放在 column 右侧空位，否则新分支线
+  /// 会跑到主线左侧、横跨主线显示
+  const addAfter = (slot: LaneSlot, after: number): number => {
+    for (let i = after + 1; i < lanes.length; i += 1) {
+      if (lanes[i] === null) {
+        lanes[i] = slot;
+        return i;
+      }
+    }
+    lanes.push(slot);
     return lanes.length - 1;
   };
 
   const result: LaneAssignment[] = [];
   for (const c of commits) {
     const column = findOrAdd(c.hash);
+    const selfColorId = lanes[column]!.colorId;
     const prev = lanes.slice();
-    // 当前 commit 这条 lane 替换为 first parent（或 null）
-    lanes[column] = c.parents[0] ?? null;
-    // 处理 merge：parents[1..] 各自占一个 lane
-    for (let i = 1; i < c.parents.length; i += 1) {
-      findOrAdd(c.parents[i]!);
+    // 当前 commit 已消化，清空它的 lane
+    lanes[column] = null;
+    const mergeOutLanes: { idx: number; colorId: number }[] = [];
+
+    c.parents.forEach((p, pIdx) => {
+      // limit 外的 parent：不入 lane（避免贯穿到底的幽灵线）
+      if (!commitSet.has(p)) return;
+      const existing = findLane(p);
+      if (existing >= 0) {
+        // 这个 hash 已经在等着 —— 不能重复入 lane（否则有幽灵 lane）
+        // 记一条从 commit 流入该 lane 的合并曲线，颜色用那条 lane 的
+        if (existing !== column) {
+          mergeOutLanes.push({ idx: existing, colorId: lanes[existing]!.colorId });
+        }
+        return;
+      }
+      if (pIdx === 0 && lanes[column] === null) {
+        // 主父继承 commit 的 lane —— 同一分支身份延续，颜色不变
+        lanes[column] = { hash: p, colorId: selfColorId };
+      } else {
+        // 新分支 lane：新 colorId，放到 column 右侧
+        addAfter({ hash: p, colorId: nextColorId++ }, column);
+      }
+    });
+
+    // 压缩：移除所有 null —— 让 lane 列号按需展开、不预占位置
+    // 注意：压缩会让 lane 的列号在行间漂移（这正是用户要的"按需展开"效果），
+    // 颜色因为绑定 colorId 而不会跟着跳变；连线时上半段曲线会从 prev 列号
+    // 弯到 next 列号，视觉上表达 lane 的横向挪动
+    let w = 0;
+    for (let r = 0; r < lanes.length; r += 1) {
+      const l = lanes[r];
+      if (l !== null) {
+        lanes[w] = l;
+        w += 1;
+      }
     }
-    // trim 末尾连续 null，避免 lane 数无谓增长
-    while (lanes.length > 0 && lanes[lanes.length - 1] === null) {
-      lanes.pop();
-    }
-    result.push({ column, prevLanes: prev, nextLanes: lanes.slice() });
+    lanes.length = w;
+
+    // 修正 mergeOutLanes 的 idx —— 压缩后位置可能变了，根据 colorId 找新位置
+    const fixedMerge = mergeOutLanes
+      .map((m) => {
+        const newIdx = lanes.findIndex((l) => l !== null && l.colorId === m.colorId);
+        return newIdx >= 0 ? { idx: newIdx, colorId: m.colorId } : null;
+      })
+      .filter((m): m is { idx: number; colorId: number } => m !== null);
+
+    result.push({ column, prevLanes: prev, nextLanes: lanes.slice(), mergeOutLanes: fixedMerge });
   }
   return result;
 }
@@ -152,21 +228,29 @@ function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
   const dotX = assign.column * LANE_WIDTH + LANE_WIDTH / 2;
   const dotY = ROW_HEIGHT / 2;
 
-  // 上半段：每个 prev lane 的"顶 → 中点"段
-  //   - 自己列那条直接画 (x, 0) → (dotX, dotY)（同列时退化直线）
-  //   - 别的列若在 next 里同 hash 不同列，画曲线到 next 列；若 hash 消失在本行，画曲线到 dotX（被合并进当前 commit）
+  // 上半段：prev → dotY 这一段
+  //   - commit 自身 lane（i == column）→ 直线进入圆点 (column.x, 0) → (dotX, dotY)
+  //   - 其他 lane 在行中"通过"：在上半段就把横向位置挪到 next 列，圆点高度处就位 ——
+  //     这样圆点处所有"通过 lane"都已经在 next 位置，视觉对齐
+  //   - 其他 lane 在 next 里找不到（被本 commit 消化或终止）→ 弯进 dotX
   const upper: JSX.Element[] = [];
-  assign.prevLanes.forEach((hash, i) => {
-    if (hash === null) return;
+  assign.prevLanes.forEach((slot, i) => {
+    if (slot === null) return;
     const x = i * LANE_WIDTH + LANE_WIDTH / 2;
-    // 该 prev lane 在 next 里的位置：找到说明它"穿过"本行；找不到说明被本 commit 消化（合并进当前 lane）
-    const j = assign.nextLanes.indexOf(hash);
-    const targetX = j >= 0 ? x : dotX; // hash 消失 → 视为流入当前 commit
+    let targetX: number;
+    if (i === assign.column) {
+      targetX = dotX; // 自己 lane：直进圆点
+    } else {
+      // 用 colorId（不是 hash）在 next 找位置 —— commit 处理后 lane 上的 hash
+      // 会变成 parent.hash，但 colorId 不变（同分支身份延续）
+      const j = assign.nextLanes.findIndex((l) => l !== null && l.colorId === slot.colorId);
+      targetX = j >= 0 ? j * LANE_WIDTH + LANE_WIDTH / 2 : dotX;
+    }
     upper.push(
       <path
         key={`u${i}`}
         d={curvePath(x, 0, targetX, dotY)}
-        stroke={laneColor(i)}
+        stroke={laneColor(slot.colorId)}
         strokeWidth={LINE_WIDTH}
         fill="none"
         opacity={LANE_OPACITY}
@@ -174,21 +258,29 @@ function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
     );
   });
 
-  // 下半段：每个 next lane 的"中点 → 底"段
-  //   - 是从 dotX 分叉出来（merge 引入的新 lane）→ 从 (dotX, dotY) 曲线到 (x, ROW_HEIGHT)
-  //   - 否则正常 → 从 (x, dotY) 直线/曲线到 (x, ROW_HEIGHT)
+  // 下半段：dotY → ROW_HEIGHT 这一段
+  //   - 是 commit 自身 lane 的延续（P0 继承同 colorId）→ 从 dotX 出发，曲线/直线到 next 列
+  //     （commit lane 在圆点处分叉是合理的"主线挪位置"视觉）
+  //   - 是新引入 lane（prev 没有同 colorId）→ 从 dotX 曲线分叉
+  //   - 是行中通过的其他 lane → 上半段已挪到 next 列，下半段直线到底
   const lower: JSX.Element[] = [];
-  assign.nextLanes.forEach((hash, i) => {
-    if (hash === null) return;
+  assign.nextLanes.forEach((slot, i) => {
+    if (slot === null) return;
     const x = i * LANE_WIDTH + LANE_WIDTH / 2;
-    // 这条 next lane 是不是 prev 里没有的"新"lane？是的话从 commit 圆点曲线分叉
-    const wasInPrev = assign.prevLanes.indexOf(hash) >= 0;
-    const fromX = wasInPrev ? x : dotX;
+    const prevIdx = assign.prevLanes.findIndex((l) => l !== null && l.colorId === slot.colorId);
+    let fromX: number;
+    if (prevIdx < 0) {
+      fromX = dotX; // 新 lane 从圆点分叉
+    } else if (prevIdx === assign.column) {
+      fromX = dotX; // commit 自身 lane 延续，从圆点出发
+    } else {
+      fromX = x; // 行中通过的 lane：上半段已经挪到位，下半段垂直
+    }
     lower.push(
       <path
         key={`l${i}`}
         d={curvePath(fromX, dotY, x, ROW_HEIGHT)}
-        stroke={laneColor(i)}
+        stroke={laneColor(slot.colorId)}
         strokeWidth={LINE_WIDTH}
         fill="none"
         opacity={LANE_OPACITY}
@@ -196,9 +288,26 @@ function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
     );
   });
 
-  // merge 的多 parent 已经被 lower 那里"从 dotX 分叉"逻辑覆盖到，不需要单独的 mergeBranches
+  // 合并曲线：parent 已在另一 lane 上等待时，从 commit 圆点斜向流入那条 lane
+  // 底部 —— 视觉上表达"汇入"，同时是幽灵 lane 修复的视觉补全
+  const mergeLines: JSX.Element[] = [];
+  assign.mergeOutLanes.forEach((m, k) => {
+    const x = m.idx * LANE_WIDTH + LANE_WIDTH / 2;
+    mergeLines.push(
+      <path
+        key={`m${k}`}
+        d={curvePath(dotX, dotY, x, ROW_HEIGHT)}
+        stroke={laneColor(m.colorId)}
+        strokeWidth={LINE_WIDTH}
+        fill="none"
+        opacity={LANE_OPACITY}
+      />,
+    );
+  });
 
-  const fillColor = laneColor(assign.column);
+  // commit 圆点的颜色：取 prev[column] 自己的 colorId（必然存在，刚 findOrAdd 进去的）
+  const selfSlot = assign.prevLanes[assign.column];
+  const fillColor = selfSlot ? laneColor(selfSlot.colorId) : LANE_COLORS[0]!;
   // root commit 用空心圆区分 + 不再画下半段（lowerLines 自然不会画该 lane）
   // 普通 commit 实心圆，merge commit 双层圆（外圈空，内圈填）
   const dot = isMerge ? (
@@ -216,6 +325,7 @@ function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
     <svg width={width} height={ROW_HEIGHT} className="shrink-0">
       {upper}
       {lower}
+      {mergeLines}
       {dot}
     </svg>
   );
@@ -225,12 +335,12 @@ function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
 /// 用 div 而非 SVG —— SVG 的 percentage height 在 flex `self-stretch` 父容器下
 /// 会 fallback 到 default 150px（无确定 parent height）；div absolute inset-y-0
 /// 不存在这个 chicken-and-egg 问题，高度由 sibling（文件列表）主导，完美自适应。
-function ContinuationGraph({ lanes }: { lanes: (string | null)[] }): JSX.Element {
+function ContinuationGraph({ lanes }: { lanes: (LaneSlot | null)[] }): JSX.Element {
   const cols = Math.max(lanes.length, 1);
   return (
     <div className="relative h-full" style={{ width: cols * LANE_WIDTH }}>
-      {lanes.map((hash, i) => {
-        if (hash === null) return null;
+      {lanes.map((slot, i) => {
+        if (slot === null) return null;
         const x = i * LANE_WIDTH + LANE_WIDTH / 2;
         return (
           <div
@@ -239,7 +349,7 @@ function ContinuationGraph({ lanes }: { lanes: (string | null)[] }): JSX.Element
             style={{
               left: x - LINE_WIDTH / 2,
               width: LINE_WIDTH,
-              backgroundColor: laneColor(i),
+              backgroundColor: laneColor(slot.colorId),
               opacity: LANE_OPACITY,
             }}
           />
@@ -348,6 +458,16 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
   );
 
   const assignments = useMemo(() => computeLanes(commits), [commits]);
+  /// 全局最大 lane 数 —— graph 区在每行实际按需展开，但容器宽度统一到这个值，
+  /// 让所有 commit subject 起点对齐到同一列；上限 MAX_GRAPH_WIDTH 防止过宽抢空间
+  const globalCellWidth = useMemo(() => {
+    let maxCols = 1;
+    for (const a of assignments) {
+      const c = Math.max(a.prevLanes.length, a.nextLanes.length, a.column + 1);
+      if (c > maxCols) maxCols = c;
+    }
+    return Math.min(maxCols * LANE_WIDTH, MAX_GRAPH_WIDTH);
+  }, [assignments]);
 
   if (loading) {
     return (
@@ -393,14 +513,9 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
           const files = filesByHash.get(c.hash);
           const isFilesLoading = filesLoading.has(c.hash);
           const fileErr = filesError.get(c.hash);
-          // 每行 graph 区按该行实际 lane 数算宽度（VSCode 风格）—— 不再用全局 maxLanes
-          // 让单 lane 行紧凑 (8px)，多 lane 行宽 (≤40px)；subject 自然贴着 lane 显示
-          const rowCols = Math.max(
-            assign.prevLanes.length,
-            assign.nextLanes.length,
-            assign.column + 1,
-          );
-          const rowCellWidth = Math.min(Math.max(rowCols, 1) * LANE_WIDTH, MAX_GRAPH_WIDTH);
+          // graph 区容器宽度用全局 max —— 让所有 commit subject 起点对齐
+          // 每行内部按需展开 lane（GraphCell SVG 会自己算实际占用宽度）
+          const rowCellWidth = globalCellWidth;
           return (
             <div key={c.hash} className="flex flex-col">
               <button

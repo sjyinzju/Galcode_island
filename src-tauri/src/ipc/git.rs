@@ -339,7 +339,11 @@ pub struct GitCommit {
 }
 
 /// 取最近 `limit` 条提交（默认 200，上限 1000，避免一次拉爆）。
-/// 用 `--all --exclude=refs/stash` + `--date-order` 让分支线在前端图里能正确展开。
+/// 用 `--all --exclude=refs/stash` + `--date-order` 让分支线按提交时间排列。
+/// 排序选型：date-order 比 topo-order 视觉更稳定——topo-order 会把一条非主线
+/// 分支的整条 history 一口气输出完才回主线，导致主线 lane 被长时间搁置。
+/// 配合前端 lane 算法里"hash 不重复入 lane + 已等待 lane 复用"的修复，
+/// date-order 整体更紧凑。
 /// `refs/stash` 是 `git stash` 用的临时引用，stash 在 git 里也是真实 commit，
 /// 但跟"项目提交历史"语义不同——用户不应该在 history 图表里看到它们；显式排除。
 /// 字段间用 ASCII 0x1F (Unit Separator) 分隔，避免 subject 里的特殊字符干扰解析。
