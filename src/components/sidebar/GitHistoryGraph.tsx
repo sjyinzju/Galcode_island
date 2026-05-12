@@ -118,12 +118,12 @@ function computeLanes(commits: GitCommit[]): LaneAssignment[] {
 }
 
 /// 单行高 / 单 lane 宽 / 圆点半径 —— 用统一常量便于 SVG 绝对定位。
-/// VSCode 风格：graph 列只占很窄一条（约 28px），把屏幕让给 commit subject。
+/// VSCode 风格：graph 列尽量窄，把屏幕让给 commit subject。
 const ROW_HEIGHT = 26;
-const LANE_WIDTH = 10;
-const DOT_RADIUS = 2.6;
-const LINE_WIDTH = 1.3;
-/// graph 区域的硬上限：5 lanes (50px)。超出的分支被 SVG 视口裁掉，
+const LANE_WIDTH = 8;
+const DOT_RADIUS = 2.2;
+const LINE_WIDTH = 1.2;
+/// graph 区域硬上限：5 lanes (40px)。超出的分支被 SVG 视口裁掉，
 /// 工程上罕见同时活着 5+ 条分支；超出也不会让 graph 抢走 commit 信息的空间。
 const MAX_GRAPH_WIDTH = LANE_WIDTH * 5;
 
@@ -135,95 +135,68 @@ interface GraphCellProps {
 
 /// 单行的 graph 部分：把 prev → 本行中点的上半段竖线，本行中点 → next 的下半段
 /// 竖线，以及圆点画进同一个 SVG。Merge 时 parent[1] 走斜线接到新 lane。
+/// 跨列连接：用三次贝塞尔曲线让线条平滑（控制点在垂直方向的中点 → 视觉上 "S 形 → 接近直角"）。
+/// 同列时退化成直线。stroke 不透明度 0.75 让 graph 不喧宾夺主，更接近 VSCode 视觉。
+function curvePath(x1: number, y1: number, x2: number, y2: number): string {
+  if (x1 === x2) return `M ${x1} ${y1} L ${x2} ${y2}`;
+  // 控制点：竖向中点处保持各自 x 坐标 → 顶部和底部都是直立切线，中段平滑过渡
+  const midY = (y1 + y2) / 2;
+  return `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
+}
+
+const LANE_OPACITY = 0.6;
+
 function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
   const cols = Math.max(assign.prevLanes.length, assign.nextLanes.length, assign.column + 1);
   const width = Math.max(cols * LANE_WIDTH, LANE_WIDTH);
   const dotX = assign.column * LANE_WIDTH + LANE_WIDTH / 2;
   const dotY = ROW_HEIGHT / 2;
 
-  // 上半段：每个 prev lane 从 (x, 0) 到 (x, dotY) 都画线（如果 lane 在 prev 不为 null）
-  const upperLines: JSX.Element[] = [];
+  // 上半段：每个 prev lane 的"顶 → 中点"段
+  //   - 自己列那条直接画 (x, 0) → (dotX, dotY)（同列时退化直线）
+  //   - 别的列若在 next 里同 hash 不同列，画曲线到 next 列；若 hash 消失在本行，画曲线到 dotX（被合并进当前 commit）
+  const upper: JSX.Element[] = [];
   assign.prevLanes.forEach((hash, i) => {
     if (hash === null) return;
     const x = i * LANE_WIDTH + LANE_WIDTH / 2;
-    // 当前 commit 那条 lane 的上半段也画（让圆点跟上一行的线衔接）
-    upperLines.push(
-      <line
+    // 该 prev lane 在 next 里的位置：找到说明它"穿过"本行；找不到说明被本 commit 消化（合并进当前 lane）
+    const j = assign.nextLanes.indexOf(hash);
+    const targetX = j >= 0 ? x : dotX; // hash 消失 → 视为流入当前 commit
+    upper.push(
+      <path
         key={`u${i}`}
-        x1={x}
-        y1={0}
-        x2={x === dotX ? x : x}
-        y2={x === dotX ? dotY : dotY}
+        d={curvePath(x, 0, targetX, dotY)}
         stroke={laneColor(i)}
         strokeWidth={LINE_WIDTH}
+        fill="none"
+        opacity={LANE_OPACITY}
       />,
     );
-    // 如果该 prev lane 不是当前 commit 这条，需要把它直通到 next 那侧的同名 lane
-    // —— 这里 upper 部分只画到 dotY，下半段由 lowerLines 处理
   });
 
-  // 下半段：next lanes 从 (x, dotY) 到 (x, ROW_HEIGHT)
-  const lowerLines: JSX.Element[] = [];
+  // 下半段：每个 next lane 的"中点 → 底"段
+  //   - 是从 dotX 分叉出来（merge 引入的新 lane）→ 从 (dotX, dotY) 曲线到 (x, ROW_HEIGHT)
+  //   - 否则正常 → 从 (x, dotY) 直线/曲线到 (x, ROW_HEIGHT)
+  const lower: JSX.Element[] = [];
   assign.nextLanes.forEach((hash, i) => {
     if (hash === null) return;
     const x = i * LANE_WIDTH + LANE_WIDTH / 2;
-    lowerLines.push(
-      <line
+    // 这条 next lane 是不是 prev 里没有的"新"lane？是的话从 commit 圆点曲线分叉
+    const wasInPrev = assign.prevLanes.indexOf(hash) >= 0;
+    const fromX = wasInPrev ? x : dotX;
+    lower.push(
+      <path
         key={`l${i}`}
-        x1={x}
-        y1={dotY}
-        x2={x}
-        y2={ROW_HEIGHT}
+        d={curvePath(fromX, dotY, x, ROW_HEIGHT)}
         stroke={laneColor(i)}
         strokeWidth={LINE_WIDTH}
+        fill="none"
+        opacity={LANE_OPACITY}
       />,
     );
   });
 
-  // 直通连线：prev lane（非当前列）需要从上方接到下方对应 lane（即使位置变了，也连一根）
-  // 简化：如果某个 hash 同时出现在 prev 和 next，但 prev/next 列号不同，画一根斜线衔接
-  const passthrough: JSX.Element[] = [];
-  assign.prevLanes.forEach((hash, i) => {
-    if (hash === null) return;
-    if (i === assign.column) return;
-    const j = assign.nextLanes.indexOf(hash);
-    if (j < 0) return;
-    if (i === j) return; // 同列已由上下竖线覆盖
-    passthrough.push(
-      <line
-        key={`p${i}-${j}`}
-        x1={i * LANE_WIDTH + LANE_WIDTH / 2}
-        y1={0}
-        x2={j * LANE_WIDTH + LANE_WIDTH / 2}
-        y2={ROW_HEIGHT}
-        stroke={laneColor(i)}
-        strokeWidth={LINE_WIDTH}
-      />,
-    );
-  });
-
-  // Merge 提示：parents[1..] 占了新 lane，从圆点画一条到这些新 lane 的下半段
-  // —— 已经被 lowerLines 的同 lane 竖线覆盖一部分，再补一根斜线从 dotX,dotY 到 newLaneX,ROW_HEIGHT
-  const mergeBranches: JSX.Element[] = [];
-  if (isMerge) {
-    assign.nextLanes.forEach((hash, i) => {
-      if (hash === null) return;
-      if (i === assign.column) return;
-      // 只对"在 prev 里不存在的新 lane"画分叉斜线
-      if (assign.prevLanes.indexOf(hash) >= 0) return;
-      mergeBranches.push(
-        <line
-          key={`m${i}`}
-          x1={dotX}
-          y1={dotY}
-          x2={i * LANE_WIDTH + LANE_WIDTH / 2}
-          y2={ROW_HEIGHT}
-          stroke={laneColor(i)}
-          strokeWidth={LINE_WIDTH}
-        />,
-      );
-    });
-  }
+  // merge 的多 parent 已经被 lower 那里"从 dotX 分叉"逻辑覆盖到，不需要单独的 mergeBranches
 
   const fillColor = laneColor(assign.column);
   // root commit 用空心圆区分 + 不再画下半段（lowerLines 自然不会画该 lane）
@@ -241,12 +214,38 @@ function GraphCell({ assign, isMerge, isRoot }: GraphCellProps): JSX.Element {
 
   return (
     <svg width={width} height={ROW_HEIGHT} className="shrink-0">
-      {passthrough}
-      {upperLines}
-      {lowerLines}
-      {mergeBranches}
+      {upper}
+      {lower}
       {dot}
     </svg>
+  );
+}
+
+/// commit 展开区左侧的"lane 续接"图：只画当前活跃的 lanes 各一根从顶到底的直线。
+/// 用 div 而非 SVG —— SVG 的 percentage height 在 flex `self-stretch` 父容器下
+/// 会 fallback 到 default 150px（无确定 parent height）；div absolute inset-y-0
+/// 不存在这个 chicken-and-egg 问题，高度由 sibling（文件列表）主导，完美自适应。
+function ContinuationGraph({ lanes }: { lanes: (string | null)[] }): JSX.Element {
+  const cols = Math.max(lanes.length, 1);
+  return (
+    <div className="relative h-full" style={{ width: cols * LANE_WIDTH }}>
+      {lanes.map((hash, i) => {
+        if (hash === null) return null;
+        const x = i * LANE_WIDTH + LANE_WIDTH / 2;
+        return (
+          <div
+            key={i}
+            className="absolute inset-y-0"
+            style={{
+              left: x - LINE_WIDTH / 2,
+              width: LINE_WIDTH,
+              backgroundColor: laneColor(i),
+              opacity: LANE_OPACITY,
+            }}
+          />
+        );
+      })}
+    </div>
   );
 }
 
@@ -349,13 +348,6 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
   );
 
   const assignments = useMemo(() => computeLanes(commits), [commits]);
-  const maxLanes = useMemo(() => {
-    let m = 1;
-    for (const a of assignments) {
-      m = Math.max(m, a.prevLanes.length, a.nextLanes.length, a.column + 1);
-    }
-    return m;
-  }, [assignments]);
 
   if (loading) {
     return (
@@ -379,10 +371,6 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
     );
   }
 
-  // graph 区域宽度 = min(实际 lanes, 上限) × LANE_WIDTH。
-  // SVG 内部仍按真实 column 画线条，超出 graphWidth 的分支被裁切，不会侵占 commit 信息空间。
-  const graphWidth = Math.min(Math.max(maxLanes, 1) * LANE_WIDTH, MAX_GRAPH_WIDTH);
-
   return (
     // overflow-x-hidden：单行如果某段意外超长（比如非常宽的 ref 标签），不让它撑出
     // 横向滚动条 —— 内层每一行都靠 truncate / shrink-0 处理溢出。
@@ -405,6 +393,14 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
           const files = filesByHash.get(c.hash);
           const isFilesLoading = filesLoading.has(c.hash);
           const fileErr = filesError.get(c.hash);
+          // 每行 graph 区按该行实际 lane 数算宽度（VSCode 风格）—— 不再用全局 maxLanes
+          // 让单 lane 行紧凑 (8px)，多 lane 行宽 (≤40px)；subject 自然贴着 lane 显示
+          const rowCols = Math.max(
+            assign.prevLanes.length,
+            assign.nextLanes.length,
+            assign.column + 1,
+          );
+          const rowCellWidth = Math.min(Math.max(rowCols, 1) * LANE_WIDTH, MAX_GRAPH_WIDTH);
           return (
             <div key={c.hash} className="flex flex-col">
               <button
@@ -417,7 +413,7 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
                 title={tooltip}
               >
                 <div
-                  style={{ width: graphWidth }}
+                  style={{ width: rowCellWidth }}
                   className="relative shrink-0 self-stretch overflow-hidden"
                 >
                   <GraphCell assign={assign} isMerge={isMerge} isRoot={isRoot} />
@@ -444,12 +440,18 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
                 ) : null}
               </button>
 
-              {/* 展开区：commit 修改的文件列表，缩进对齐到 graph 区右侧 */}
+              {/* 展开区：左侧 graph 续接（pass-through lanes 直线），右侧文件列表。
+                  续接区用同 row 的 cellWidth，保证 commit 行 / 展开区 / 下一 commit 行
+                  视觉对齐（subject / 文件列表起点 x 一致） */}
               {isExpanded ? (
-                <div
-                  className="flex flex-col gap-0.5 border-l border-sky-400/30 bg-zinc-50/40 py-1 pr-2 text-[11px] dark:border-sky-300/30 dark:bg-zinc-800/30"
-                  style={{ paddingLeft: graphWidth + 12 }}
-                >
+                <div className="flex bg-zinc-50/40 dark:bg-zinc-800/30">
+                  <div
+                    style={{ width: rowCellWidth }}
+                    className="relative shrink-0 self-stretch overflow-hidden"
+                  >
+                    <ContinuationGraph lanes={assign.nextLanes} />
+                  </div>
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5 border-l border-sky-400/30 py-1 pl-3 pr-2 text-[11px] dark:border-sky-300/30">
                   {isFilesLoading && !files ? (
                     <div className="px-1 py-0.5 text-[10px] text-zinc-400 dark:text-zinc-500">
                       读取文件列表…
@@ -495,6 +497,7 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
                       );
                     })
                   ) : null}
+                  </div>
                 </div>
               ) : null}
             </div>

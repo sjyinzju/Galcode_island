@@ -339,7 +339,9 @@ pub struct GitCommit {
 }
 
 /// 取最近 `limit` 条提交（默认 200，上限 1000，避免一次拉爆）。
-/// 用 `--all` + `--date-order` 让分支线在前端图里能正确展开。
+/// 用 `--all --exclude=refs/stash` + `--date-order` 让分支线在前端图里能正确展开。
+/// `refs/stash` 是 `git stash` 用的临时引用，stash 在 git 里也是真实 commit，
+/// 但跟"项目提交历史"语义不同——用户不应该在 history 图表里看到它们；显式排除。
 /// 字段间用 ASCII 0x1F (Unit Separator) 分隔，避免 subject 里的特殊字符干扰解析。
 #[tauri::command]
 pub fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
@@ -348,7 +350,14 @@ pub fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String
     let fmt = "--pretty=format:%H\u{1f}%h\u{1f}%an\u{1f}%at\u{1f}%P\u{1f}%D\u{1f}%s";
     let (ok, stdout, stderr) = run_git(
         &cwd,
-        &["log", "--all", "--date-order", n_arg.as_str(), fmt],
+        &[
+            "log",
+            "--exclude=refs/stash",
+            "--all",
+            "--date-order",
+            n_arg.as_str(),
+            fmt,
+        ],
     )?;
     if !ok {
         return Err(stderr.trim().to_string());
