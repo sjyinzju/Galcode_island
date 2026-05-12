@@ -95,7 +95,12 @@ export function AboutModal(): JSX.Element {
               <div className="flex flex-col gap-5 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
                 {/* 应用头部：logo + 名字 */}
                 <div className="flex items-center gap-3">
-                  <div className="h-12 w-12 shrink-0 rounded-2xl bg-gradient-to-br from-amber-400 via-orange-500 to-amber-500 shadow-md shadow-amber-400/35" />
+                  <img
+                    src="/50EE91C4-396A-4B96-B116-C8B7373D898B.png"
+                    alt="Galcode Island"
+                    className="h-12 w-12 shrink-0 rounded-2xl object-cover shadow-md shadow-amber-400/35"
+                    draggable={false}
+                  />
                   <div className="flex min-w-0 flex-1 flex-col">
                     <h3 className="text-base font-bold text-zinc-800 dark:text-zinc-100">
                       Galcode Island
@@ -108,9 +113,7 @@ export function AboutModal(): JSX.Element {
 
                 {/* 简介 */}
                 <p className="text-[13px] leading-relaxed text-zinc-600 dark:text-zinc-300">
-                  把 Claude Code、OpenCode 和 Codex 放进同一套桌宠式界面里。直连各 CLI
-                  原生协议，再补上多 tab、会话持久化、结构化流式输出、跨设备同步、
-                  以及随任务状态变化的桌宠反馈。
+                  由凉宫春日开发组发布。
                 </p>
 
                 {/* 版本信息 + 检查更新 */}
