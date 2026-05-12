@@ -10,7 +10,8 @@
 // 后续如需扩展，FileRow 那一套 hover-action 模式可复用。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence } from "framer-motion";
+import { createPortal } from "react-dom";
+import { AnimatePresence, motion } from "framer-motion";
 import { invoke } from "../../lib/bridge";
 import { GitDiffViewer } from "./GitDiffViewer";
 
@@ -359,6 +360,199 @@ function ContinuationGraph({ lanes }: { lanes: (LaneSlot | null)[] }): JSX.Eleme
   );
 }
 
+/// 从 git remote URL 解析出 GitHub 仓库 base 链接（https://github.com/{user}/{repo}）。
+/// 支持 SSH 和 HTTPS 两种 origin 格式；其它 host（GitLab / Gitee / 自建）返回 null，
+/// 卡片就不显示"在 GitHub 打开"按钮。
+function parseGithubBase(remoteUrl: string | null | undefined): string | null {
+  if (!remoteUrl) return null;
+  // SSH: git@github.com:user/repo(.git)
+  let m = remoteUrl.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
+  if (m) return `https://github.com/${m[1]}/${m[2]}`;
+  // HTTPS: https://github.com/user/repo(.git)
+  m = remoteUrl.match(/^https?:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?\/?$/);
+  if (m) return `https://github.com/${m[1]}/${m[2]}`;
+  return null;
+}
+
+/// 相对时间（中文）—— 卡片头部显示，比绝对时间一眼能看出"多久之前"。
+function relTime(ts: number): string {
+  const diff = Math.max(0, Date.now() / 1000 - ts);
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)} 天前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400 / 7)} 周前`;
+  if (diff < 86400 * 365) return `${Math.floor(diff / 86400 / 30)} 个月前`;
+  return `${Math.floor(diff / 86400 / 365)} 年前`;
+}
+
+interface CommitHoverCardProps {
+  commit: GitCommit;
+  /// commit 行的 boundingClientRect，用来定位卡片
+  anchorRect: DOMRect;
+  /// GitHub 仓库 base URL；null 表示不显示 GitHub 相关按钮
+  githubBase: string | null;
+  /// commit 是否已推送到远端 —— 未推送时 GitHub 按钮禁用 + 状态提示
+  /// null 表示"还不知道"（推送状态尚在加载），按钮默认 enabled
+  isPushed: boolean | null;
+  /// 鼠标进入卡片时调用 —— 取消父级的隐藏延时（让卡片不消失）
+  onMouseEnter: () => void;
+  /// 鼠标离开卡片 —— 触发隐藏
+  onMouseLeave: () => void;
+}
+
+/// commit 悬停信息卡片：subject、refs、作者 · 时间、hash + 复制按钮、GitHub 跳转。
+/// portal 到 body 避免被 sidebar 的 overflow-hidden 裁掉；用 fixed 定位锚到 commit 行右侧。
+function CommitHoverCard({
+  commit,
+  anchorRect,
+  githubBase,
+  isPushed,
+  onMouseEnter,
+  onMouseLeave,
+}: CommitHoverCardProps): JSX.Element {
+  /// 复制反馈：用 enum 区分复制了什么 ——
+  /// 同时显示"复制 hash 成功"和"复制链接成功"在同一卡片上需要区分两个状态
+  const [copiedKind, setCopiedKind] = useState<"hash" | "link" | null>(null);
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  // 卡片渲染后才能拿到实际宽高 → 用 state 触发二次渲染来 clamp 位置
+  const [pos, setPos] = useState<{ left: number; top: number }>(() => ({
+    left: anchorRect.right + 8,
+    top: anchorRect.top,
+  }));
+
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el) return;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    // 默认放右侧；放不下翻到左侧；左右都放不下就 clamp 到右边界
+    let left = anchorRect.right + 8;
+    if (left + w > vw - 8) {
+      left = anchorRect.left - w - 8;
+      if (left < 8) left = vw - w - 8;
+    }
+    let top = anchorRect.top;
+    if (top + h > vh - 8) top = vh - h - 8;
+    if (top < 8) top = 8;
+    setPos({ left, top });
+  }, [anchorRect.left, anchorRect.right, anchorRect.top]);
+
+  const commitUrl = githubBase ? `${githubBase}/commit/${commit.hash}` : null;
+
+  const copyTo = async (kind: "hash" | "link", text: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKind(kind);
+      window.setTimeout(() => setCopiedKind((k) => (k === kind ? null : k)), 1400);
+    } catch {
+      /* clipboard 被拒——静默失败 */
+    }
+  };
+
+  const handleOpenGithub = async (): Promise<void> => {
+    if (!commitUrl || isPushed === false) return;
+    try {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(commitUrl);
+    } catch {
+      window.open(commitUrl, "_blank", "noopener,noreferrer");
+    }
+  };
+
+  const absTime = new Date(commit.timestamp * 1000).toLocaleString();
+  const githubDisabled = isPushed === false;
+
+  return createPortal(
+    <motion.div
+      ref={cardRef}
+      initial={{ opacity: 0, y: -2 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -2 }}
+      transition={{ duration: 0.12 }}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      style={{ position: "fixed", left: pos.left, top: pos.top, zIndex: 60 }}
+      className="w-[300px] rounded-lg border border-zinc-200 bg-white/95 p-3 shadow-xl backdrop-blur dark:border-zinc-700 dark:bg-zinc-900/95"
+    >
+      <div className="mb-1.5 break-words text-[12px] font-medium leading-snug text-zinc-900 dark:text-zinc-50">
+        {commit.subject || "(无提交说明)"}
+      </div>
+      {commit.refs.length > 0 ? (
+        <div className="mb-1.5 flex flex-wrap gap-1">
+          {commit.refs.map((r) => (
+            <span
+              key={r}
+              className="truncate rounded bg-sky-400/15 px-1.5 py-px font-mono text-[10px] leading-tight text-sky-700 dark:bg-sky-400/15 dark:text-sky-300"
+            >
+              {r}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <div className="mb-2 flex items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+        <span className="truncate">{commit.author}</span>
+        <span className="opacity-50">·</span>
+        <span title={absTime}>{relTime(commit.timestamp)}</span>
+      </div>
+      {githubDisabled && githubBase ? (
+        <div className="mb-2 rounded bg-amber-500/10 px-1.5 py-1 text-[10px] leading-tight text-amber-700 dark:bg-amber-400/10 dark:text-amber-300">
+          此提交尚未推送到远端，GitHub 上可能找不到
+        </div>
+      ) : null}
+      <div className="flex flex-wrap items-center gap-1">
+        <button
+          type="button"
+          onClick={() => void copyTo("hash", commit.hash)}
+          className={`flex shrink-0 items-center gap-1 rounded px-1.5 py-1 font-mono text-[10px] transition-colors ${
+            copiedKind === "hash"
+              ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+              : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+          }`}
+          title={copiedKind === "hash" ? "已复制完整 hash" : "复制完整 hash"}
+        >
+          <span>{commit.shortHash}</span>
+          <span className="opacity-60">{copiedKind === "hash" ? "✓" : "⧉"}</span>
+        </button>
+        {commitUrl ? (
+          <>
+            <button
+              type="button"
+              onClick={handleOpenGithub}
+              disabled={githubDisabled}
+              className={`flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[10px] transition-colors ${
+                githubDisabled
+                  ? "cursor-not-allowed bg-zinc-100/60 text-zinc-400 dark:bg-zinc-800/60 dark:text-zinc-600"
+                  : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+              }`}
+              title={githubDisabled ? "此 commit 未推送到远端" : "在 GitHub 打开此提交"}
+            >
+              <span>GitHub</span>
+              <span className="opacity-60">↗</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void copyTo("link", commitUrl)}
+              className={`flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[10px] transition-colors ${
+                copiedKind === "link"
+                  ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                  : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+              }`}
+              title={copiedKind === "link" ? "已复制 GitHub 链接" : "复制 GitHub 链接"}
+            >
+              <span>{copiedKind === "link" ? "已复制" : "复制链接"}</span>
+              <span className="opacity-60">{copiedKind === "link" ? "✓" : "⧉"}</span>
+            </button>
+          </>
+        ) : null}
+      </div>
+    </motion.div>,
+    document.body,
+  );
+}
+
 interface GitHistoryGraphProps {
   cwd: string;
   /// 父组件改变这个值（比如刚 commit 完）时，本组件会重新拉 git log
@@ -385,6 +579,56 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
     path: string;
     status: string;
   } | null>(null);
+  // 当前悬停的 commit 卡片 —— null 表示不显示
+  const [hoverCard, setHoverCard] = useState<{ commit: GitCommit; rect: DOMRect } | null>(null);
+  // 原始 remote URL（用于解析 GitHub base）。null = 还在加载或没有 remote
+  const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
+  const githubBase = useMemo(() => parseGithubBase(remoteUrl), [remoteUrl]);
+  // 已推送到远端的 commit hash 集合；null = 还在加载（按钮先按 enabled 显示）
+  const [pushedSet, setPushedSet] = useState<Set<string> | null>(null);
+  // hover 显示 / 隐藏延时句柄 —— 给用户从 commit 行移到卡片上的反应时间
+  const showTimerRef = useRef<number | null>(null);
+  const hideTimerRef = useRef<number | null>(null);
+
+  /// commit 行 hover 进入：延时 250ms 显示卡片；同时取消上一次"将要隐藏"的计时器
+  const scheduleShow = useCallback((commit: GitCommit, el: HTMLElement) => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+    if (showTimerRef.current !== null) window.clearTimeout(showTimerRef.current);
+    const rect = el.getBoundingClientRect();
+    showTimerRef.current = window.setTimeout(() => {
+      setHoverCard({ commit, rect });
+    }, 250);
+  }, []);
+
+  /// commit 行 hover 离开：200ms 后隐藏卡片，留时间让用户移动到卡片上 hover
+  const scheduleHide = useCallback(() => {
+    if (showTimerRef.current !== null) {
+      window.clearTimeout(showTimerRef.current);
+      showTimerRef.current = null;
+    }
+    if (hideTimerRef.current !== null) window.clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = window.setTimeout(() => {
+      setHoverCard(null);
+    }, 200);
+  }, []);
+
+  /// 卡片被 hover → 取消隐藏（让卡片保持显示）
+  const cancelHide = useCallback(() => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (showTimerRef.current !== null) window.clearTimeout(showTimerRef.current);
+      if (hideTimerRef.current !== null) window.clearTimeout(hideTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (!cwd) return;
@@ -397,6 +641,9 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
     setFilesLoading(new Set());
     setFilesError(new Map());
     setViewingCommitFile(null);
+    setHoverCard(null);
+    setRemoteUrl(null);
+    setPushedSet(null);
     invoke<GitCommit[]>("git_log", { cwd, limit: 200 })
       .then((res) => {
         if (seq !== reqSeqRef.current) return;
@@ -408,6 +655,26 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
       })
       .finally(() => {
         if (seq === reqSeqRef.current) setLoading(false);
+      });
+    // 拉 origin URL —— 失败 / 没有 origin 都视为"不能跳 GitHub"，静默
+    invoke<string | null>("git_remote_url", { cwd })
+      .then((url) => {
+        if (seq !== reqSeqRef.current) return;
+        setRemoteUrl(url);
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    // 拉"已推送到远端"的 commit 集合 —— 区分本地未 push commit，避免点 GitHub 404
+    invoke<string[]>("git_pushed_commits", { cwd })
+      .then((list) => {
+        if (seq !== reqSeqRef.current) return;
+        setPushedSet(new Set(list));
+      })
+      .catch(() => {
+        if (seq !== reqSeqRef.current) return;
+        // 失败时给空集 —— 所有 commit 视为未 push（保守，避免误导用户）
+        setPushedSet(new Set());
       });
   }, [cwd, reloadKey]);
 
@@ -507,9 +774,6 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
           const isRoot = c.parents.length === 0;
           const isHead = c.refs.includes("HEAD") || i === 0;
           const isExpanded = expanded.has(c.hash);
-          const tooltip = `${c.subject}\n\n${c.author} · ${new Date(
-            c.timestamp * 1000,
-          ).toLocaleString()}\n${c.shortHash}${c.refs.length > 0 ? `\n${c.refs.join(", ")}` : ""}`;
           const files = filesByHash.get(c.hash);
           const isFilesLoading = filesLoading.has(c.hash);
           const fileErr = filesError.get(c.hash);
@@ -521,11 +785,12 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
               <button
                 type="button"
                 onClick={() => toggleExpand(c.hash)}
+                onMouseEnter={(e) => scheduleShow(c, e.currentTarget)}
+                onMouseLeave={scheduleHide}
                 className={`group flex w-full cursor-pointer items-center gap-1.5 overflow-hidden pr-2 text-left text-[12px] text-zinc-700 transition-colors hover:bg-black/[0.04] dark:text-zinc-300 dark:hover:bg-white/[0.04] ${
                   isExpanded ? "bg-sky-400/10 dark:bg-sky-400/10" : ""
                 }`}
                 style={{ minHeight: ROW_HEIGHT, height: ROW_HEIGHT }}
-                title={tooltip}
               >
                 <div
                   style={{ width: rowCellWidth }}
@@ -636,6 +901,21 @@ export function GitHistoryGraph({ cwd, reloadKey }: GitHistoryGraphProps): JSX.E
               })
             }
             onClose={() => setViewingCommitFile(null)}
+          />
+        ) : null}
+      </AnimatePresence>
+
+      {/* commit 悬停卡片：portal 到 body 在 commit 行外部显示，可点按钮 */}
+      <AnimatePresence>
+        {hoverCard ? (
+          <CommitHoverCard
+            key={`hover-${hoverCard.commit.hash}`}
+            commit={hoverCard.commit}
+            anchorRect={hoverCard.rect}
+            githubBase={githubBase}
+            isPushed={pushedSet === null ? null : pushedSet.has(hoverCard.commit.hash)}
+            onMouseEnter={cancelHide}
+            onMouseLeave={scheduleHide}
           />
         ) : null}
       </AnimatePresence>

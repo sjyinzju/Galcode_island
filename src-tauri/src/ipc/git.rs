@@ -338,6 +338,43 @@ pub struct GitCommit {
     pub refs: Vec<String>,
 }
 
+/// 一次性列出所有"已经被任何 remote 看到过"的 commit hash。
+/// 用 `git rev-list --remotes` —— 从所有 refs/remotes/* ref tip 反向走对象图，
+/// 输出所有可达 commit；这正是"已 push"的定义。
+/// 没有 remote 时输出为空（不报错）。前端拿到结果做 Set 后 O(1) 判断每个 commit
+/// 是否 pushed —— 比逐个 `git branch -r --contains <hash>` 快得多。
+#[tauri::command]
+pub fn git_pushed_commits(cwd: String) -> Result<Vec<String>, String> {
+    let (ok, stdout, _stderr) = run_git(&cwd, &["rev-list", "--remotes"])?;
+    if !ok {
+        // 没有 remote / 仓库异常 —— 返回空集（前端把所有 commit 视为未 push）
+        return Ok(Vec::new());
+    }
+    Ok(stdout
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// 取 origin 的 fetch URL；没有 origin remote 时返回 None（不视为错误——
+/// 本地 init 的仓库就没有 origin，前端"在 GitHub 打开"按钮要相应隐藏）。
+/// 不做 SSH→HTTPS 转换：前端拿到原始 URL 自己判断格式（git@github.com:u/r.git 或
+/// https://github.com/u/r.git），构造 commit URL 时再标准化。
+#[tauri::command]
+pub fn git_remote_url(cwd: String) -> Result<Option<String>, String> {
+    let (ok, stdout, _stderr) = run_git(&cwd, &["remote", "get-url", "origin"])?;
+    if !ok {
+        return Ok(None);
+    }
+    let url = stdout.trim().to_string();
+    if url.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(url))
+    }
+}
+
 /// 取最近 `limit` 条提交（默认 200，上限 1000，避免一次拉爆）。
 /// 用 `--all --exclude=refs/stash` + `--date-order` 让分支线按提交时间排列。
 /// 排序选型：date-order 比 topo-order 视觉更稳定——topo-order 会把一条非主线
