@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "galcode_island"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "env_logger",
