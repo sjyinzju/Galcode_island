@@ -555,8 +555,25 @@ pub fn resolve_claude_binary(app: &AppHandle, requested: Option<&str>) -> PathBu
     normalize_requested_binary_path(PathBuf::from(desired))
 }
 
-/// 当前项目的 project root：含有 src-tauri 子目录的最近祖先。
-/// dev 时是 cwd 上溯，release 时退化为 resource_dir 的祖先。
+/// 拿一个 CLI 可用的工作目录。
+///
+/// dev 模式（从源码 cargo run）能命中 cwd 或 resource_dir 祖先里的源码树
+/// （含 `src-tauri/` + `package.json` 那个目录），保留原行为：这样 dev 时
+/// `--version` / `auth status` 等子命令的 cwd 是项目根，便于读 local 配置。
+///
+/// release 模式（.app / 安装的 exe）resource_dir 是 `Contents/Resources` /
+/// `<exe>/resources/`，往上爬都找不到源码标记 —— 这种情况下源码树根本不
+/// 存在于用户机器上，再坚持"必须找到源码"只会让所有 backend status / start
+/// 全部失败。退化策略按从可控到兜底排：
+///   1. tauri `app_local_data_dir`（macOS `~/Library/Application Support/.../`、
+///      Windows `%LOCALAPPDATA%\...\`、Linux `~/.local/share/...`）—— 一定存在
+///      或可创建；属于 app 自己的私有目录，cwd 在这里跑 CLI 不会污染用户目录
+///   2. 用户 home（`$HOME` / `%USERPROFILE%`）—— 极少数环境拿不到 data dir 时兜底
+///   3. 系统 temp dir —— 最后兜底，保证函数永不返回 Err
+///
+/// 注意：本函数返回的目录仅用作 spawn CLI 的 cwd，CLI 自己关心的工作目录
+/// 通过 `--cd` / `-C` / `cwd_for_serve` 等显式参数传给子进程，跟这里返回值
+/// 解耦，所以"非源码树"作为 cwd 没有语义副作用。
 pub fn resolve_project_root(app: &AppHandle) -> Result<PathBuf, String> {
     fn push_with_ancestors(candidates: &mut Vec<PathBuf>, path: PathBuf) {
         let mut current = Some(path);
@@ -594,9 +611,32 @@ pub fn resolve_project_root(app: &AppHandle) -> Result<PathBuf, String> {
         push_with_ancestors(&mut candidates, resource_dir.join("_up_"));
     }
 
-    candidates
+    if let Some(matched) = candidates
         .into_iter()
         .filter(|candidate| is_valid_project_root(candidate))
         .min_by_key(|candidate| (candidate_rank(candidate), candidate.components().count()))
-        .ok_or_else(|| "Unable to resolve Galcode project root.".to_string())
+    {
+        return Ok(matched);
+    }
+
+    // dev 源码树没找到 —— 走 release 兜底链。任何一层成功都立即返回，
+    // 失败的就 try 下一层；目录不存在但能创建就 create_dir_all 一次。
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
+        if data_dir.is_dir() || fs::create_dir_all(&data_dir).is_ok() {
+            return Ok(data_dir);
+        }
+    }
+    if let Some(home) = user_home_dir() {
+        if home.is_dir() {
+            return Ok(home);
+        }
+    }
+    // tempfile 这一层几乎不可能失败：std::env::temp_dir() 在三平台都返回
+    // OS 级 temp（macOS `/tmp`, Windows `%TEMP%`, Linux `/tmp` 或 `$TMPDIR`），
+    // 且无 Result —— 拿到的路径若不存在，再尝试 mkdir 一次兜底
+    let tmp = std::env::temp_dir();
+    if tmp.is_dir() || fs::create_dir_all(&tmp).is_ok() {
+        return Ok(tmp);
+    }
+    Err("Unable to resolve a writable working directory for Galcode CLI commands.".to_string())
 }

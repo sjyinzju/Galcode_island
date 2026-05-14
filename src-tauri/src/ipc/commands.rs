@@ -390,8 +390,14 @@ pub async fn list_llm_models(
 /// 通用字段 model/effort/proxy/binary，加 OpenCode 专属的 provider/apiKey/authMode。
 /// 后端的 launch_*_agent 在每次 turn 启动时都会读这份偏好。
 /// `backend` 取值：`"claude-code" | "codex" | "opencode"`。
+///
+/// 副作用：每次调用都顺手 `notify_one` 一下 `boot_prefs_ready` 门闩，让 boot
+/// 阶段等"前端 prefs 就绪"的延后任务（opencode auto-start）能开始动作。
+/// Notify 自带幂等性，多调几次没事；非 boot 阶段（用户改 settings）的调用也只
+/// 是消耗一个永远没人等的 permit，无副作用。
 #[tauri::command]
 pub fn update_backend_preferences(
+    runtime_state: State<'_, Arc<RuntimeState>>,
     backend: String,
     model: Option<String>,
     effort: Option<String>,
@@ -403,7 +409,9 @@ pub fn update_backend_preferences(
 ) -> Result<(), String> {
     crate::agent::preferences::update_backend_preferences(
         &backend, model, effort, proxy, binary, provider, api_key, auth_mode,
-    )
+    )?;
+    runtime_state.boot_prefs_ready.notify_one();
+    Ok(())
 }
 
 #[tauri::command]

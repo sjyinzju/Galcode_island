@@ -144,6 +144,45 @@ pub fn run() {
                 e
             }).ok();
 
+            // OpenCode 后台静默自启 —— 装了 CLI 就在 boot 阶段顺手把
+            // `opencode serve` 拉起来（占 DEFAULT_RUN_ID 槽位 + 默认端口 4096），
+            // 让 SettingsModal 一打开就看到"运行中"，给 OpenCode 选服务商/模型
+            // 不再需要用户先点"启动服务"。失败仅 warn，不阻塞 app 启动。
+            //
+            // 时机：先 await `boot_prefs_ready` —— 前端 App.tsx 跑完 useEffect
+            // 把用户存的 binary / proxy / provider 推进 Rust 内存（命中
+            // update_backend_preferences）后才动手，免得 auto-start 拿 None
+            // 默认 binary 起服务、用户在 tab 里又拿自定义 binary 起一份。
+            // 8s 超时兜底是为了"前端不推 prefs 的场景"（比如 LAN 浏览器客户端
+            // 是唯一连接、桌面 webview 一直没启动 useEffect），到点也得起服务，
+            // 不能让 OpenCode 永远等不到。
+            {
+                let handle_for_opencode = handle.clone();
+                let runtime_state = handle
+                    .state::<Arc<agent::runtime::RuntimeState>>()
+                    .inner()
+                    .clone();
+                tauri::async_runtime::spawn(async move {
+                    let notify = runtime_state.boot_prefs_ready.clone();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        notify.notified(),
+                    )
+                    .await
+                    {
+                        Ok(_) => log::debug!("[opencode] boot prefs ready, proceeding with auto-start"),
+                        Err(_) => log::info!(
+                            "[opencode] boot prefs ready timeout (8s), auto-starting with defaults"
+                        ),
+                    }
+                    agent::opencode::opencode_auto_start_silent(
+                        &handle_for_opencode,
+                        runtime_state.as_ref(),
+                    )
+                    .await;
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -385,8 +385,8 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
         "update_backend_preferences" => {
             let p: UpdateBackendPreferencesArgs = parse(args)?;
             commands::update_backend_preferences(
-                p.backend, p.model, p.effort, p.proxy, p.binary, p.provider, p.api_key,
-                p.auth_mode,
+                runtime_state, p.backend, p.model, p.effort, p.proxy, p.binary, p.provider,
+                p.api_key, p.auth_mode,
             )?;
             Ok(Value::Null)
         }

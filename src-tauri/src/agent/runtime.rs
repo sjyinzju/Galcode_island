@@ -39,12 +39,34 @@ pub const OPENCODE_BASE_PORT: u16 = 4096;
 // 因此 Codex 强制使用共享实例，通过 CODEX_SHARED_KEY 固定存放。
 pub const CODEX_SHARED_KEY: &str = "__codex_shared__";
 
-#[derive(Default)]
 pub struct RuntimeState {
     pub opencode: Mutex<HashMap<String, OpencodeState>>,
     pub codex: Mutex<HashMap<String, CodexAppServerState>>,
     pub claude: Mutex<HashMap<String, ClaudeStreamState>>,
     pub port_pool: Mutex<HashSet<u16>>,
+    /// 启动阶段"前端已把首批 backend 偏好推过来"的门闩。
+    ///
+    /// boot 时依赖 prefs 的延后任务（当前只有 opencode 自动启动）`.notified().await`
+    /// 这个 Notify，等前端 App.tsx 跑 `update_backend_preferences` 把用户存的
+    /// `binary` / `proxy` / `provider` 等同步进 Rust 内存后再开始动作。
+    ///
+    /// 用 tokio Notify 而不是 oneshot 有两个原因：
+    ///   1. 触发顺序鲁棒——先 `notify_one` 再 `notified()` 也能立即 ready（permit
+    ///      会被 buffer 一份），oneshot 必须先创建 receiver 才能 send
+    ///   2. 前端会连续推 3 个 backend，多次 `notify_one` 是幂等的（多余 permit 丢弃）
+    pub boot_prefs_ready: Arc<tokio::sync::Notify>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            opencode: Mutex::new(HashMap::new()),
+            codex: Mutex::new(HashMap::new()),
+            claude: Mutex::new(HashMap::new()),
+            port_pool: Mutex::new(HashSet::new()),
+            boot_prefs_ready: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

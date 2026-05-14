@@ -637,6 +637,60 @@ pub async fn opencode_start(
     Err("OpenCode did not become ready in time.".to_string())
 }
 
+/// 启动时自动跑一次 `opencode serve`（DEFAULT_RUN_ID 槽位 + 默认端口）。
+/// 调用方一般在 setup 阶段 fire-and-forget，且应当等 boot_prefs_ready 触发后再调，
+/// 这样能尊重用户在 settings 里设的 binary / proxy。本函数：
+///   - CLI 没装：静默跳过（只打 info 日志），不让"未装 OpenCode 的用户"看到错误
+///   - 已经在跑（健康检查命中）：什么都不做，opencode_start 内部已幂等
+///   - 起服务失败：仅打 warn 日志，不向调用方传播——这是后台静默任务，
+///     用户没主动触发，弹错只会打扰
+///
+/// 后续用户开 SettingsModal / 给 tab 选 OpenCode 时，运行中的服务可直接被发现
+/// （snapshot_opencode 的健康检查会命中）；新 tab 想要独立端口时仍走 4097+ 分配。
+pub async fn opencode_auto_start_silent(app: &AppHandle, state: &RuntimeState) {
+    let root = match resolve_project_root(app) {
+        Ok(value) => value,
+        Err(error) => {
+            log::debug!("[opencode] auto-start skipped: working dir unresolved ({error})");
+            return;
+        }
+    };
+    // 读用户在 settings 里存的 binary / proxy。boot_prefs_ready notify 之前 prefs
+    // 是空的；门闩兜底超时后这里可能拿到 None，opencode_start 内部 resolver 会
+    // fallback 到 bundled / PATH 默认二进制，依然能起。
+    let prefs = crate::agent::preferences::load_backend_preferences("opencode");
+    let binary_pref = prefs.binary.clone();
+    let resolved_binary = resolve_opencode_binary(app, binary_pref.as_deref());
+    // 装没装 = 能不能跑 --version；不存在 / 报错 = 跳过自动启动
+    if opencode_command_version(&resolved_binary, &root).is_err() {
+        log::info!("[opencode] auto-start skipped: CLI not installed");
+        return;
+    }
+    log::info!("[opencode] auto-starting `opencode serve` at boot");
+    match opencode_start(
+        app,
+        state,
+        DEFAULT_RUN_ID,
+        binary_pref.as_deref(),
+        prefs.proxy.as_deref(),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(status) => {
+            log::info!(
+                "[opencode] auto-start ok · running on :{} (managed={})",
+                status.port,
+                status.managed
+            );
+        }
+        Err(error) => {
+            log::warn!("[opencode] auto-start failed: {error}");
+        }
+    }
+}
+
 pub async fn opencode_stop(
     state: &RuntimeState,
     run_id: &str,
