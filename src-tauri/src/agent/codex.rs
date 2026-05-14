@@ -49,6 +49,27 @@ pub struct CodexVerifyResult {
     pub message: String,
 }
 
+/// 来自 `codex debug models` 的单条目（按官方 JSON 结构归一化）。
+/// supported_efforts 直接拿原始 effort id（low/medium/high/xhigh 等），
+/// 让前端下拉选项跟 CLI 真正支持的 reasoning level 完全一致。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModel {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub default_effort: Option<String>,
+    pub supported_efforts: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexModelsResult {
+    pub available_models: Vec<CodexModel>,
+    pub current_model_id: Option<String>,
+    pub current_effort: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // 块事件辅助
 // ---------------------------------------------------------------------------
@@ -1566,6 +1587,128 @@ pub fn read_codex_default_model() -> Option<String> {
 
 pub fn read_codex_default_reasoning_effort() -> Option<String> {
     read_codex_root_setting("model_reasoning_effort")
+}
+
+/// 拉取 Codex 官方模型目录 —— 走 `codex debug models`（CLI 自带的 JSON dump），
+/// 这是当前唯一不需要再启 app-server 就能拿到全量模型 + 每个模型支持的
+/// reasoning effort 的官方入口。
+///
+/// 返回结构跟 Claude 那边的 `ClaudeModelsResult` 平行；前端就按同一份逻辑
+/// 渲染下拉。隐藏类（visibility != "list"，比如 codex-auto-review）按 CLI
+/// 自己 TUI 的过滤行为剔除掉，避免在用户的模型选择里冒出来。
+pub fn build_codex_model_catalog(
+    app: &AppHandle,
+    requested_binary: Option<&str>,
+) -> Result<CodexModelsResult, String> {
+    let root = resolve_project_root(app)?;
+    let binary = resolve_codex_binary(app, requested_binary);
+    let mut command = Command::new(&binary);
+    configure_background_command(&mut command);
+    apply_codex_windows_sandbox_override(&mut command);
+    let child = command
+        .arg("debug")
+        .arg("models")
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to start `codex debug models`: {error}"))?;
+    let output = wait_child_output_with_timeout(child, CLI_VERIFY_TIMEOUT)
+        .map_err(|error| format!("`codex debug models` 超时：{error}"))?;
+    if !output.status.success() {
+        let stderr = strip_cli_warning_lines(&trim_output(&output.stderr));
+        return Err(if stderr.is_empty() {
+            "`codex debug models` 退出码非零".into()
+        } else {
+            stderr
+        });
+    }
+    let stdout = trim_output(&output.stdout);
+    if stdout.is_empty() {
+        return Err("`codex debug models` 没有输出，可能 CLI 版本过旧不支持该子命令".into());
+    }
+    let value: Value = serde_json::from_str(&stdout)
+        .map_err(|error| format!("`codex debug models` 输出非 JSON：{error}"))?;
+
+    let mut available_models: Vec<CodexModel> = Vec::new();
+    if let Some(arr) = value.get("models").and_then(Value::as_array) {
+        for entry in arr {
+            let id = entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let Some(id) = id else { continue };
+            // 隐藏类（codex-auto-review 等）按 CLI 自身的过滤剔除
+            if entry.get("visibility").and_then(Value::as_str) != Some("list") {
+                continue;
+            }
+            let name = entry
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| id.clone());
+            let description = entry
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let default_effort = entry
+                .get("default_reasoning_level")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let supported_efforts: Vec<String> = entry
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|lvl| {
+                            lvl.get("effort")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(ToOwned::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            available_models.push(CodexModel {
+                id,
+                name,
+                description,
+                default_effort,
+                supported_efforts,
+            });
+        }
+    }
+
+    // 按官方 priority（数字越小越靠前）稳定排序：把"最新最强"放最前，跟 Codex CLI 自身一致
+    if let Some(arr) = value.get("models").and_then(Value::as_array) {
+        let priority_of = |slug: &str| -> i64 {
+            arr.iter()
+                .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(slug))
+                .and_then(|entry| entry.get("priority").and_then(Value::as_i64))
+                .unwrap_or(i64::MAX)
+        };
+        available_models.sort_by(|a, b| {
+            priority_of(&a.id)
+                .cmp(&priority_of(&b.id))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+
+    Ok(CodexModelsResult {
+        available_models,
+        current_model_id: read_codex_default_model(),
+        current_effort: read_codex_default_reasoning_effort(),
+    })
 }
 
 // ---------------------------------------------------------------------------

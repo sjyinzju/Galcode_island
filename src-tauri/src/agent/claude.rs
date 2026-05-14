@@ -203,7 +203,9 @@ pub fn normalize_claude_effort(value: &str) -> Option<String> {
     let normalized = value.trim().to_lowercase();
     match normalized.as_str() {
         "" | "default" | "auto" => None,
-        "low" | "medium" | "high" | "max" => Some(normalized),
+        // `claude --help` 在 1.x 里列了 low/medium/high/xhigh/max 五档，
+        // 老版本只有 low/medium/high/max。拿不到 xhigh 的版本由 help 解析自动剔除。
+        "low" | "medium" | "high" | "xhigh" | "max" => Some(normalized),
         _ => None,
     }
 }

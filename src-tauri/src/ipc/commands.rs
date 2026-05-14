@@ -1,5 +1,5 @@
 use crate::agent::claude::{self as claude_agent, ClaudeModelsResult, CliRuntimeStatus};
-use crate::agent::codex::{self as codex_agent, CodexStatus, CodexVerifyResult};
+use crate::agent::codex::{self as codex_agent, CodexModelsResult, CodexStatus, CodexVerifyResult};
 use crate::agent::manager::{self, LaunchResult};
 use crate::agent::opencode::{self as opencode_agent, OpencodeStatus};
 use crate::agent::runtime::{RuntimeState, DEFAULT_RUN_ID};
@@ -544,6 +544,19 @@ pub async fn codex_status(app: AppHandle, binary: Option<String>) -> Result<Code
     tokio::task::spawn_blocking(move || codex_agent::codex_status_snapshot(&handle, binary.as_deref()))
         .await
         .map_err(|error| format!("codex_status task failed: {error}"))?
+}
+
+/// 拉 Codex 官方模型目录（走 `codex debug models` 的 JSON dump）。
+/// 跟 claude_models 平行；前端在 ProjectOverview / SettingsModal 里都靠它拉下拉数据。
+#[tauri::command]
+pub async fn codex_models(
+    app: AppHandle,
+    binary: Option<String>,
+) -> Result<CodexModelsResult, String> {
+    let handle = app.clone();
+    tokio::task::spawn_blocking(move || codex_agent::build_codex_model_catalog(&handle, binary.as_deref()))
+        .await
+        .map_err(|error| format!("codex_models task failed: {error}"))?
 }
 
 #[tauri::command]

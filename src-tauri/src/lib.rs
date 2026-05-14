@@ -20,7 +20,7 @@ use tauri::Manager;
 
 use ipc::commands::{
     claude_login_open, claude_models, claude_send_prompt, claude_status, claude_verify,
-    codex_login_open, codex_send_prompt, codex_status, codex_verify, finalize_pending,
+    codex_login_open, codex_models, codex_send_prompt, codex_status, codex_verify, finalize_pending,
     get_session_logs, lan_clear_password, lan_get_state, lan_get_storage, lan_list_storage,
     lan_remove_storage, lan_revoke_all_devices, lan_set_enabled, lan_set_password, lan_set_port,
     lan_set_storage, lan_sync_projects, list_directory, list_llm_models, list_sessions,
@@ -175,6 +175,7 @@ pub fn run() {
             claude_send_prompt,
             // Codex
             codex_status,
+            codex_models,
             codex_verify,
             codex_login_open,
             codex_send_prompt,
