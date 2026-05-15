@@ -186,7 +186,7 @@ export function GlobalOverview(): JSX.Element {
           relative z-30：下方统计卡 / 热图卡也用 backdrop-blur 创建了 stacking context，
           相同 z-auto 时后写的会覆盖前面的，导致 agent 下拉被盖住。把启动行抬到 z-30
           独立成层后，内部 absolute 定位的下拉菜单（z-20）就能盖住所有 z-auto 兄弟。 */}
-      <div className="relative z-30 rounded-2xl border border-white/60 bg-white/65 p-4 shadow-sm backdrop-blur-md sm:p-5 dark:border-white/10 dark:bg-slate-800/55">
+      <div className="relative z-10 rounded-2xl border border-white/60 bg-white/65 p-4 shadow-sm backdrop-blur-md sm:p-5 dark:border-white/10 dark:bg-slate-800/55">
         <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400 dark:text-zinc-500">
           开始一个新项目
         </div>
