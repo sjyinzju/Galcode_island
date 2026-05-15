@@ -148,6 +148,246 @@ pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> 
     })
 }
 
+/// 项目 / 用户 / 插件级斜杠命令元数据。
+///
+/// 来源：
+/// - `project`：`{cwd}/.claude/commands/**/*.md`
+/// - `user`：`~/.claude/commands/**/*.md`
+/// - `plugin`：`~/.claude/plugins/cache/<marketplace>/<plugin>/<ver>/commands/**/*.md`
+///
+/// 命名：子目录会进入命令名前缀，分隔符 `:`。例如
+/// `~/.claude/commands/ecc/plan.md` → `ecc:plan`；插件 `ecc` 下的
+/// `commands/agent-sort.md` → `ecc:agent-sort`。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommandMeta {
+    /// 命令名，不含开头 `/`；子目录用 `:` 当命名空间分隔符；插件命令带 `<plugin>:` 前缀
+    pub name: String,
+    /// 来源：project / user / plugin / builtin（builtin 由前端注入，本结构只产出前三种）
+    pub source: &'static str,
+    /// frontmatter 里的 description；解析失败 / 不存在时为空串
+    pub description: String,
+    /// frontmatter 里的 argument-hint（提示该命令需要哪些参数）
+    pub argument_hint: Option<String>,
+    /// 命令定义文件绝对路径，便于前端打开编辑
+    pub file_path: String,
+    /// 插件名（仅 `plugin` 来源有；其它为 None）。前端可用来分组显示。
+    pub plugin: Option<String>,
+}
+
+/// 从 .md 文件头部抽 YAML frontmatter 的 `description` / `argument-hint`。
+///
+/// Claude Code 的命令文件格式是：
+/// ```text
+/// ---
+/// description: ...
+/// argument-hint: ...
+/// ---
+/// <body>
+/// ```
+/// 这里只挑两个字段，不引 serde_yaml；语法非常稳定（一行一个 key: value）。
+fn parse_command_frontmatter(content: &str) -> (String, Option<String>) {
+    let mut description = String::new();
+    let mut argument_hint: Option<String> = None;
+
+    let trimmed = content.trim_start_matches('\u{feff}');
+    let rest = match trimmed.strip_prefix("---") {
+        Some(r) => r.trim_start_matches(['\r', '\n']),
+        None => return (description, argument_hint),
+    };
+    // 找闭合的 ---
+    let end_idx = rest.find("\n---").or_else(|| rest.find("\r\n---"));
+    let block = match end_idx {
+        Some(idx) => &rest[..idx],
+        None => return (description, argument_hint),
+    };
+
+    for line in block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        match key.as_str() {
+            "description" => description = value,
+            "argument-hint" => argument_hint = Some(value).filter(|v| !v.is_empty()),
+            _ => {}
+        }
+    }
+
+    (description, argument_hint)
+}
+
+/// 递归扫一个 commands 目录。子目录被当作命名空间，最终命令名拼成
+/// `<dir1>:<dir2>:<stem>` 形式（点开头的隐藏目录/文件直接跳过）。
+fn scan_commands_dir_recursive(
+    root: &std::path::Path,
+    subdir: &std::path::Path,
+    namespace: Vec<String>,
+    source: &'static str,
+    plugin: Option<&str>,
+    out: &mut Vec<SlashCommandMeta>,
+) {
+    let scan_path = root.join(subdir);
+    let Ok(read) = std::fs::read_dir(&scan_path) else { return };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else { continue };
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            // 限制递归深度避免病态目录结构爆栈：命名空间嵌套不应超过 4 层
+            if namespace.len() >= 4 {
+                continue;
+            }
+            let mut next_ns = namespace.clone();
+            next_ns.push(name_str.into_owned());
+            scan_commands_dir_recursive(
+                root,
+                &subdir.join(&file_name),
+                next_ns,
+                source,
+                plugin,
+                out,
+            );
+            continue;
+        }
+
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if stem.is_empty() {
+            continue;
+        }
+        let full_name = if namespace.is_empty() {
+            // 顶层命令：插件来源默认套上 `<plugin>:` 前缀，模仿 Claude Code CLI 行为
+            if let Some(p) = plugin {
+                if stem == p {
+                    // 插件目录里同名文件（feature-dev.md 在 feature-dev 插件下）就是
+                    // "默认命令"，名字直接用插件名，不重复
+                    p.to_string()
+                } else {
+                    format!("{p}:{stem}")
+                }
+            } else {
+                stem.to_string()
+            }
+        } else {
+            let prefix = namespace.join(":");
+            if let Some(p) = plugin {
+                format!("{p}:{prefix}:{stem}")
+            } else {
+                format!("{prefix}:{stem}")
+            }
+        };
+
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let (description, argument_hint) = parse_command_frontmatter(&content);
+        out.push(SlashCommandMeta {
+            name: full_name,
+            source,
+            description,
+            argument_hint,
+            file_path: path.to_string_lossy().into_owned(),
+            plugin: plugin.map(ToOwned::to_owned),
+        });
+    }
+}
+
+fn scan_commands_dir(dir: &std::path::Path, source: &'static str, out: &mut Vec<SlashCommandMeta>) {
+    scan_commands_dir_recursive(dir, std::path::Path::new(""), Vec::new(), source, None, out);
+}
+
+/// 扫 `~/.claude/plugins/installed_plugins.json` 列出的所有插件，读它们的
+/// `<installPath>/commands/**/*.md`。每个命令命名 `<plugin>:<file-stem>`
+/// （子目录嵌入到 `:` 分隔的中间段）。
+fn scan_installed_plugin_commands(out: &mut Vec<SlashCommandMeta>) {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return;
+    };
+    let manifest_path = std::path::PathBuf::from(&home)
+        .join(".claude")
+        .join("plugins")
+        .join("installed_plugins.json");
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else { return };
+    let Ok(json) = serde_json::from_str::<Value>(&text) else { return };
+
+    let Some(map) = json.get("plugins").and_then(Value::as_object) else { return };
+    for (key, entries) in map {
+        // key 形如 "ecc@everything-claude-code"；插件名取 `@` 之前
+        let plugin_name = key.split('@').next().unwrap_or(key).trim();
+        if plugin_name.is_empty() {
+            continue;
+        }
+        let Some(array) = entries.as_array() else { continue };
+        // 一份 installed_plugins.json 里同插件可能多实例（user / project scope）；都扫
+        for entry in array {
+            let Some(install_path) = entry.get("installPath").and_then(Value::as_str) else {
+                continue;
+            };
+            let commands_dir = std::path::PathBuf::from(install_path).join("commands");
+            if commands_dir.is_dir() {
+                scan_commands_dir_recursive(
+                    &commands_dir,
+                    std::path::Path::new(""),
+                    Vec::new(),
+                    "plugin",
+                    Some(plugin_name),
+                    out,
+                );
+            }
+        }
+    }
+}
+
+/// 列出当前项目 + 用户家目录 + 已安装插件下定义的斜杠命令。
+///
+/// 前端在 chat 输入框敲 `/` 时把结果合并进下拉。同名时优先级
+/// `project` > `user` > `plugin`，保持与 Claude Code CLI 的覆盖语义一致。
+#[tauri::command]
+pub fn list_project_slash_commands(cwd: Option<String>) -> Result<Vec<SlashCommandMeta>, String> {
+    let mut commands: Vec<SlashCommandMeta> = Vec::new();
+
+    // 插件级（最低优先级，先扫）
+    scan_installed_plugin_commands(&mut commands);
+
+    // 用户级（覆盖同名 plugin）
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let user_dir = std::path::PathBuf::from(home).join(".claude").join("commands");
+        if user_dir.is_dir() {
+            let mut user_cmds = Vec::new();
+            scan_commands_dir(&user_dir, "user", &mut user_cmds);
+            let user_names: std::collections::HashSet<String> =
+                user_cmds.iter().map(|c| c.name.clone()).collect();
+            commands.retain(|c| !user_names.contains(&c.name));
+            commands.extend(user_cmds);
+        }
+    }
+
+    // 项目级（覆盖同名 user / plugin）
+    if let Some(cwd) = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let project_dir = std::path::PathBuf::from(cwd).join(".claude").join("commands");
+        if project_dir.is_dir() {
+            let mut project_cmds = Vec::new();
+            scan_commands_dir(&project_dir, "project", &mut project_cmds);
+            let project_names: std::collections::HashSet<String> =
+                project_cmds.iter().map(|c| c.name.clone()).collect();
+            commands.retain(|c| !project_names.contains(&c.name));
+            commands.extend(project_cmds);
+        }
+    }
+
+    commands.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(commands)
+}
+
 /// 中文任务 → 翻译 → 启动 Agent（claude-code / opencode / codex / demo）。
 /// 工作目录默认 `.`，可通过 `cwd` 指定。
 ///
@@ -169,6 +409,9 @@ pub async fn start_agent(
     // 可选：前端持久化的 tab.sessionId（重启 app 后内存 last_session_per_context
     // 是空的，前端 localStorage 留着 sessionId，传过来当 resume hint）。
     session_id: Option<String>,
+    // 仅 claude-code 使用：Claude CLI 的 --permission-mode 参数值，
+    // 来自 tab.permissionMode（Shift+Tab 切换 / 全局默认）。其它 backend 忽略此参数。
+    permission_mode: Option<String>,
 ) -> Result<LaunchResult, String> {
     let cwd = cwd.unwrap_or_else(|| ".".to_string());
     let agent_type = agent
@@ -209,6 +452,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            permission_mode,
         ),
         "opencode" => manager::launch_opencode_agent(
             app,
@@ -277,6 +521,9 @@ pub async fn stop_agent(
     .await
 }
 
+/// 老接口，沿用 session_id + tool_use_id 形式；现已无用（permission_mcp 用独立的
+/// request_id 路由），但保留 export 让 LAN dispatch 不破。新调用走
+/// [`respond_permission_decision`]。
 #[tauri::command]
 pub fn respond_permission(
     state: State<Arc<AppState>>,
@@ -286,6 +533,36 @@ pub fn respond_permission(
 ) -> Result<PermissionResponse, String> {
     let mut mgr = state.manager.lock().map_err(|e| e.to_string())?;
     mgr.respond_permission_stub(&session_id, &tool_use_id, &decision)?;
+    Ok(PermissionResponse { ok: true })
+}
+
+/// 实战版：给 permission-prompt-tool MCP 桥接用。前端 PermissionCard
+/// 用户点 Allow / Deny 后调本命令，按 request_id 解出阻塞中的 MCP handler
+/// 线程并把决策传回去，Claude CLI 收到决策继续 / 终止该工具调用。
+#[tauri::command]
+pub fn respond_permission_decision(
+    request_id: String,
+    decision: String,
+    message: Option<String>,
+    updated_input: Option<Value>,
+) -> Result<PermissionResponse, String> {
+    let normalized = match decision.as_str() {
+        "allow" | "approve" | "yes" => "allow".to_string(),
+        _ => "deny".to_string(),
+    };
+    let resolved = crate::permission_mcp::resolve(
+        &request_id,
+        crate::permission_mcp::PermissionDecision {
+            decision: normalized,
+            message,
+            updated_input,
+        },
+    );
+    if !resolved {
+        return Err(format!(
+            "找不到对应的审批请求（已超时或被重复响应？request_id={request_id}）"
+        ));
+    }
     Ok(PermissionResponse { ok: true })
 }
 
@@ -406,9 +683,18 @@ pub fn update_backend_preferences(
     provider: Option<String>,
     api_key: Option<String>,
     auth_mode: Option<String>,
+    default_permission_mode: Option<String>,
 ) -> Result<(), String> {
     crate::agent::preferences::update_backend_preferences(
-        &backend, model, effort, proxy, binary, provider, api_key, auth_mode,
+        &backend,
+        model,
+        effort,
+        proxy,
+        binary,
+        provider,
+        api_key,
+        auth_mode,
+        default_permission_mode,
     )?;
     runtime_state.boot_prefs_ready.notify_one();
     Ok(())
@@ -499,6 +785,34 @@ pub async fn claude_login_open(
     .map_err(|error| format!("claude_login_open task failed: {error}"))?
 }
 
+/// 通用：在系统终端新开窗口跑 `claude <args>`。用来桥接 Claude CLI 的内置交互命令
+/// （/logout /doctor /upgrade /init /migrate-installer 等），这些只在 TTY 模式才有效。
+#[tauri::command]
+pub async fn claude_run_in_terminal(
+    app: AppHandle,
+    args: Vec<String>,
+    binary: Option<String>,
+    proxy: Option<String>,
+    success_message: Option<String>,
+) -> Result<String, String> {
+    let handle = app.clone();
+    let cmd_text = args.join(" ");
+    let msg = success_message
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("已在系统终端运行 `claude {cmd_text}`。"));
+    tokio::task::spawn_blocking(move || {
+        claude_agent::open_claude_terminal_with_args(
+            &handle,
+            binary.as_deref(),
+            proxy.as_deref(),
+            &args,
+            &msg,
+        )
+    })
+    .await
+    .map_err(|error| format!("claude_run_in_terminal task failed: {error}"))?
+}
+
 /// Claude 原始 turn —— 不翻译、不套总结，直接走 stream-json。
 /// 返回 { sessionId, output }（output 是 CLI 英文原文）。
 #[tauri::command]
@@ -513,6 +827,7 @@ pub async fn claude_send_prompt(
     effort: Option<String>,
     binary: Option<String>,
     proxy: Option<String>,
+    permission_mode: Option<String>,
     stream_id: Option<String>,
 ) -> Result<Value, String> {
     let runtime = Arc::clone(runtime_state.inner());
@@ -530,6 +845,7 @@ pub async fn claude_send_prompt(
             effort.as_deref(),
             binary.as_deref(),
             proxy.as_deref(),
+            permission_mode.as_deref(),
             stream_id.as_deref(),
         )
     });

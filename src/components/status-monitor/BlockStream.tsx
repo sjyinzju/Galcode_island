@@ -23,6 +23,7 @@ import { useUiStore, type ActiveMatch } from "../../stores/useUiStore";
 import type { CliBlock } from "../../types/blocks";
 import { countOccurrences, highlightText } from "./highlight";
 import { ErrorDiagnosisCard } from "./ErrorDiagnosisCard";
+import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { isNearBottom } from "./scrollUtils";
 
 /// 子组件公共的高亮上下文 prop —— 没 query 时所有子组件渲染行为退化为原状。
@@ -520,6 +521,8 @@ function BlockRenderer({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JS
       return <ErrorLine block={block} hl={hl} />;
     case "stderr":
       return <StderrBlock block={block} hl={hl} />;
+    case "permission-request":
+      return <PermissionRequestBlock block={block} />;
     default:
       return null;
   }

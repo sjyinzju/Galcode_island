@@ -16,6 +16,8 @@ import { useLanProjectsSync } from "./hooks/useLanProjectsSync";
 import { useTabsReattach } from "./hooks/useTabsReattach";
 import { useTaskCompletionNotifier } from "./hooks/useTaskCompletionNotifier";
 import { useThemeHotkey } from "./hooks/useThemeHotkey";
+import { useChatHotkeys } from "./hooks/useChatHotkeys";
+import { usePermissionRequests } from "./hooks/usePermissionRequests";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useProfileStore } from "./stores/useProfileStore";
@@ -25,8 +27,10 @@ function App(): JSX.Element {
   const closeMobileLeftDrawer = useUiStore((s) => s.closeMobileLeftDrawer);
 
   useThemeHotkey();
+  useChatHotkeys();
   useAgentIPC();
   useCliStream();
+  usePermissionRequests();
   useTabsReattach();
   useInPageSearchHotkey();
   useLanProjectsSync();
@@ -67,6 +71,8 @@ function App(): JSX.Element {
         provider: prefs.provider || null,
         apiKey: prefs.apiKey || null,
         authMode: prefs.authMode || null,
+        // 仅 Claude Code 使用：新开 tab 的默认 permission mode
+        defaultPermissionMode: prefs.defaultPermissionMode || null,
       }).catch(console.error);
     }
   }, []);

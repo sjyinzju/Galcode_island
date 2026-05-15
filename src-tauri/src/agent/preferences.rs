@@ -21,6 +21,12 @@ pub struct BackendSettings {
     pub api_key: Option<String>,
     /// 仅 OpenCode 用："oauth" / "key" / None。决定启动前是否要 set_auth。
     pub auth_mode: Option<String>,
+    /// 仅 Claude Code 用：新开 tab 的默认 permission mode
+    /// （"default" / "acceptEdits" / "plan" / "bypassPermissions"）。None 表示用前端 fallback。
+    /// 实际每次 start_agent 的 mode 由前端传入；这里仅用作"全局 Settings 设过默认值"的 cache，
+    /// 给将来 CLI / LAN 客户端读取用。
+    #[allow(dead_code)]
+    pub default_permission_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +58,7 @@ pub fn update_backend_preferences(
     provider: Option<String>,
     api_key: Option<String>,
     auth_mode: Option<String>,
+    default_permission_mode: Option<String>,
 ) -> Result<(), String> {
     let settings = BackendSettings {
         model: normalize(model),
@@ -63,6 +70,7 @@ pub fn update_backend_preferences(
         // 走 normalize 保持空串归 None 行为一致。
         api_key: normalize(api_key),
         auth_mode: normalize(auth_mode),
+        default_permission_mode: normalize(default_permission_mode),
     };
 
     let mut prefs = get_global_prefs()

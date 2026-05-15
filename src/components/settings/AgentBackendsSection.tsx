@@ -102,19 +102,32 @@ interface PrefsEditorProps {
   fields: ReadonlyArray<keyof BackendPrefs>;
 }
 
-const FIELD_LABEL: Record<keyof BackendPrefs, string> = {
+// PrefsEditor 只渲染调用方在 `fields` 里显式列出的字段；这里不必为 BackendPrefs
+// 的每个 key 都给标签（provider/apiKey/authMode 走 OpencodeAuthEditor）。
+const FIELD_LABEL: Partial<Record<keyof BackendPrefs, string>> = {
   model: "Model",
   effort: "Effort",
   proxy: "Proxy",
   binary: "Binary 路径",
+  defaultPermissionMode: "默认 Permission Mode",
 };
 
-const FIELD_PLACEHOLDER: Record<keyof BackendPrefs, string> = {
+const FIELD_PLACEHOLDER: Partial<Record<keyof BackendPrefs, string>> = {
   model: "默认（settings.json / config.toml / env）",
   effort: "low | medium | high | max",
   proxy: "http://127.0.0.1:7890 或 socks5://...",
   binary: "默认（PATH / bundled runtime）",
+  defaultPermissionMode: "default | acceptEdits | plan | bypassPermissions",
 };
+
+const PERMISSION_MODE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "", label: "acceptEdits（推荐默认，自动接受编辑）" },
+  { value: "acceptEdits", label: "acceptEdits（推荐，自动接受编辑）" },
+  { value: "auto", label: "auto（Auto Mode，桌面版同名档位）" },
+  { value: "plan", label: "plan（Plan Mode，先列计划）" },
+  { value: "bypassPermissions", label: "bypassPermissions（完全跳过审批，慎用）" },
+  { value: "default", label: "default（⚠ stream-json 下工具调用会被拒绝）" },
+];
 
 function PrefsEditor({ backend, fields }: PrefsEditorProps): JSX.Element {
   const prefs = useSettingsStore((s) => s.backends[backend]);
@@ -132,26 +145,59 @@ function PrefsEditor({ backend, fields }: PrefsEditorProps): JSX.Element {
       provider: current.provider || null,
       apiKey: current.apiKey || null,
       authMode: current.authMode || null,
+      defaultPermissionMode: current.defaultPermissionMode || null,
     }).catch(console.error);
   }, [backend]);
 
   return (
     <div className="mt-3 grid grid-cols-2 gap-2">
-      {fields.map((field) => (
-        <label key={field} className="flex flex-col gap-1">
-          <span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
-            {FIELD_LABEL[field]}
-          </span>
-          <input
-            type="text"
-            value={prefs[field]}
-            onChange={(e) => setBackendPref(backend, field, e.target.value)}
-            onBlur={sync}
-            placeholder={FIELD_PLACEHOLDER[field]}
-            className="rounded-md border border-black/5 bg-white/40 px-2 py-1 text-xs text-zinc-800 outline-none transition-all focus:border-sky-400/50 focus:bg-white/70 focus:ring-1 focus:ring-sky-400/15 dark:border-white/5 dark:bg-slate-800/40 dark:text-zinc-100 dark:focus:bg-slate-800/70"
-          />
-        </label>
-      ))}
+      {fields.map((field) => {
+        const label = FIELD_LABEL[field] ?? field;
+        const placeholder = FIELD_PLACEHOLDER[field] ?? "";
+        if (field === "defaultPermissionMode") {
+          return (
+            <label key={field} className="flex flex-col gap-1">
+              <span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+                {label}
+              </span>
+              <select
+                value={prefs[field] ?? ""}
+                onChange={(e) => {
+                  setBackendPref(backend, field, e.target.value);
+                  // select 没有 blur 语义；立即 sync
+                  setTimeout(sync, 0);
+                }}
+                className="rounded-md border border-black/5 bg-white/40 px-2 py-1 text-xs text-zinc-800 outline-none transition-all focus:border-sky-400/50 focus:bg-white/70 focus:ring-1 focus:ring-sky-400/15 dark:border-white/5 dark:bg-slate-800/40 dark:text-zinc-100 dark:focus:bg-slate-800/70"
+              >
+                {PERMISSION_MODE_OPTIONS.filter(
+                  (o, idx, arr) =>
+                    // 去掉重复的 "" 与 "default"，只保留一个 default 项
+                    !(o.value === "default" && arr[idx - 1]?.value === "")
+                ).map((o) => (
+                  <option key={o.value || "_empty"} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        }
+        return (
+          <label key={field} className="flex flex-col gap-1">
+            <span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+              {label}
+            </span>
+            <input
+              type="text"
+              value={prefs[field] ?? ""}
+              onChange={(e) => setBackendPref(backend, field, e.target.value)}
+              onBlur={sync}
+              placeholder={placeholder}
+              className="rounded-md border border-black/5 bg-white/40 px-2 py-1 text-xs text-zinc-800 outline-none transition-all focus:border-sky-400/50 focus:bg-white/70 focus:ring-1 focus:ring-sky-400/15 dark:border-white/5 dark:bg-slate-800/40 dark:text-zinc-100 dark:focus:bg-slate-800/70"
+            />
+          </label>
+        );
+      })}
     </div>
   );
 }
@@ -201,6 +247,8 @@ function OpencodeAuthEditor({
     provider: rawPrefs?.provider ?? "",
     apiKey: rawPrefs?.apiKey ?? "",
     authMode: (rawPrefs?.authMode ?? "") as BackendPrefs["authMode"],
+    defaultPermissionMode:
+      (rawPrefs?.defaultPermissionMode ?? "") as BackendPrefs["defaultPermissionMode"],
   };
   const [providers, setProviders] = useState<OpencodeProviderInfo[]>([]);
   const [loadingProviders, setLoadingProviders] = useState(false);
@@ -220,6 +268,7 @@ function OpencodeAuthEditor({
       provider: current?.provider || null,
       apiKey: current?.apiKey || null,
       authMode: current?.authMode || null,
+      defaultPermissionMode: current?.defaultPermissionMode || null,
     });
   }, []);
 
@@ -595,7 +644,10 @@ export function AgentBackendsSection({
             刷新状态
           </button>
         </div>
-        <PrefsEditor backend="claude-code" fields={["model", "effort", "binary", "proxy"]} />
+        <PrefsEditor
+          backend="claude-code"
+          fields={["model", "effort", "binary", "proxy", "defaultPermissionMode"]}
+        />
         <Toast toast={toasts.claude ?? null} />
       </BackendCard>
     );

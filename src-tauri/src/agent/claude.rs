@@ -14,15 +14,74 @@ use crate::agent::runtime::*;
 use crate::agent::sysutils::*;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tauri::AppHandle;
+
+// ---------------------------------------------------------------------------
+// tool_use_id → 块前缀的映射表
+// ---------------------------------------------------------------------------
+//
+// 流式 stream-json 里 tool_use 先到，tool_result 后到。tool_use 时根据工具
+// 类型把块发到 claude-cmd-/claude-file-/claude-tool-/claude-diff- 其中一种
+// id 上；tool_result 到达时我们只该更新对应那一种，而不是给三种前缀都发
+// 一遍（之前为了"反正前端按 id 去重"的偷懒写法，结果在前端 upsert 路径上
+// 创建出空 command/file 幻影块，截图里"$ (command) User has answered..."
+// 就是这么来的）。
+//
+// 全局 HashMap 够用：tool_use_id 是 Claude 端 UUID，唯一；同一 App 寿命里
+// 不会膨胀到危险量级（万级以内）。多个 session 共用一份也无冲突。
+static TOOL_USE_PREFIX: LazyLock<Mutex<HashMap<String, &'static str>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 同步记录每个 tool_use_id 对应的工具名，以便 tool_result 阶段对特定工具
+/// （AskUserQuestion 等）做特殊后处理。
+static TOOL_USE_NAME: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember_tool_use_prefix(tool_use_id: &str, prefix: &'static str) {
+    if tool_use_id.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = TOOL_USE_PREFIX.lock() {
+        map.insert(tool_use_id.to_string(), prefix);
+    }
+}
+
+fn remember_tool_use_name(tool_use_id: &str, name: &str) {
+    if tool_use_id.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = TOOL_USE_NAME.lock() {
+        map.insert(tool_use_id.to_string(), name.to_string());
+    }
+}
+
+fn lookup_tool_use_prefix(tool_use_id: &str) -> Option<&'static str> {
+    if tool_use_id.is_empty() {
+        return None;
+    }
+    TOOL_USE_PREFIX
+        .lock()
+        .ok()
+        .and_then(|map| map.get(tool_use_id).copied())
+}
+
+fn lookup_tool_use_name(tool_use_id: &str) -> Option<String> {
+    if tool_use_id.is_empty() {
+        return None;
+    }
+    TOOL_USE_NAME
+        .lock()
+        .ok()
+        .and_then(|map| map.get(tool_use_id).cloned())
+}
 
 // ---------------------------------------------------------------------------
 // 模块内 API 响应类型 (供未来 UI 命令使用)
@@ -376,6 +435,29 @@ pub fn open_claude_login_terminal(
     )
 }
 
+/// 通用：在系统终端新开窗口跑 `claude <args>`。
+///
+/// 用于桥接 Claude Code 的 CLI 内置交互命令（/login /logout /doctor /upgrade
+/// /init …）—— 这些命令本身只在 TTY 交互模式有效，我们的应用走 stream-json
+/// 非交互模式，所以只能新开终端让 CLI 自己跑。前端面板调用 `claude_run_in_terminal`
+/// 时通过 `args` 指定子命令。
+#[allow(dead_code)]
+pub fn open_claude_terminal_with_args(
+    app: &AppHandle,
+    requested_binary: Option<&str>,
+    proxy: Option<&str>,
+    args: &[String],
+    success_message: &str,
+) -> Result<String, String> {
+    let binary = resolve_claude_binary(app, requested_binary);
+    let command_text = format!(
+        "{}{}",
+        proxy_env_prefix(proxy),
+        shell_command_text(&binary, &[], args)
+    );
+    open_terminal_command(&command_text, success_message)
+}
+
 // ---------------------------------------------------------------------------
 // Stream 事件解析（通用 stream-json 提取，跨 backend 复用）
 // ---------------------------------------------------------------------------
@@ -574,6 +656,8 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| format!("tool-{}", chrono::Utc::now().timestamp_millis()));
                 let input = item.get("input").cloned().unwrap_or(Value::Null);
+                // 默认前缀按下面 match 实际走哪一支决定；用 mut 占位等 match 内部赋。
+                let mut effective_prefix: &'static str = "claude-tool";
 
                 let block = match name {
                     "Edit" => {
@@ -583,6 +667,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                         if path.is_empty() && old.is_empty() && new.is_empty() {
                             continue;
                         }
+                        effective_prefix = "claude-diff";
                         build_diff_block(&id, "Edit", path, &simple_diff(old, new))
                     }
                     "MultiEdit" => {
@@ -601,6 +686,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                             }
                             diff_text.push_str(&simple_diff(old, new));
                         }
+                        effective_prefix = "claude-diff";
                         build_diff_block(&id, "MultiEdit", path, &diff_text)
                     }
                     "Write" => {
@@ -611,6 +697,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                             .map(|l| format!("+{l}"))
                             .collect::<Vec<_>>()
                             .join("\n");
+                        effective_prefix = "claude-diff";
                         build_diff_block(&id, "Write", path, &diff_text)
                     }
                     "Bash" => {
@@ -618,6 +705,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                             .get("command")
                             .and_then(Value::as_str)
                             .unwrap_or("");
+                        effective_prefix = "claude-cmd";
                         json!({
                             "id": format!("claude-cmd-{id}"),
                             "type": "command",
@@ -628,7 +716,108 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                             "suppressLogLine": false
                         })
                     }
-                    "Read" | "Grep" | "Glob" | "TodoWrite" | "WebFetch" | "WebSearch" => {
+                    "TodoWrite" => {
+                        // 把 input.todos 解析成前端 todo 块的 items 数组。
+                        // 老路径走 file/tool 块只会显示 "[object Object]"，
+                        // 用专用 todo 块 + TodoBlock 渲染才有打勾视觉。
+                        let items: Vec<Value> = input
+                            .get("todos")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(i, raw)| {
+                                let obj = raw.as_object()?;
+                                let label = obj
+                                    .get("content")
+                                    .or_else(|| obj.get("activeForm"))
+                                    .or_else(|| obj.get("task"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                if label.is_empty() {
+                                    return None;
+                                }
+                                let status = obj
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("pending")
+                                    .to_string();
+                                Some(json!({
+                                    "id": obj.get("id")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned)
+                                        .unwrap_or_else(|| format!("todo-{i}")),
+                                    "label": label,
+                                    "status": status,
+                                }))
+                            })
+                            .collect();
+                        effective_prefix = "claude-todo";
+                        json!({
+                            "id": format!("claude-todo-{id}"),
+                            "type": "todo",
+                            "title": "TodoWrite",
+                            "items": items,
+                            "status": "running",
+                            "backend": "claude",
+                            "suppressLogLine": false
+                        })
+                    }
+                    "Task" => {
+                        // 子 agent 调用：把 subagent_type + description / prompt 漂亮地显示
+                        let subagent = input
+                            .get("subagent_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("agent");
+                        let desc = input
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .or_else(|| input.get("prompt").and_then(Value::as_str))
+                            .map(|s| {
+                                // 截到 200 字符避免一坨 prompt 把 UI 撑爆
+                                s.chars().take(200).collect::<String>()
+                            });
+                        effective_prefix = "claude-tool";
+                        json!({
+                            "id": format!("claude-tool-{id}"),
+                            "type": "tool",
+                            "tool": format!("Task · {subagent}"),
+                            "detail": desc,
+                            "status": "running",
+                            "startedAt": chrono::Utc::now().timestamp_millis(),
+                            "backend": "claude",
+                            "suppressLogLine": false
+                        })
+                    }
+                    "Skill" => {
+                        // 安装的技能调用：surface skill_name 让用户知道在跑哪个 skill
+                        let skill = input
+                            .get("skill_name")
+                            .or_else(|| input.get("name"))
+                            .or_else(|| input.get("skill"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("(unknown skill)");
+                        let desc = input
+                            .get("description")
+                            .or_else(|| input.get("command"))
+                            .or_else(|| input.get("prompt"))
+                            .and_then(Value::as_str)
+                            .map(|s| s.chars().take(200).collect::<String>());
+                        effective_prefix = "claude-tool";
+                        json!({
+                            "id": format!("claude-tool-{id}"),
+                            "type": "tool",
+                            "tool": format!("Skill · {skill}"),
+                            "detail": desc,
+                            "status": "running",
+                            "startedAt": chrono::Utc::now().timestamp_millis(),
+                            "backend": "claude",
+                            "suppressLogLine": false
+                        })
+                    }
+                    "Read" | "Grep" | "Glob" | "WebFetch" | "WebSearch" => {
                         let path = input
                             .get("file_path")
                             .or_else(|| input.get("path"))
@@ -640,6 +829,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                             .or_else(|| input.get("prompt"))
                             .and_then(Value::as_str);
                         if let Some(path) = path {
+                            effective_prefix = "claude-file";
                             json!({
                                 "id": format!("claude-file-{id}"),
                                 "type": "file",
@@ -650,6 +840,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                                 "suppressLogLine": false
                             })
                         } else {
+                            effective_prefix = "claude-tool";
                             json!({
                                 "id": format!("claude-tool-{id}"),
                                 "type": "tool",
@@ -666,6 +857,7 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                         let detail = serde_json::to_string(&input)
                             .ok()
                             .map(|s| s.chars().take(80).collect::<String>());
+                        effective_prefix = "claude-tool";
                         json!({
                             "id": format!("claude-tool-{id}"),
                             "type": "tool",
@@ -677,6 +869,11 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                         })
                     }
                 };
+                // 记下这次 tool_use 实际落到哪种前缀块上，方便 tool_result 精准回更新
+                remember_tool_use_prefix(&id, effective_prefix);
+                // 同步记下工具名，给 tool_result 阶段特殊后处理用（如
+                // AskUserQuestion 把 deny 当成功显示）
+                remember_tool_use_name(&id, name);
                 out.push(json!({ "type": "galcode.block", "block": block }));
             }
             "tool_result" if event_type == "user" => {
@@ -704,20 +901,68 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                         })
                     })
                     .unwrap_or_default();
-                let status = if is_error { "error" } else { "success" };
-                // 同时更新 command 和 file/tool 类型——前端按 id 匹配，不存在的 id 自然忽略
-                for prefix in ["claude-cmd", "claude-file", "claude-tool"] {
+                // AskUserQuestion 特化：走 deny + message 通路时 CLI 把 message
+                // 标 is_error=true（甚至 <error> 包装），但其实是用户提交的答案。
+                // 在前端展示上强制 success 状态 + 把消息当成 output 显示，避免
+                // 渲染成红色错误块；Claude 那边仍然原样收到带 is_error 标记的
+                // tool_result，能从内容里读到 "User has answered..." 用户答案。
+                let resolved_tool_name = lookup_tool_use_name(tool_use_id);
+                let is_ask_user_question = resolved_tool_name.as_deref() == Some("AskUserQuestion");
+                let status: &'static str = if is_ask_user_question {
+                    "success"
+                } else if is_error {
+                    "error"
+                } else {
+                    "success"
+                };
+                // 查 tool_use 那一步登记过的前缀，只更新它。查不到（极少见，比如
+                // tool_use 比 tool_result 晚到达或代码升级前的旧 id）则回退到老的
+                // 三前缀广播以保住"至少有一条更新到"的兜底。
+                let target_prefix = lookup_tool_use_prefix(tool_use_id);
+                let prefixes: Vec<&'static str> = match target_prefix {
+                    Some(p) => vec![p],
+                    None => vec!["claude-cmd", "claude-file", "claude-tool", "claude-todo"],
+                };
+                for prefix in prefixes {
+                    let block_type = match prefix {
+                        "claude-cmd" => "command",
+                        "claude-file" => "file",
+                        "claude-todo" => "todo",
+                        "claude-diff" => "diff",
+                        _ => "tool",
+                    };
+                    // command 块要把 output 灌进去（终端样式渲染要展示）；
+                    // 其它块用 message 字段承载错误文本，正常完成时无需附内容；
+                    // AskUserQuestion 特例：把答案同时灌到 output（command 备用）
+                    // 和 detail（tool/file 块的展示字段）让任何前缀的块都显出来
+                    let output_for_block = if prefix == "claude-cmd" || is_ask_user_question {
+                        Some(output.clone())
+                    } else {
+                        None
+                    };
+                    // 错误消息只在真正错误（且不是 AskUserQuestion 走 deny）时填
+                    let message_for_block = if is_error && !is_ask_user_question {
+                        Some(output.clone())
+                    } else {
+                        None
+                    };
+                    // ToolBlock / FileBlock 渲染 detail 字段，给 AskUserQuestion
+                    // 把答案塞进去；其它工具的 detail 在 tool_use 阶段就有，
+                    // 这里 *不要* 设 detail（含 null）覆盖掉它，故用 Map 构造
+                    let mut block_map = serde_json::Map::new();
+                    block_map.insert("id".into(), json!(format!("{prefix}-{tool_use_id}")));
+                    block_map.insert("type".into(), json!(block_type));
+                    block_map.insert("status".into(), json!(status));
+                    block_map.insert("output".into(), json!(output_for_block));
+                    block_map.insert("message".into(), json!(message_for_block));
+                    block_map.insert("backend".into(), json!("claude"));
+                    block_map.insert("suppressLogLine".into(), json!(true));
+                    if is_ask_user_question {
+                        block_map.insert("detail".into(), json!(output.clone()));
+                    }
                     out.push(json!({
                         "type": "galcode.block",
-                        "block": {
-                            "id": format!("{prefix}-{tool_use_id}"),
-                            "type": if prefix == "claude-cmd" { "command" } else if prefix == "claude-file" { "file" } else { "tool" },
-                            "status": status,
-                            "output": if prefix == "claude-cmd" { Some(output.clone()) } else { None },
-                            "message": if is_error { Some(output.clone()) } else { None },
-                            "backend": "claude",
-                            "suppressLogLine": true
-                        }
+                        "block": Value::Object(block_map)
                     }));
                 }
             }
@@ -784,6 +1029,24 @@ pub fn current_claude_stream_id(client: &ClaudeStreamClient) -> Option<String> {
 // Stream 客户端生命周期
 // ---------------------------------------------------------------------------
 
+/// Claude CLI 支持的四种 permission mode。前端用同名 PermissionMode TS 类型。
+///
+/// 额外 UI alias：`"auto"` 是前端模式选择里的"Auto Mode"档（对照 Claude Code 桌面版
+/// 同名按钮）。CLI 没有独立的 `auto` 值，把它当作 `acceptEdits` 的同义词转发即可。
+/// 如果未来 Claude CLI 引入真正的 `auto` 值，只需在此处改 map。
+///
+/// 任何不在白名单里的字符串会被 fall back 到 "acceptEdits"（保持向后兼容老行为）。
+fn normalize_permission_mode(mode: Option<&str>) -> &'static str {
+    match mode.map(str::trim).unwrap_or("") {
+        "default" => "default",
+        "auto" => "acceptEdits",
+        "acceptEdits" => "acceptEdits",
+        "plan" => "plan",
+        "bypassPermissions" => "bypassPermissions",
+        _ => "acceptEdits",
+    }
+}
+
 pub fn spawn_claude_stream_client(
     app: &AppHandle,
     run_id: &str,
@@ -793,6 +1056,7 @@ pub fn spawn_claude_stream_client(
     effort: Option<&str>,
     requested_binary: Option<&str>,
     proxy: Option<&str>,
+    permission_mode: Option<&str>,
 ) -> Result<Arc<ClaudeStreamClient>, String> {
     let binary = resolve_claude_binary(app, requested_binary);
     let binary_display = binary.display().to_string();
@@ -812,6 +1076,7 @@ pub fn spawn_claude_stream_client(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let permission_mode_text = normalize_permission_mode(permission_mode);
 
     let mut command = Command::new(&binary);
     configure_background_command(&mut command);
@@ -826,7 +1091,72 @@ pub fn spawn_claude_stream_client(
         .arg("--replay-user-messages")
         .arg("--include-partial-messages")
         .arg("--permission-mode")
-        .arg("acceptEdits");
+        .arg(permission_mode_text);
+
+    // 接入 permission-prompt-tool：让 Claude 在工具调用前 RPC 到本地 MCP 桥接
+    // 服务，桥接转 Tauri 事件 → 前端 PermissionCard，让用户在 App 内 Allow/Deny。
+    // 失败时（MCP 没起来 / 写 config 出错）忽略，行为退化到纯 --permission-mode。
+    let mut prompt_tool_attached = false;
+    match crate::permission_mcp::write_session_mcp_config(app, run_id) {
+        Ok(cfg_path) => {
+            command
+                .arg("--mcp-config")
+                .arg(&cfg_path)
+                .arg("--permission-prompt-tool")
+                .arg(crate::permission_mcp::PERMISSION_TOOL_NAME);
+            prompt_tool_attached = true;
+            log::info!(
+                "[claude] permission-prompt-tool 接入 OK: run_id={run_id} cfg={} tool={}",
+                cfg_path.display(),
+                crate::permission_mcp::PERMISSION_TOOL_NAME
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "[claude] 跳过 permission-prompt-tool 接入: {e}（将走 --permission-mode 原生行为）"
+            );
+        }
+    }
+    log::info!(
+        "[claude] spawn args: run_id={run_id} mode={permission_mode_text} prompt_tool={} model={:?} effort={:?} proxy_set={}",
+        if prompt_tool_attached { "on" } else { "off" },
+        model_text,
+        effort_text,
+        proxy_text.is_some()
+    );
+
+    // 直接把 spawn 配置作为 status 块推给前端，让用户在对话流里立刻看到 Claude
+    // 实际启动的 mode + 是否挂了 permission-prompt-tool。这对诊断"default 模式
+    // Edit 不弹窗"这种问题极有用——一眼就能确认 CLI 拿到的参数是否符合预期。
+    let prompt_tool_label = if prompt_tool_attached {
+        "✓ permission-prompt-tool 已挂"
+    } else {
+        "⚠ permission-prompt-tool 未挂（CLI 走 --permission-mode 原生行为）"
+    };
+    let mode_warn = if permission_mode_text == "default" && !prompt_tool_attached {
+        "（default 模式下没有 prompt-tool，工具调用大概率被 CLI 直接拒）"
+    } else {
+        ""
+    };
+    let status_text = format!(
+        "Claude CLI started · mode={permission_mode_text} · {prompt_tool_label}{mode_warn}"
+    );
+    emit_cli_stream_json_event(
+        app,
+        "claude",
+        run_id,
+        &format!("spawn-{run_id}"),
+        &json!({
+            "type": "galcode.block",
+            "block": {
+                "id": format!("claude-spawn-info-{}", chrono::Utc::now().timestamp_millis()),
+                "type": "status",
+                "content": status_text,
+                "backend": "claude",
+                "suppressLogLine": true
+            }
+        }),
+    );
 
     if let Some(existing_session) = resume_session.as_deref() {
         command.arg("--resume").arg(existing_session);
@@ -877,6 +1207,7 @@ pub fn spawn_claude_stream_client(
         proxy: proxy_text,
         model: model_text,
         effort: effort_text,
+        permission_mode: permission_mode_text.to_string(),
         resume_session,
         run_id: run_id.to_string(),
     });
@@ -1085,6 +1416,7 @@ pub fn claude_stream_client_matches(
     effort: Option<&str>,
     requested_binary: Option<&str>,
     proxy: Option<&str>,
+    permission_mode: Option<&str>,
     app: &AppHandle,
 ) -> bool {
     if client.exited.load(Ordering::SeqCst) || client.directory != directory {
@@ -1110,11 +1442,13 @@ pub fn claude_stream_client_matches(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let desired_permission_mode = normalize_permission_mode(permission_mode);
 
     if client.binary != desired_binary
         || client.proxy != desired_proxy
         || client.model != desired_model
         || client.effort != desired_effort
+        || client.permission_mode != desired_permission_mode
     {
         return false;
     }
@@ -1143,6 +1477,7 @@ pub fn ensure_claude_stream_client(
     effort: Option<&str>,
     requested_binary: Option<&str>,
     proxy: Option<&str>,
+    permission_mode: Option<&str>,
 ) -> Result<Arc<ClaudeStreamClient>, String> {
     let existing = with_claude_state(state, run_id, |claude| claude.client.clone())?;
 
@@ -1155,6 +1490,7 @@ pub fn ensure_claude_stream_client(
             effort,
             requested_binary,
             proxy,
+            permission_mode,
             app,
         ) {
             return Ok(client);
@@ -1172,6 +1508,7 @@ pub fn ensure_claude_stream_client(
         effort,
         requested_binary,
         proxy,
+        permission_mode,
     )?;
 
     with_claude_state(state, run_id, |claude| {
@@ -1191,6 +1528,7 @@ pub fn run_claude_stream_turn(
     effort: Option<&str>,
     requested_binary: Option<&str>,
     proxy: Option<&str>,
+    permission_mode: Option<&str>,
     stream_id: Option<&str>,
 ) -> Result<(Option<String>, String), String> {
     let client = ensure_claude_stream_client(
@@ -1203,6 +1541,7 @@ pub fn run_claude_stream_turn(
         effort,
         requested_binary,
         proxy,
+        permission_mode,
     )?;
 
     if client.exited.load(Ordering::SeqCst) {
