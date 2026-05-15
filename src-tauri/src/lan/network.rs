@@ -59,7 +59,11 @@ fn hostname_lookup() -> std::io::Result<Vec<String>> {
     let host = std::env::var("HOSTNAME")
         .ok()
         .or_else(|| {
-            std::process::Command::new("hostname")
+            // Windows 下 GUI 进程 spawn `hostname.exe` 会弹一个 conhost 黑框，
+            // 用 configure_background_command 加 CREATE_NO_WINDOW 压掉。
+            let mut command = std::process::Command::new("hostname");
+            crate::agent::proc::configure_background_command(&mut command);
+            command
                 .output()
                 .ok()
                 .and_then(|out| String::from_utf8(out.stdout).ok())
