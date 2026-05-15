@@ -13,14 +13,20 @@ use std::path::Path;
 use std::process::Command;
 
 /// 跑 `git <args...>`，cwd 切到工作目录；返回 (exit_ok, stdout, stderr)。
+///
+/// Windows 注意：GUI 进程（Tauri 主进程无控制台）spawn 控制台子进程时，
+/// 系统会为每个子进程分配新的 conhost 窗口，表现为"黑框一闪而过"。
+/// `configure_background_command` 内部按平台条件加 `CREATE_NO_WINDOW`
+/// flag，从根上压掉这种窗口；非 Windows 平台是空操作。
 fn run_git(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
     let path = Path::new(cwd);
     if !path.exists() {
         return Err(format!("目录不存在: {cwd}"));
     }
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(path)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(path);
+    crate::agent::proc::configure_background_command(&mut command);
+    let output = command
         .output()
         .map_err(|e| format!("启动 git 失败: {e}（请确认系统已安装 git）"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
