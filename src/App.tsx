@@ -8,6 +8,7 @@ import { ProfileModal } from "./components/profile/ProfileModal";
 import { SidebarLeft } from "./components/sidebar/SidebarLeft";
 import { SidebarRight } from "./components/sidebar/SidebarRight";
 import { InPageSearch } from "./components/InPageSearch";
+import { WindowsTopBar } from "./components/WindowsTopBar";
 import { useUiStore } from "./stores/useUiStore";
 import { useAgentIPC } from "./hooks/useAgentIPC";
 import { useCliStream } from "./hooks/useCliStream";
@@ -21,6 +22,12 @@ import { usePermissionRequests } from "./hooks/usePermissionRequests";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useProfileStore } from "./stores/useProfileStore";
+
+// 自画顶栏的存在条件：Tauri 桌面端非 mac（mac 走 lib.rs 的 set_decorations(true)
+// + titleBarStyle Overlay 的原生红绿灯）。motion.div 在该条件下 pt-7 让位 28px。
+const isMacOS = typeof navigator !== "undefined"
+  && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
+const hasCustomTopBar = isTauri && !isMacOS;
 
 function App(): JSX.Element {
   const mobileLeftDrawerOpen = useUiStore((s) => s.mobileLeftDrawerOpen);
@@ -151,6 +158,10 @@ function App(): JSX.Element {
       {/* Glass container —— 桌面端 inset-2 浮起感；移动端贴边铺满，最大化可用区 */}
       <div className="absolute inset-0 overflow-hidden border border-white/60 bg-white/70 backdrop-blur-2xl sm:inset-2 sm:rounded-[22px] sm:shadow-[0_8px_40px_rgba(0,0,0,0.06)] dark:border-white/10 dark:bg-slate-800/60 dark:shadow-none">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_18%,rgba(255,255,255,0.3),transparent_38%),radial-gradient(circle_at_88%_82%,rgba(0,0,0,0.04),transparent_30%)] dark:bg-[radial-gradient(circle_at_12%_18%,rgba(255,255,255,0.04),transparent_38%),radial-gradient(circle_at_88%_82%,rgba(255,255,255,0.02),transparent_30%)]" />
+        {/* Windows / Linux 桌面端自画顶栏：absolute top-0 覆盖玻璃容器顶部 28px。
+            内部自己判断 isTauri && !isMacOS，组件级 return null 实现条件渲染。
+            放在 motion.div 之外（不参与 mount/unmount 动画）避免切换屏幕时顶栏闪烁。 */}
+        <WindowsTopBar />
         <AnimatePresence mode="wait">
           <motion.div
             key="main"
@@ -158,7 +169,9 @@ function App(): JSX.Element {
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.985 }}
             transition={{ duration: 0.25, ease: "easeOut" }}
-            className="relative z-10 h-full w-full"
+            // hasCustomTopBar 时 pt-7 把内容下移 28px 给顶栏让位；mac 不需要
+            // （顶部留白由 SidebarLeft drag-bar 与 MainView lg:pt-7 配合处理）
+            className={`relative z-10 h-full w-full ${hasCustomTopBar ? "pt-7" : ""}`}
           >
             {currentScreen}
           </motion.div>
