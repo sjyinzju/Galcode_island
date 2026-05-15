@@ -101,11 +101,15 @@ function App(): JSX.Element {
         {/* 左栏：桌面端常驻；< lg 时绝对定位抽屉 + 遮罩点击关闭。
             移动端用 top-0 + h-[100dvh] 而不是 inset-y-0：fixed 元素的 inset-y-0
             在 iOS Safari 引用大视口（含底部地址栏）→ 抽屉底部会被浏览器栏挡住；
-            h-[100dvh] 跟着可视区动态变化，浏览器栏显隐时 reflow */}
+            h-[100dvh] 跟着可视区动态变化，浏览器栏显隐时 reflow。
+            hasCustomTopBar 时把抽屉整个挤到 WindowsTopBar 之下：top-7 (28px) 跟
+            WindowsTopBar 高度对齐，高度补差 — 不是靠 z-index 盖，而是物理上让出
+            顶栏区域，跟 mac 上 SidebarLeft 内部 28px 让位红绿灯的视觉一致。
+            lg:top-0 复位让桌面端 lg:relative 模式下不引入额外偏移。 */}
         <div
-          className={`fixed top-0 left-0 z-30 h-[100dvh] w-[78%] max-w-[320px] transform transition-transform duration-200 ease-out lg:relative lg:z-auto lg:h-full lg:w-auto lg:max-w-none lg:translate-x-0 ${
-            mobileLeftDrawerOpen ? "translate-x-0" : "-translate-x-full"
-          }`}
+          className={`fixed left-0 z-30 w-[78%] max-w-[320px] transform transition-transform duration-200 ease-out lg:relative lg:z-auto lg:top-0 lg:h-full lg:w-auto lg:max-w-none lg:translate-x-0 ${
+            hasCustomTopBar ? "top-7 h-[calc(100dvh-1.75rem)]" : "top-0 h-[100dvh]"
+          } ${mobileLeftDrawerOpen ? "translate-x-0" : "-translate-x-full"}`}
         >
           <SidebarLeft />
         </div>
@@ -114,7 +118,10 @@ function App(): JSX.Element {
             type="button"
             aria-label="关闭侧边栏"
             onClick={closeMobileLeftDrawer}
-            className="fixed top-0 left-0 z-20 h-[100dvh] w-full bg-black/30 backdrop-blur-[2px] lg:hidden"
+            // 遮罩跟侧边栏同步让位顶栏区域，让用户感知顶栏始终可点
+            className={`fixed left-0 z-20 w-full bg-black/30 backdrop-blur-[2px] lg:hidden ${
+              hasCustomTopBar ? "top-7 h-[calc(100dvh-1.75rem)]" : "top-0 h-[100dvh]"
+            }`}
           />
         )}
 
@@ -158,10 +165,6 @@ function App(): JSX.Element {
       {/* Glass container —— 桌面端 inset-2 浮起感；移动端贴边铺满，最大化可用区 */}
       <div className="absolute inset-0 overflow-hidden border border-white/60 bg-white/70 backdrop-blur-2xl sm:inset-2 sm:rounded-[22px] sm:shadow-[0_8px_40px_rgba(0,0,0,0.06)] dark:border-white/10 dark:bg-slate-800/60 dark:shadow-none">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_18%,rgba(255,255,255,0.3),transparent_38%),radial-gradient(circle_at_88%_82%,rgba(0,0,0,0.04),transparent_30%)] dark:bg-[radial-gradient(circle_at_12%_18%,rgba(255,255,255,0.04),transparent_38%),radial-gradient(circle_at_88%_82%,rgba(255,255,255,0.02),transparent_30%)]" />
-        {/* Windows / Linux 桌面端自画顶栏：absolute top-0 覆盖玻璃容器顶部 28px。
-            内部自己判断 isTauri && !isMacOS，组件级 return null 实现条件渲染。
-            放在 motion.div 之外（不参与 mount/unmount 动画）避免切换屏幕时顶栏闪烁。 */}
-        <WindowsTopBar />
         <AnimatePresence mode="wait">
           <motion.div
             key="main"
@@ -179,6 +182,11 @@ function App(): JSX.Element {
         <SettingsModal />
         <ProfileModal />
       </div>
+      {/* Windows / Linux 自画顶栏。组件内部用 createPortal 挂到 document.body
+          脱离 React DOM 祖先链，stacking ancestor 直接是文档根，绕开 webview 上
+          motion.div / glass container / 侧边栏 fixed 之间复杂 stacking quirk。
+          这里渲染位置只是 React 组件树上的位置，对实际 DOM 位置无影响。 */}
+      <WindowsTopBar />
     </main>
   );
 }

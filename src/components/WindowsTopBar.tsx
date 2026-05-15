@@ -10,9 +10,14 @@
 //
 // 渲染条件：`isTauri && !isMacOS`。LAN 客户端（浏览器）和 macOS 桌面端都不渲染。
 //
-// 位置：在 App.tsx 玻璃容器内 absolute top-0 left-0 right-0，跟容器 inset-2
-// 桌面边距自然对齐；不用 fixed 避免被祖先 transform 影响 containing block。
-// 玻璃容器内的 motion.div 同时 pt-7 把内容下移 28px 让位。
+// 位置：用 createPortal 挂到 document.body。
+// 之前尝试过 absolute in glass container（z-60）和 fixed in main（z-100），
+// 都被侧边栏穿透 — Tauri WebView 上 fixed 元素的 stacking 在多层
+// transform/backdrop-filter 嵌套下表现不可预测，侧边栏 fixed z-30 实际跑到
+// 比 main 还外层。挂到 body 之后 WindowsTopBar 的 stacking ancestor 就是
+// 文档根，谁也跑不出去；只要 z-index 比侧边栏 30 高，必然在上。
+// 桌面端 sm:inset-2 + h-7 跟玻璃容器顶部 8px 边距对齐。
+// motion.div 的 pt-7 让位仍然需要（避免内容被 fixed 顶栏盖住 28px）。
 //
 // 拖窗：仅挂 data-tauri-drag-region，Tauri 自己处理 mousedown→startDragging
 // 与双击→toggleMaximize 两件事。**不要叠加 onMouseDown startDragging()**：
@@ -22,6 +27,7 @@
 // 探测条件挂 onMouseDown 兜底，先优先保证 mac/Windows 双击正常。
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isTauri } from "../lib/bridge";
 
@@ -80,14 +86,16 @@ export function WindowsTopBar(): JSX.Element | null {
     try { await appWindow.close(); } catch { /* noop */ }
   };
 
-  return (
+  // 用 portal 挂到 document.body，让 WindowsTopBar 完全脱离 React 组件树
+  // 在 DOM 上的祖先，stacking ancestor 直接是文档根 — 不受任何 transform /
+  // backdrop-filter / motion.div / glass container 的 stacking 嵌套影响。
+  // z-[100] 仍然保留（虽然 body 内基本无对手，留余量给同样挂 body 的弹层
+  // 维持顺序），SettingsModal 等 z-[200+] 仍盖得住。
+  return createPortal(
     <div
-      // absolute（不是 fixed）：fixed 受祖先 transform/filter/backdrop-filter
-      // 创建 containing block 的影响，App.tsx 内多处 backdrop-blur-2xl 会让
-      // fixed 变成相对玻璃容器定位。直接用 absolute 既绕开这层 quirk 又
-      // 自动跟随玻璃容器 sm:inset-2 桌面边距，跟整体视觉一致。
-      // z-[60]：高于 MobileTopBar (z-40)、低于 SettingsModal 等弹层 (z-200+)。
-      className="absolute top-0 left-0 right-0 z-[60] flex h-7 items-stretch"
+      // 窄屏 top-0 left-0 right-0；桌面端 sm:top-2 sm:left-2 sm:right-2 跟
+      // 玻璃容器 sm:inset-2 边距对齐，视觉上嵌入玻璃容器顶部。
+      className="fixed top-0 left-0 right-0 z-[100] flex h-7 items-stretch sm:top-2 sm:left-2 sm:right-2"
     >
       {/* 拖窗区：data-tauri-drag-region 自己处理拖窗 + 双击最大化，不挂 JS handler */}
       <div data-tauri-drag-region className="h-full flex-1" />
@@ -137,6 +145,7 @@ export function WindowsTopBar(): JSX.Element | null {
           <path d="M3 3l6 6M9 3l-6 6" strokeLinecap="round" />
         </svg>
       </button>
-    </div>
+    </div>,
+    document.body
   );
 }
