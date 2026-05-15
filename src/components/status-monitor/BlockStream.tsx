@@ -312,21 +312,100 @@ function CommandBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX
   );
 }
 
+/// 每个 todo 项的三态视觉（pending / in_progress / completed），对齐 Claude
+/// Code 终端的体验。其它 status 字符串（如 cancelled / error / running）做兜底。
+function todoItemPalette(status: string | undefined): {
+  icon: string;
+  iconClass: string;
+  labelClass: string;
+  rowClass: string;
+} {
+  switch ((status ?? "").toLowerCase()) {
+    case "completed":
+    case "success":
+    case "done":
+      return {
+        icon: "✓",
+        iconClass: "text-emerald-600 dark:text-emerald-400",
+        labelClass: "text-zinc-500 line-through dark:text-zinc-500",
+        rowClass: "",
+      };
+    case "in_progress":
+    case "running":
+    case "active":
+      return {
+        icon: "◔",
+        iconClass: "text-amber-600 animate-pulse dark:text-amber-400",
+        labelClass: "text-zinc-900 font-medium dark:text-zinc-100",
+        rowClass: "bg-amber-50/50 dark:bg-amber-500/5 rounded-md",
+      };
+    case "error":
+    case "cancelled":
+    case "failed":
+      return {
+        icon: "✕",
+        iconClass: "text-rose-600 dark:text-rose-400",
+        labelClass: "text-rose-700 dark:text-rose-300",
+        rowClass: "",
+      };
+    default:
+      return {
+        icon: "○",
+        iconClass: "text-zinc-400 dark:text-zinc-500",
+        labelClass: "text-zinc-600 dark:text-zinc-300",
+        rowClass: "",
+      };
+  }
+}
+
 function TodoBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
   const items = block.items ?? [];
   if (items.length === 0) return null;
+  const total = items.length;
+  const done = items.filter((i) =>
+    ["completed", "success", "done"].includes((i.status ?? "").toLowerCase())
+  ).length;
+  const inProgress = items.filter((i) =>
+    ["in_progress", "running", "active"].includes((i.status ?? "").toLowerCase())
+  ).length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   return (
-    <div className="rounded-md border border-amber-300/40 bg-amber-50/60 p-2 text-xs dark:border-amber-400/30 dark:bg-amber-400/5">
-      <div className="mb-1 text-[11px] font-semibold text-amber-700 dark:text-amber-300">
-        {highlightText(block.title || "Todo", hl.query, block.id, "title", hl.activeMatch)}
+    <div className="rounded-md border-l-4 border-violet-400 border-y border-r border-violet-200/40 bg-violet-50/40 p-2.5 text-xs dark:border-violet-400 dark:border-violet-400/30 dark:bg-violet-500/5">
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-violet-700 dark:text-violet-300">
+          📋 {highlightText(block.title || "Todo", hl.query, block.id, "title", hl.activeMatch)}
+        </span>
+        <span className="ml-auto font-mono text-[10px] text-zinc-600 dark:text-zinc-400">
+          {done}/{total}
+          {inProgress > 0 && (
+            <span className="ml-1 text-amber-600 dark:text-amber-400">· {inProgress} 进行中</span>
+          )}
+        </span>
+      </div>
+      {/* 进度条：done 部分翠绿，in_progress 部分琥珀（叠加在 done 之后） */}
+      <div className="mb-2 h-1 w-full overflow-hidden rounded-full bg-zinc-200/60 dark:bg-zinc-700/60">
+        <div className="flex h-full w-full">
+          <div
+            className="h-full bg-emerald-500/80 transition-[width] duration-300"
+            style={{ width: `${pct}%` }}
+          />
+          {inProgress > 0 && (
+            <div
+              className="h-full bg-amber-500/80 transition-[width] duration-300"
+              style={{ width: `${Math.round((inProgress / total) * 100)}%` }}
+            />
+          )}
+        </div>
       </div>
       <ul className="flex flex-col gap-0.5">
         {items.map((item) => {
-          const badge = statusBadge(item.status);
+          const palette = todoItemPalette(item.status);
           return (
-            <li key={item.id} className="flex items-start gap-1.5">
-              <span className={`mt-0.5 ${badge.cls}`}>{badge.label}</span>
-              <span className="text-zinc-700 dark:text-zinc-200">{item.label}</span>
+            <li key={item.id} className={`flex items-start gap-2 px-1 py-0.5 ${palette.rowClass}`}>
+              <span className={`mt-0.5 inline-block w-3 shrink-0 text-center font-bold ${palette.iconClass}`}>
+                {palette.icon}
+              </span>
+              <span className={`flex-1 ${palette.labelClass}`}>{item.label}</span>
             </li>
           );
         })}
@@ -353,13 +432,147 @@ function ConfirmBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX
   );
 }
 
+/// 把 Claude SDK 给的 mcp__<server>__<tool> 形式拆成 server / tool 两段
+/// 让 ToolBlock 可以分两个色块展示。常见 server 名形如 plugin_ecc_github，
+/// 拆开后做基本的 prettify（把首层下划线显成 ·）。
+function parseMcpToolName(raw: string | undefined): { server?: string; tool: string } {
+  const value = (raw ?? "tool").trim();
+  if (!value.startsWith("mcp__")) {
+    return { tool: value };
+  }
+  const body = value.slice(5); // 去 "mcp__"
+  const sepIdx = body.indexOf("__");
+  if (sepIdx < 0) return { tool: value };
+  const server = body.slice(0, sepIdx);
+  const tool = body.slice(sepIdx + 2);
+  return {
+    server: server.replace(/^plugin_/, "").replace(/_/g, "·"),
+    tool,
+  };
+}
+
+/// 根据工具名给整个 ToolBlock 卡片打配色组。让 Task / Skill / Web 等特殊工具
+/// 一眼就能跟普通灰底工具块区分。
+function toolBlockPalette(toolName: string | undefined): {
+  container: string;
+  toolText: string;
+  icon: string;
+} {
+  const name = (toolName ?? "").trim();
+  // Task 调用子代理 —— 靛蓝
+  if (name.startsWith("Task")) {
+    return {
+      container:
+        "bg-indigo-100/60 border border-indigo-300/50 dark:bg-indigo-500/15 dark:border-indigo-400/30",
+      toolText: "text-indigo-800 dark:text-indigo-200",
+      icon: "🤖",
+    };
+  }
+  // Skill 调用安装的技能 —— 翠绿
+  if (name === "Skill" || name.startsWith("Skill·") || name.startsWith("Skill ")) {
+    return {
+      container:
+        "bg-teal-100/60 border border-teal-300/50 dark:bg-teal-500/15 dark:border-teal-400/30",
+      toolText: "text-teal-800 dark:text-teal-200",
+      icon: "✨",
+    };
+  }
+  // Web 工具 —— 天蓝
+  if (name === "WebFetch" || name === "WebSearch") {
+    return {
+      container:
+        "bg-sky-100/60 border border-sky-300/50 dark:bg-sky-500/15 dark:border-sky-400/30",
+      toolText: "text-sky-800 dark:text-sky-200",
+      icon: name === "WebFetch" ? "🌐" : "🔍",
+    };
+  }
+  // MCP 工具 —— 紫色（与 server 徽章颜色协调）
+  if (name.startsWith("mcp__")) {
+    return {
+      container:
+        "bg-violet-50/60 border border-violet-200/50 dark:bg-violet-500/10 dark:border-violet-400/20",
+      toolText: "text-violet-800 dark:text-violet-200",
+      icon: "🔌",
+    };
+  }
+  // TodoWrite 不走这里（走 TodoBlock），但万一漏了兜底
+  // 普通工具 —— 中性灰
+  return {
+    container: "bg-zinc-100/50 dark:bg-zinc-800/40",
+    toolText: "text-zinc-700 dark:text-zinc-200",
+    icon: "",
+  };
+}
+
+/// 格式化耗时为 "Xs" / "Xm Ys"。
+function formatElapsed(ms: number): string {
+  const secs = Math.max(0, Math.floor(ms / 1000));
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m ${s}s`;
+}
+
 function ToolBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element {
   const badge = statusBadge(block.status);
+  const { server, tool } = parseMcpToolName(block.tool);
+  const palette = toolBlockPalette(block.tool);
+  const isRunning = block.status === "running" || block.status === "active";
+  const isLongRunning =
+    !!block.startedAt && (block.tool?.startsWith("Task") || block.tool?.startsWith("Skill"));
+  const activeTabId = useActiveTabId();
+
+  // Task / Skill running 时按秒刷新一次显示耗时；其它工具不需要走 ticker。
+  const [now, setNow] = useState(() => Date.now());
+  const [stopping, setStopping] = useState(false);
+  useEffect(() => {
+    if (!isLongRunning || !isRunning) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [isLongRunning, isRunning]);
+
+  const elapsedText =
+    block.startedAt && isLongRunning
+      ? formatElapsed((isRunning ? now : block.startedAt + 0) - block.startedAt)
+      : null;
+
+  // Stop 按钮：仅 Task / Skill 跑着时显示。点了会调 stop_agent 停掉当前整个 turn —
+  // Claude SDK 当前没有 per-Task 取消能力，停整 turn 是唯一可达的中断手段。
+  const handleStop = async (): Promise<void> => {
+    if (stopping || !activeTabId) return;
+    setStopping(true);
+    try {
+      const { invoke } = await import("../../lib/bridge");
+      await invoke("stop_agent", { runId: activeTabId });
+    } catch (err) {
+      console.error("[ToolBlock] stop failed", err);
+    } finally {
+      setStopping(false);
+    }
+  };
+
   return (
-    <div className="flex items-center gap-2 rounded-md bg-zinc-100/50 px-2 py-1 text-[11px] dark:bg-zinc-800/40">
+    <div
+      className={`flex items-center gap-2 rounded-md px-2 py-1 text-[11px] ${palette.container} ${
+        isRunning && isLongRunning ? "shadow-[0_0_12px_rgba(99,102,241,0.25)]" : ""
+      }`}
+    >
       <span className={badge.cls}>{badge.label}</span>
-      <span className="font-medium text-zinc-700 dark:text-zinc-200">
-        {highlightText(block.tool || "tool", hl.query, block.id, "tool", hl.activeMatch)}
+      {palette.icon && (
+        <span className={`shrink-0 ${isRunning && isLongRunning ? "animate-pulse" : ""}`} aria-hidden>
+          {palette.icon}
+        </span>
+      )}
+      {server && (
+        <span
+          className="shrink-0 rounded bg-violet-100/80 px-1 font-mono text-[9px] font-medium uppercase tracking-wider text-violet-700 dark:bg-violet-500/15 dark:text-violet-300"
+          title={`MCP server: ${server}`}
+        >
+          {server}
+        </span>
+      )}
+      <span className={`font-medium ${palette.toolText}`}>
+        {highlightText(tool, hl.query, block.id, "tool", hl.activeMatch)}
       </span>
       {block.detail ? (
         <span className="truncate text-zinc-500 dark:text-zinc-400">
@@ -371,6 +584,30 @@ function ToolBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
           {highlightText(block.message, hl.query, block.id, "message", hl.activeMatch)}
         </span>
       ) : null}
+      {elapsedText && (
+        <span
+          className={`ml-auto shrink-0 rounded px-1 font-mono text-[10px] tabular-nums ${
+            isRunning
+              ? "bg-amber-100/80 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300"
+              : "bg-zinc-100/80 text-zinc-500 dark:bg-zinc-700/40 dark:text-zinc-400"
+          }`}
+          title={isRunning ? "进行中耗时" : "总耗时"}
+        >
+          {isRunning ? "⏱ " : ""}{elapsedText}
+        </span>
+      )}
+      {isRunning && isLongRunning && (
+        <button
+          type="button"
+          onClick={() => void handleStop()}
+          disabled={stopping}
+          title="停止当前整个 turn（Claude SDK 暂不支持单独取消子代理）"
+          aria-label="Stop"
+          className="shrink-0 rounded-md border border-rose-300/60 bg-rose-50/80 px-1.5 py-0.5 text-[10px] font-bold text-rose-700 transition-colors hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-400/40 dark:bg-rose-500/15 dark:text-rose-300 dark:hover:bg-rose-500/25"
+        >
+          {stopping ? "…" : "✕"}
+        </button>
+      )}
     </div>
   );
 }
