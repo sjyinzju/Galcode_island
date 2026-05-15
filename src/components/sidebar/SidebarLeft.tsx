@@ -1,7 +1,7 @@
 // 三栏布局的左栏：上下结构
 //   - 顶部 28px drag bar：mac 上给 traffic lights 让位 + 整条可拖窗；
-//     非 mac 上整条可拖 + 右侧嵌入 −/□/× 三连窗口控制按钮（GlobalTopBar 已删除，
-//     窗口控制只能寄生在这里）
+//     非 mac 上整条可拖（窗口控制按钮已迁移至 App.tsx 的 WindowsTopBar，避免
+//     抽屉收起时找不到 min/max/close 入口）
 //   - 上：导航菜单（"所有项目" / "历史会话" / "搜索"切换中部视图）
 //   - 中：按 useUiStore.leftSidebarView 切换显示 ProjectTree / HistoryList / SearchPanel
 //   - 下：主题 / 设置 / 个人档案
@@ -113,43 +113,9 @@ export function SidebarLeft(): JSX.Element {
             </button>
           </>
         )}
-        {isTauri && !isMacOS && (
-          <div className="flex items-center gap-0.5 pr-1">
-            <button
-              type="button"
-              onClick={async () => {
-                try { if (appWindow) await appWindow.minimize(); }
-                catch (error) { console.error("Failed to minimize", error); }
-              }}
-              className="flex h-5 w-6 items-center justify-center rounded text-zinc-500 transition-colors hover:bg-black/10 dark:text-zinc-400 dark:hover:bg-white/10"
-              aria-label="最小化窗口"
-            >
-              -
-            </button>
-            <button
-              type="button"
-              onClick={async () => {
-                try { if (appWindow) await appWindow.toggleMaximize(); }
-                catch (error) { console.error("Failed to toggle maximize", error); }
-              }}
-              className="flex h-5 w-6 items-center justify-center rounded text-[10px] text-zinc-500 transition-colors hover:bg-black/10 dark:text-zinc-400 dark:hover:bg-white/10"
-              aria-label="最大化窗口"
-            >
-              □
-            </button>
-            <button
-              type="button"
-              onClick={async () => {
-                try { if (appWindow) await appWindow.close(); }
-                catch (error) { console.error("Failed to close", error); }
-              }}
-              className="flex h-5 w-6 items-center justify-center rounded text-rose-500 transition-colors hover:bg-rose-400/15 dark:text-rose-300"
-              aria-label="关闭窗口"
-            >
-              ×
-            </button>
-          </div>
-        )}
+        {/* Windows / Linux 上的 min/max/close 按钮已迁移到 App.tsx 的 WindowsTopBar
+            统一管理（避免抽屉收起时找不到窗口控制）；这里仅保留 28px drag-bar
+            区域作为视觉对齐 / 桌面端额外可拖区。 */}
       </div>
 
       {/* 顶部菜单：紧贴 drag bar 下方（pt-0），让第一个按钮顶部 y === drag bar
