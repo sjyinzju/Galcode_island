@@ -60,10 +60,15 @@ pub struct PermissionRequestEvent {
     pub permission_suggestions: Option<Value>,
 }
 
-/// 待响应的请求池：request_id → 阻塞中的 MCP handler 线程的 oneshot sender
-static PENDING: OnceLock<Mutex<HashMap<String, Sender<PermissionDecision>>>> = OnceLock::new();
+/// 待响应的请求池：request_id → (run_id, 阻塞中的 MCP handler 线程的 oneshot sender)
+///
+/// 携带 run_id 是为了在对应 session 被 kill 时按 run_id 批量 deny，避免 handler
+/// 线程在 rx.recv_timeout 上空等 10 分钟（前端 PermissionCard 已经随 tab 销毁了
+/// 不会再回 respond_permission_decision）。
+static PENDING: OnceLock<Mutex<HashMap<String, (String, Sender<PermissionDecision>)>>> =
+    OnceLock::new();
 
-fn pending() -> &'static Mutex<HashMap<String, Sender<PermissionDecision>>> {
+fn pending() -> &'static Mutex<HashMap<String, (String, Sender<PermissionDecision>)>> {
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -264,7 +269,7 @@ fn handle_tools_call(id: &Value, payload: &Value, run_id: &str, app: &AppHandle)
 
     {
         let mut map = pending().lock().unwrap();
-        map.insert(request_id.clone(), tx);
+        map.insert(request_id.clone(), (run_id.to_string(), tx));
     }
 
     let event = PermissionRequestEvent {
@@ -483,7 +488,7 @@ fn urldecode(s: &str) -> String {
 pub fn resolve(request_id: &str, decision: PermissionDecision) -> bool {
     let tx = {
         let mut map = pending().lock().unwrap();
-        map.remove(request_id)
+        map.remove(request_id).map(|(_run_id, sender)| sender)
     };
     match tx {
         Some(sender) => {
@@ -499,6 +504,38 @@ pub fn resolve(request_id: &str, decision: PermissionDecision) -> bool {
             false
         }
     }
+}
+
+/// 把某个 run_id 下所有待响应请求 deny 掉。在 Claude session 被 kill 时调，
+/// 让 MCP handler 线程立刻收到决策从 rx.recv_timeout 返回，否则会空等 10 分钟，
+/// 期间一直占着 pending map 和一个 worker 线程。
+///
+/// 返回释放的请求数（用于日志诊断）。
+pub fn deny_pending_for_run(run_id: &str, reason: &str) -> usize {
+    let entries: Vec<Sender<PermissionDecision>> = {
+        let mut map = pending().lock().unwrap();
+        let mut taken = Vec::new();
+        let keys_to_remove: Vec<String> = map
+            .iter()
+            .filter(|(_, (rid, _))| rid == run_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys_to_remove {
+            if let Some((_, tx)) = map.remove(&k) {
+                taken.push(tx);
+            }
+        }
+        taken
+    };
+    let count = entries.len();
+    for tx in entries {
+        let _ = tx.send(PermissionDecision {
+            decision: "deny".into(),
+            message: Some(reason.to_string()),
+            updated_input: None,
+        });
+    }
+    count
 }
 
 /// 给指定 run_id 写一份 per-session MCP config 文件，返回路径。
@@ -546,11 +583,11 @@ pub fn cleanup_session_mcp_config(app: &AppHandle, run_id: &str) {
 /// 测试桩用；释放所有 pending（让 Claude 拿到 deny），上下游异常时调一下避免泄漏。
 #[allow(dead_code)]
 pub fn deny_all_pending(reason: &str) {
-    let entries: Vec<(String, Sender<PermissionDecision>)> = {
+    let entries: Vec<(String, (String, Sender<PermissionDecision>))> = {
         let mut map = pending().lock().unwrap();
         map.drain().collect()
     };
-    for (_id, tx) in entries {
+    for (_id, (_run_id, tx)) in entries {
         let _ = tx.send(PermissionDecision {
             decision: "deny".into(),
             message: Some(reason.to_string()),

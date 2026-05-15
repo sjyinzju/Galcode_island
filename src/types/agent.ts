@@ -33,18 +33,13 @@ export type LastStage =
   | "error"
   | "suggest";
 
-/// Claude Code 的权限模式。
-///
-/// 直接对应 Claude CLI `--permission-mode` 的 4 个原生值：
-/// - default: 默认行为，工具调用需要审批
-/// - acceptEdits: 自动接受所有编辑（写文件 / Edit / Patch 等），其它工具仍要审批
-/// - plan: Plan Mode，agent 先列计划再执行，需 ExitPlanMode 才真正动手
-/// - bypassPermissions: 完全跳过审批；危险，仅给可信脚本用
-///
-/// 额外提供一个 UI 别名：
-/// - auto: 对应 Claude Code 桌面版的"Auto"按钮；当前 CLI 没有独立值，
-///   Rust 端 normalize_permission_mode 把它映射到 `acceptEdits` 实际生效。
-///   单独列出是为了让 UI 跟桌面版 Shift+Tab 循环保持一致（用户预期里有这一档）。
+/// Claude Code 的权限模式。直接对应 Claude CLI `--permission-mode` 的 5 个值：
+/// - default: 工具调用走 permission-prompt-tool 弹审批卡
+/// - acceptEdits: 自动放行编辑类（Edit/Write/Patch、mkdir/touch/mv/cp 等），其它工具仍审批
+/// - plan: 先研究 + 写计划，不动源码；ExitPlanMode 时退出
+/// - auto: 不弹审批，但独立 classifier 模型逐 action 做安全审查；被 block 3 次/20 次累计后
+///   回退到 prompt-tool。需要 v2.1.83+ CLI 与 Max/Team/Enterprise/API 计划。
+/// - bypassPermissions: 完全跳过审批 + 关闭 prompt-tool 桥接；仅限隔离环境
 export type PermissionMode =
   | "default"
   | "auto"

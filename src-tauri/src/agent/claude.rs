@@ -83,6 +83,20 @@ fn lookup_tool_use_name(tool_use_id: &str) -> Option<String> {
         .and_then(|map| map.get(tool_use_id).cloned())
 }
 
+/// tool_result 处理完后调用：释放该 tool_use_id 在两个全局 map 上的条目。
+/// 长跑 session（几千次工具调用）下避免 map 持续增长。
+fn forget_tool_use(tool_use_id: &str) {
+    if tool_use_id.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = TOOL_USE_PREFIX.lock() {
+        map.remove(tool_use_id);
+    }
+    if let Ok(mut map) = TOOL_USE_NAME.lock() {
+        map.remove(tool_use_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 模块内 API 响应类型 (供未来 UI 命令使用)
 // ---------------------------------------------------------------------------
@@ -921,7 +935,13 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                 let target_prefix = lookup_tool_use_prefix(tool_use_id);
                 let prefixes: Vec<&'static str> = match target_prefix {
                     Some(p) => vec![p],
-                    None => vec!["claude-cmd", "claude-file", "claude-tool", "claude-todo"],
+                    None => vec![
+                        "claude-cmd",
+                        "claude-file",
+                        "claude-tool",
+                        "claude-todo",
+                        "claude-diff",
+                    ],
                 };
                 for prefix in prefixes {
                     let block_type = match prefix {
@@ -965,6 +985,8 @@ pub fn extract_claude_blocks(event: &Value) -> Vec<Value> {
                         "block": Value::Object(block_map)
                     }));
                 }
+                // tool_use_id 这次 turn 不会再用到，释放两个 map 上的条目避免长期累积
+                forget_tool_use(tool_use_id);
             }
             _ => {}
         }
@@ -1029,17 +1051,21 @@ pub fn current_claude_stream_id(client: &ClaudeStreamClient) -> Option<String> {
 // Stream 客户端生命周期
 // ---------------------------------------------------------------------------
 
-/// Claude CLI 支持的四种 permission mode。前端用同名 PermissionMode TS 类型。
+/// Claude CLI 支持的 permission mode。前端用同名 PermissionMode TS 类型。
 ///
-/// 额外 UI alias：`"auto"` 是前端模式选择里的"Auto Mode"档（对照 Claude Code 桌面版
-/// 同名按钮）。CLI 没有独立的 `auto` 值，把它当作 `acceptEdits` 的同义词转发即可。
-/// 如果未来 Claude CLI 引入真正的 `auto` 值，只需在此处改 map。
+/// `auto` 是 Claude Code v2.1.83+ 引入的独立 mode：CLI 不弹审批，但有独立 classifier
+/// 模型逐 action 做安全审查，被 block 3 次连续 / 20 次累计后才回退到 prompt-tool。
+/// 这里**原样透传** `auto`，让 CLI 自己处理 — 之前误把它映射到 acceptEdits 是错的。
+///
+/// 注意：auto 有最低 CLI 版本 + 计划 + 模型 + provider 要求（详见
+/// <https://code.claude.com/docs/en/permission-modes>）。若用户当前账号不满足，
+/// CLI 会自己报错，本应用不预先判断。
 ///
 /// 任何不在白名单里的字符串会被 fall back 到 "acceptEdits"（保持向后兼容老行为）。
 fn normalize_permission_mode(mode: Option<&str>) -> &'static str {
     match mode.map(str::trim).unwrap_or("") {
         "default" => "default",
-        "auto" => "acceptEdits",
+        "auto" => "auto",
         "acceptEdits" => "acceptEdits",
         "plan" => "plan",
         "bypassPermissions" => "bypassPermissions",
@@ -1096,25 +1122,35 @@ pub fn spawn_claude_stream_client(
     // 接入 permission-prompt-tool：让 Claude 在工具调用前 RPC 到本地 MCP 桥接
     // 服务，桥接转 Tauri 事件 → 前端 PermissionCard，让用户在 App 内 Allow/Deny。
     // 失败时（MCP 没起来 / 写 config 出错）忽略，行为退化到纯 --permission-mode。
+    //
+    // bypassPermissions 例外：用户明确选了"零审批"，不该再起任何审批往返。
+    // Claude CLI 在 bypass 下其实也不会调 prompt-tool（CLI 行为兜底），但
+    // 我们这边显式不挂，连 MCP config 文件都不写、HTTP 也不被访问，语义更干净。
     let mut prompt_tool_attached = false;
-    match crate::permission_mcp::write_session_mcp_config(app, run_id) {
-        Ok(cfg_path) => {
-            command
-                .arg("--mcp-config")
-                .arg(&cfg_path)
-                .arg("--permission-prompt-tool")
-                .arg(crate::permission_mcp::PERMISSION_TOOL_NAME);
-            prompt_tool_attached = true;
-            log::info!(
-                "[claude] permission-prompt-tool 接入 OK: run_id={run_id} cfg={} tool={}",
-                cfg_path.display(),
-                crate::permission_mcp::PERMISSION_TOOL_NAME
-            );
-        }
-        Err(e) => {
-            log::warn!(
-                "[claude] 跳过 permission-prompt-tool 接入: {e}（将走 --permission-mode 原生行为）"
-            );
+    if permission_mode_text == "bypassPermissions" {
+        log::info!(
+            "[claude] bypassPermissions 模式：跳过 permission-prompt-tool 接入"
+        );
+    } else {
+        match crate::permission_mcp::write_session_mcp_config(app, run_id) {
+            Ok(cfg_path) => {
+                command
+                    .arg("--mcp-config")
+                    .arg(&cfg_path)
+                    .arg("--permission-prompt-tool")
+                    .arg(crate::permission_mcp::PERMISSION_TOOL_NAME);
+                prompt_tool_attached = true;
+                log::info!(
+                    "[claude] permission-prompt-tool 接入 OK: run_id={run_id} cfg={} tool={}",
+                    cfg_path.display(),
+                    crate::permission_mcp::PERMISSION_TOOL_NAME
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[claude] 跳过 permission-prompt-tool 接入: {e}（将走 --permission-mode 原生行为）"
+                );
+            }
         }
     }
     log::info!(
@@ -1130,6 +1166,8 @@ pub fn spawn_claude_stream_client(
     // Edit 不弹窗"这种问题极有用——一眼就能确认 CLI 拿到的参数是否符合预期。
     let prompt_tool_label = if prompt_tool_attached {
         "✓ permission-prompt-tool 已挂"
+    } else if permission_mode_text == "bypassPermissions" {
+        "（bypassPermissions：所有工具直接放行）"
     } else {
         "⚠ permission-prompt-tool 未挂（CLI 走 --permission-mode 原生行为）"
     };
@@ -1149,7 +1187,9 @@ pub fn spawn_claude_stream_client(
         &json!({
             "type": "galcode.block",
             "block": {
-                "id": format!("claude-spawn-info-{}", chrono::Utc::now().timestamp_millis()),
+                // id 用 run_id 保证同 tab 内 respawn（参数变更触发 kill + respawn）
+                // 时新的 spawn-info 块 upsert 覆盖旧的，而不是堆出多条历史 status。
+                "id": format!("claude-spawn-info-{run_id}"),
                 "type": "status",
                 "content": status_text,
                 "backend": "claude",
@@ -1377,6 +1417,22 @@ pub fn spawn_claude_stream_client(
 pub fn kill_claude_stream_client(client: &ClaudeStreamClient) {
     if client.exited.load(Ordering::SeqCst) {
         return;
+    }
+
+    // 解开所有阻塞中的 permission-prompt-tool handler 线程：Claude 进程一旦
+    // 被杀，前端 PermissionCard 也会随 tab 销毁，永远不会有人调
+    // respond_permission_decision，handler 会在 rx.recv_timeout 上空等
+    // 10 分钟。这里主动 deny 一下释放掉。
+    let denied = crate::permission_mcp::deny_pending_for_run(
+        &client.run_id,
+        "Claude session 已停止",
+    );
+    if denied > 0 {
+        log::info!(
+            "[claude] kill run_id={}: denied {} pending permission request(s)",
+            client.run_id,
+            denied
+        );
     }
 
     // 先递归清理子进程树（含 SIGTERM→SIGKILL 回退），再强杀主进程

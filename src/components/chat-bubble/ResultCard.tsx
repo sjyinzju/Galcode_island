@@ -1,6 +1,7 @@
 import { invoke } from "../../lib/bridge";
 import { useRef, useState, type KeyboardEvent } from "react";
 import { useAppStore } from "../../stores/useAppStore";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useActivityStore } from "../../stores/useActivityStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
@@ -8,10 +9,11 @@ import { motion, AnimatePresence } from "framer-motion";
 import { PetCharacter } from "../pet-character/PetCharacter";
 import { ErrorDiagnosisCard } from "../status-monitor/ErrorDiagnosisCard";
 import { PermissionModeBadge } from "../PermissionModeBadge";
+import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
 
 export function ResultCard(): JSX.Element {
   const tab = useActiveTab();
-  const { activeTabId, update } = useActiveTabActions();
+  const { activeTabId, update, clearBlocks } = useActiveTabActions();
   const addLogEntry = useAppStore((s) => s.addLogEntry);
 
   const mode = tab.mode;
@@ -30,6 +32,30 @@ export function ResultCard(): JSX.Element {
   // 中文输入法 composition 期间不要把 Enter 当发送 —— 用 keydown 检查 isComposing
   // 即可（Safari/Chrome/Edge 都支持）；composition* 事件做 backup 兜底。
   const isComposingRef = useRef(false);
+  // 给 slash 面板 hook 补全后 setSelectionRange 用
+  const followupTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // ResultCard 外层 motion.div 和 inner container 都有 overflow-hidden（rounded-2xl
+  // 切角用），普通 absolute 定位面板会被裁。挂这个 ref 给 SlashCommandPanel
+  // 的 portal 模式做坐标 anchor。
+  const followupRowRef = useRef<HTMLDivElement | null>(null);
+
+  // 斜杠命令面板：跟 InputBubble 共用 hook。projectPath 走 tab.projectPath。
+  // 切到 builtin 命令（/clear /mode /model ...）时不发送 follow-up，让命令本地生效。
+  const slash = useSlashCommandPanel({
+    value: followupText,
+    setValue: setFollowupText,
+    textareaRef: followupTextareaRef,
+    isComposingRef,
+    projectPath: tab.projectPath,
+    activeTabId,
+    actions: {
+      clearActiveTabBlocks: () => clearBlocks(),
+      openSettings: () => useSettingsStore.getState().openSettingsModal(),
+      setPermissionMode: (value) => update({ permissionMode: value }),
+      addLog: (level, message) =>
+        addLogEntry({ timestamp: Date.now(), level, message }),
+    },
+  });
 
   const isVisible =
     uiState === "done" ||
@@ -92,14 +118,19 @@ export function ResultCard(): JSX.Element {
     }
   };
 
-  const submitFollowup = (): void => {
+  const submitFollowup = async (): Promise<void> => {
     const text = followupText.trim();
     if (!text) return;
+    // 斜杠命令优先：能本地处理就不发给 agent（不发起新一轮 turn）
+    if (await slash.tryRunBuiltin()) return;
     setFollowupText("");
     void handleOptionClick(text);
   };
 
   const handleFollowupKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
+    // 面板可见时优先处理（方向键 / Tab / Esc / 部分匹配 Enter 补全）；
+    // Enter+exactMatch 时 hook 返回 false，让下面的 submit 接管。
+    if (slash.handleKeyDown(e)) return;
     if (e.key !== "Enter") return;
     // shift+Enter 让默认行为生效（插入换行）
     if (e.shiftKey) return;
@@ -110,7 +141,7 @@ export function ResultCard(): JSX.Element {
     const native = e.nativeEvent as KeyboardEvent["nativeEvent"] & { isComposing?: boolean };
     if (native.isComposing || e.keyCode === 229 || isComposingRef.current) return;
     e.preventDefault();
-    submitFollowup();
+    void submitFollowup();
   };
 
   const isError = mode === "error" || uiState === "error";
@@ -208,8 +239,12 @@ export function ResultCard(): JSX.Element {
             )}
 
             {/* 永久输入框：除了选项按钮之外用户始终能直接打字继续会话 */}
-            <div className="flex shrink-0 items-end gap-2 border-t border-zinc-200/50 pt-2 dark:border-zinc-700/50">
+            <div
+              ref={followupRowRef}
+              className="relative flex shrink-0 items-end gap-2 border-t border-zinc-200/50 pt-2 dark:border-zinc-700/50"
+            >
               <textarea
+                ref={followupTextareaRef}
                 value={followupText}
                 onChange={(e) => setFollowupText(e.target.value)}
                 onKeyDown={handleFollowupKeyDown}
@@ -219,14 +254,14 @@ export function ResultCard(): JSX.Element {
                 onCompositionEnd={() => {
                   isComposingRef.current = false;
                 }}
-                placeholder="继续追问…  (Enter 发送，Shift+Enter 换行)"
+                placeholder="继续追问…  (Enter 发送，Shift+Enter 换行，/ 查看命令)"
                 rows={1}
                 // 移动端 text-base 防 iOS focus 放大；桌面端 text-sm 保密度
                 className="min-h-[44px] max-h-32 flex-1 resize-y rounded-xl border border-black/5 bg-white/55 px-3 py-2.5 text-base text-zinc-800 outline-none transition-all placeholder:text-zinc-400 focus:border-sky-400/50 focus:bg-white/85 focus:ring-2 focus:ring-sky-400/15 sm:min-h-[36px] sm:py-2 sm:text-sm dark:border-white/5 dark:bg-slate-900/40 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-sky-400/40 dark:focus:bg-slate-900/60 dark:focus:ring-sky-400/10"
               />
               <button
                 type="button"
-                onClick={submitFollowup}
+                onClick={() => void submitFollowup()}
                 disabled={!followupText.trim()}
                 aria-label="发送"
                 // 移动端 44x44 触控目标；桌面端 36x36 保紧凑
@@ -236,6 +271,13 @@ export function ResultCard(): JSX.Element {
                   <path d="M2.5 8h11M9 3.5L13.5 8 9 12.5" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </button>
+              {/* 斜杠命令下拉面板：走 portal 模式定位到 followupRow 上方，
+                  绕开 ResultCard 外层 / inner container 的 overflow-hidden 裁切 */}
+              <AnimatePresence>
+                {slash.show && (
+                  <SlashCommandPanel {...slash.panelProps} anchorRef={followupRowRef} />
+                )}
+              </AnimatePresence>
             </div>
           </div>
         </motion.div>

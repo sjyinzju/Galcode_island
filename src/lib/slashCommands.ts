@@ -157,8 +157,7 @@ export const BUILTIN_COMMAND_HANDLERS: Record<
       status: "handled",
       notice:
         "命令：/clear /exit /help ｜ /mode /model /config /agents /status ｜ /login /logout /doctor /upgrade /init /cost ｜ /memory /hooks /mcp ｜ /bug /release-notes /about" +
-        " ｜ 快捷键 Shift+Tab 切 permission mode · Cmd/Ctrl+F 页内搜索 · Cmd/Ctrl+Shift+L 切主题" +
-        " ｜ ⚠ default 模式在本应用 stream-json 链路下会拒绝所有工具调用，请用 acceptEdits 或 bypassPermissions。",
+        " ｜ 快捷键 Shift+Tab 切 permission mode · Cmd/Ctrl+F 页内搜索 · Cmd/Ctrl+Shift+L 切主题",
     };
   },
 
@@ -217,11 +216,23 @@ export const BUILTIN_COMMAND_HANDLERS: Record<
           "用法：/model <id>（直接切换）或 /model 不带参数会打开设置面板。",
       };
     }
-    useSettingsStore.getState().setBackendPref("claude-code", "model", arg);
-    const current = useSettingsStore.getState().backends["claude-code"];
+    // 读 active tab 的 agent，决定写到哪个 backend 偏好里。tab 上若是
+    // gemini/cursor 这类暂未持久化偏好的 backend 则只给提示，不动 storage。
+    const tab = ctx.activeTabId ? useTabsStore.getState().tabs[ctx.activeTabId] : null;
+    const agent = tab?.agent;
+    if (agent !== "claude-code" && agent !== "codex" && agent !== "opencode") {
+      return {
+        status: "handled",
+        notice: agent
+          ? `当前 backend \"${agent}\" 暂不支持通过 /model 切换，请在设置面板修改。`
+          : "当前没有活动 tab，无法确定要切换哪个 backend 的模型。",
+      };
+    }
+    useSettingsStore.getState().setBackendPref(agent, "model", arg);
+    const current = useSettingsStore.getState().backends[agent];
     try {
       await invoke("update_backend_preferences", {
-        backend: "claude-code",
+        backend: agent,
         model: current.model || null,
         effort: current.effort || null,
         proxy: current.proxy || null,
@@ -237,9 +248,11 @@ export const BUILTIN_COMMAND_HANDLERS: Record<
         notice: `已记录但同步给后端失败：${err instanceof Error ? err.message : String(err)}`,
       };
     }
+    const agentDisplay =
+      agent === "claude-code" ? "Claude Code" : agent === "codex" ? "Codex" : "OpenCode";
     return {
       status: "handled",
-      notice: `已切到模型 \"${arg}\"（下次启动 Claude Code 生效）。`,
+      notice: `已切到模型 \"${arg}\"（下次启动 ${agentDisplay} 生效）。`,
     };
   },
 
@@ -335,7 +348,7 @@ export const BUILTIN_COMMANDS: readonly SlashCommandRecord[] = [
   {
     name: "model",
     source: "builtin",
-    description: "切换 Claude Code 默认模型（无参数打开设置）",
+    description: "切换当前 agent 的默认模型（无参数打开设置）",
     argumentHint: "<model-id>",
     handler: "local",
   },

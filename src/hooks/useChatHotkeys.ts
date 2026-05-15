@@ -13,14 +13,14 @@ import { useEffect } from "react";
 import { useTabsStore } from "../stores/useTabsStore";
 import type { PermissionMode } from "../types/agent";
 
-// Shift+Tab 循环顺序：参考 Claude Code 桌面版（default → auto → acceptEdits →
-// plan → bypassPermissions → default）。bypassPermissions 也包含在内，因为
-// 用户可以通过 /mode 显式禁用；快捷键循环不能跳过否则切回原 mode 时不连贯。
+// Shift+Tab 循环顺序：对齐 Claude Code CLI 文档（default → acceptEdits → plan →
+// auto → bypassPermissions）。auto 是 v2.1.83+ 的独立 mode，按"递增放权"
+// 放在 plan 之后；全部模式都进循环，让 Shift+Tab 不会跳档。
 const PERMISSION_MODE_CYCLE: readonly PermissionMode[] = [
   "default",
-  "auto",
   "acceptEdits",
   "plan",
+  "auto",
   "bypassPermissions",
 ];
 

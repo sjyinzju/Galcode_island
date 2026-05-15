@@ -1107,6 +1107,9 @@ pub async fn stop_session(
                 .flatten();
             if let Some(client) = client {
                 kill_claude_client(&client);
+                // 删掉本 session 的 per-run MCP config 文件（best-effort）。
+                // pending permission 请求由 kill_claude_stream_client 内部 deny。
+                crate::permission_mcp::cleanup_session_mcp_config(&app, &run_id);
                 eprintln!("[stop] claude killed for run_id={run_id}");
             }
         }
@@ -1220,6 +1223,9 @@ pub fn shutdown_runtime_clients(app: &AppHandle) {
     }
 
     for client in drain_claude_clients(runtime_state) {
+        // 清理 per-run MCP config 文件；pending permission 请求由
+        // kill_claude_stream_client 内部 deny（不需要 app）。
+        crate::permission_mcp::cleanup_session_mcp_config(app, &client.run_id);
         kill_claude_client(&client);
     }
 
