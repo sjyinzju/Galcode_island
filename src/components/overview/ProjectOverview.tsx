@@ -35,19 +35,10 @@ const AGENT_OPTIONS: ReadonlyArray<{ value: BackendKey; label: string }> = [
   { value: "opencode", label: "OpenCode" },
 ];
 
-// effort 档位的中文标签，只是给下拉显示更友好；
-// 字典里没有的（比如 xhigh）就直接显示原 id，再加个"·Effort"前缀。
-const EFFORT_LABELS: Record<string, string> = {
-  low: "低",
-  medium: "中",
-  high: "高",
-  xhigh: "极高",
-  max: "极限",
-};
-
+// effort 档位标签：直接显示英文原值。规范的 reasoning effort 等级值本身就是英文
+// 短词（low / medium / high / xhigh / max），翻成中文反而需要额外脑内对照。
 function formatEffortLabel(value: string): string {
-  const human = EFFORT_LABELS[value] ?? value;
-  return `Effort · ${human}`;
+  return `Effort · ${value}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +236,7 @@ export function ProjectOverview(): JSX.Element {
     }
     if (efforts.length === 0 && !catalog.loading) return null;
     return [
-      { value: "", label: catalog.loading ? "默认努力（加载中…）" : "默认努力" },
+      { value: "", label: catalog.loading ? "Default effort (loading…)" : "Default effort" },
       ...efforts.map((e) => ({ value: e, label: formatEffortLabel(e) })),
     ];
   }, [supportedBackend, catalog.data, catalog.loading, currentModelEntry, backendPrefs?.effort]);
@@ -263,6 +254,7 @@ export function ProjectOverview(): JSX.Element {
       provider: current.provider || null,
       apiKey: current.apiKey || null,
       authMode: current.authMode || null,
+      defaultPermissionMode: current.defaultPermissionMode || null,
     }).catch(console.error);
   }, []);
 
@@ -416,7 +408,7 @@ export function ProjectOverview(): JSX.Element {
               onChange={handleEffortChange}
               options={effortOptions}
               disabled={catalog.loading}
-              title="思考努力程度（reasoning effort）"
+              title="Reasoning effort level"
             />
           )}
         </div>

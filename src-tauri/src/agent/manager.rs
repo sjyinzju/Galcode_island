@@ -174,6 +174,9 @@ pub fn launch_claude_agent(
     // 前端持久化的 tab.sessionId hint：用作 resume 候选。重启 app 后内存
     // last_session_per_context 空了，前端持久化的 sessionId 能续上下文。
     resume_hint: Option<String>,
+    // Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
+    // None 时由 claude.rs 内部 fallback 到 acceptEdits（保留老行为）。
+    permission_mode: Option<String>,
 ) -> Result<LaunchResult, String> {
     let trimmed = task_zh.trim().to_string();
     if trimmed.is_empty() {
@@ -217,6 +220,7 @@ pub fn launch_claude_agent(
     let sid = session_id.clone();
     let user_zh = trimmed.clone();
     let cwd_owned = cwd.clone();
+    let permission_mode_owned = permission_mode.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -254,6 +258,7 @@ pub fn launch_claude_agent(
             prefs.effort.as_deref(),
             prefs.binary.as_deref(),
             prefs.proxy.as_deref(),
+            permission_mode_owned.as_deref(),
             Some(&stream_id),
         );
 
@@ -1102,6 +1107,9 @@ pub async fn stop_session(
                 .flatten();
             if let Some(client) = client {
                 kill_claude_client(&client);
+                // 删掉本 session 的 per-run MCP config 文件（best-effort）。
+                // pending permission 请求由 kill_claude_stream_client 内部 deny。
+                crate::permission_mcp::cleanup_session_mcp_config(&app, &run_id);
                 eprintln!("[stop] claude killed for run_id={run_id}");
             }
         }
@@ -1215,6 +1223,9 @@ pub fn shutdown_runtime_clients(app: &AppHandle) {
     }
 
     for client in drain_claude_clients(runtime_state) {
+        // 清理 per-run MCP config 文件；pending permission 请求由
+        // kill_claude_stream_client 内部 deny（不需要 app）。
+        crate::permission_mcp::cleanup_session_mcp_config(app, &client.run_id);
         kill_claude_client(&client);
     }
 

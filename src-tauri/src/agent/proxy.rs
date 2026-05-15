@@ -105,6 +105,29 @@ pub fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// 剥掉 Windows 扩展长度路径前缀 (`\\?\`)，返回 cmd.exe 能解析的常规路径。
+///
+/// Tauri 在 Windows 上 `resource_dir()` 返回的路径常常带 `\\?\` 前缀（CreateFile
+/// 长路径绕过 MAX_PATH 限制），但 cmd.exe 的命令行解析器不认这种前缀，把
+/// `"\\?\E:\...\claude.exe"` 当 /K 的可执行参数传过去会报"不是内部或外部命令"。
+///
+/// Rust 自身 `Command::new(path)` 走 CreateProcessW 能吃下这种前缀，所以只在
+/// **通过 cmd.exe 中转**的终端启动路径上需要剥前缀。
+///
+/// 处理两种形态：
+/// - `\\?\C:\foo\bar` → `C:\foo\bar`
+/// - `\\?\UNC\server\share\foo` → `\\server\share\foo`
+#[cfg(target_os = "windows")]
+pub fn simplify_windows_path(value: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(value)
+}
+
 #[cfg(target_os = "windows")]
 pub fn terminal_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
@@ -142,7 +165,13 @@ pub fn shell_command_text(
         }
     }
 
-    parts.push(terminal_quote(&binary.display().to_string()));
+    // cmd.exe 不认 `\\?\` 扩展长度路径前缀，必须剥掉再传过去。
+    // 非 Windows 平台 simplify_windows_path 不存在；不过路径本来也不会带这种前缀。
+    let binary_display = binary.display().to_string();
+    #[cfg(target_os = "windows")]
+    let binary_display = simplify_windows_path(&binary_display).into_owned();
+
+    parts.push(terminal_quote(&binary_display));
     parts.extend(leading_args.iter().map(|value| terminal_quote(value)));
     parts.extend(trailing_args.iter().map(|value| terminal_quote(value)));
     parts.join(" ")
@@ -230,5 +259,61 @@ pub fn open_terminal_command(command_text: &str, success_message: &str) -> Resul
             .spawn()
             .map_err(|error| format!("Failed to open terminal: {error}"))?;
         return Ok(success_message.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn simplify_strips_dos_device_prefix() {
+        assert_eq!(
+            simplify_windows_path(r"\\?\E:\app\claude.exe"),
+            r"E:\app\claude.exe"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn simplify_strips_unc_prefix() {
+        assert_eq!(
+            simplify_windows_path(r"\\?\UNC\server\share\bin\claude.exe"),
+            r"\\server\share\bin\claude.exe"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn simplify_leaves_normal_path() {
+        assert_eq!(
+            simplify_windows_path(r"C:\Program Files\claude\claude.exe"),
+            r"C:\Program Files\claude\claude.exe"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shell_command_text_drops_extended_prefix() {
+        let path = PathBuf::from(r"\\?\E:\app\claude.exe");
+        let text = shell_command_text(
+            &path,
+            &[],
+            &["auth".to_string(), "login".to_string()],
+        );
+        assert!(!text.contains(r"\\?\"), "extended prefix should be stripped: {text}");
+        assert!(text.contains(r"E:\app\claude.exe"));
+        assert!(text.ends_with(r#" "auth" "login""#));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shell_command_text_keeps_call_prefix_for_cmd() {
+        let path = PathBuf::from(r"\\?\C:\bin\claude.cmd");
+        let text = shell_command_text(&path, &[], &[]);
+        assert!(text.starts_with("call "), "got: {text}");
+        assert!(!text.contains(r"\\?\"));
     }
 }

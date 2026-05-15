@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { createSharedStorage, onStorageExternalChange } from "../lib/sharedStorage";
+import type { PermissionMode } from "../types/agent";
 
 export type BackendKey = "claude-code" | "codex" | "opencode";
 
@@ -19,6 +20,9 @@ export interface BackendPrefs {
   apiKey: string;
   /// "" = 未选 / "oauth" = 走 `opencode auth login` / "key" = 自填 API Key。
   authMode: "" | "oauth" | "key";
+  /// 仅 Claude Code 使用：新开 tab 的默认 permission mode；空串/缺省 = "default"。
+  /// 已存在 tab 不会因这里改动而被覆盖（避免吞掉用户当前的临时切换）。
+  defaultPermissionMode: PermissionMode | "";
 }
 
 const emptyBackendPrefs = (): BackendPrefs => ({
@@ -29,6 +33,7 @@ const emptyBackendPrefs = (): BackendPrefs => ({
   provider: "",
   apiKey: "",
   authMode: "",
+  defaultPermissionMode: "",
 });
 
 /// 服务商预设 —— 选定后自动填 base_url 和默认 model id。

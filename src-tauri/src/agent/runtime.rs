@@ -167,6 +167,10 @@ pub struct ClaudeStreamClient {
     pub proxy: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// 启动时的 `--permission-mode` 值。改动该值需要重启子进程
+    /// （Claude CLI 一次 spawn 的 mode 固定），ensure_claude_stream_client
+    /// 用 matches 判断决定是 reuse 还是 kill + respawn。
+    pub permission_mode: String,
     pub resume_session: Option<String>,
     /// 多 tab 路由：spawn 时由 ensure_claude_stream_client 注入。
     /// stdout/stderr 后台线程 emit 流事件时填到 CliStreamEvent.run_id，

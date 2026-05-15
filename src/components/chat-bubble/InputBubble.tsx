@@ -3,11 +3,14 @@ import { motion, AnimatePresence } from "framer-motion";
 import { invoke } from "../../lib/bridge";
 import { useAppStore } from "../../stores/useAppStore";
 import { useProfileStore } from "../../stores/useProfileStore";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useActivityStore } from "../../stores/useActivityStore";
 import { useUiStore } from "../../stores/useUiStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { PetCharacter } from "../pet-character/PetCharacter";
+import { PermissionModeBadge } from "../PermissionModeBadge";
+import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
 
 const GREETINGS = [
   "喂，[称呼]，发什么呆呢？今天的部团活动要开始咯，有什么有趣的企划快交上来看看。",
@@ -23,7 +26,7 @@ export function InputBubble(): JSX.Element {
   const addLogEntry = useAppStore((s) => s.addLogEntry);
 
   const tab = useActiveTab();
-  const { activeTabId, update } = useActiveTabActions();
+  const { activeTabId, update, clearBlocks } = useActiveTabActions();
 
   const projectPath = tab.projectPath;
   const agentStatus = tab.agentStatus;
@@ -35,8 +38,26 @@ export function InputBubble(): JSX.Element {
   // + composition* 事件标记
   const isComposingRef = useRef(false);
 
-  // textarea ref：让外部（user-prompt block 的"编辑重发"按钮）可以 focus 进来
+  // textarea ref：让外部（user-prompt block 的"编辑重发"按钮）可以 focus 进来；
+  // 同时给 slash 面板 hook 在 Tab/Enter 补全后调 setSelectionRange 移光标
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // ---------- 斜杠命令面板（共用 hook，详见 SlashCommandPanel.tsx）----------
+  const slash = useSlashCommandPanel({
+    value: task,
+    setValue: (next) => update({ task: next }),
+    textareaRef,
+    isComposingRef,
+    projectPath,
+    activeTabId,
+    actions: {
+      clearActiveTabBlocks: () => clearBlocks(),
+      openSettings: () => useSettingsStore.getState().openSettingsModal(),
+      setPermissionMode: (value) => update({ permissionMode: value }),
+      addLog: (level, message) =>
+        addLogEntry({ timestamp: Date.now(), level, message }),
+    },
+  });
   const inputFocusRequest = useUiStore((s) => s.inputFocusRequest);
   // counter 一变就 focus + 把光标移到末尾，方便用户立刻继续敲
   useEffect(() => {
@@ -76,7 +97,12 @@ export function InputBubble(): JSX.Element {
   }, [greeting, agentStatus]);
 
   const handleLaunch = async (): Promise<void> => {
-    if (!task.trim() || !activeTabId || !projectPath) return;
+    if (!task.trim() || !activeTabId) return;
+    // 斜杠命令优先：能本地处理就不走 start_agent。
+    // tryRunBuiltin 内部已 clear value 并返回 true；passthrough / 项目命令 /
+    // 未知命令返回 false，落到下面的 start_agent 透传路径。
+    if (await slash.tryRunBuiltin()) return;
+    if (!projectPath) return;
     try {
       // 上一轮 backend native session id（Claude CLI session / Codex thread /
       // OpenCode session）作为 resume 候选 —— 重启 app 后内存 last_session_per_context
@@ -111,6 +137,8 @@ export function InputBubble(): JSX.Element {
         agent: tab.agent,
         runId: activeTabId,
         sessionId: resumeHint,
+        // 仅 claude-code 后端读取；codex/opencode 在 Rust 侧忽略
+        permissionMode: tab.agent === "claude-code" ? tab.permissionMode : null,
       });
       if (res?.sessionId) {
         update({ sessionId: res.sessionId });
@@ -173,22 +201,29 @@ export function InputBubble(): JSX.Element {
             </div>
 
             {/* 桌面端 greeting 单独行（移动端已嵌入头部） */}
-            <div className="hidden shrink-0 min-h-[3rem] text-[15px] font-medium leading-relaxed tracking-wide text-zinc-600 sm:block dark:text-zinc-300">
-              {displayedGreeting}
-              {displayedGreeting.length < greeting.length && (
-                <motion.span
-                  animate={{ opacity: [1, 0] }}
-                  transition={{ repeat: Infinity, duration: 0.8 }}
-                  className="ml-1 inline-block h-[15px] w-2 bg-sky-400/70 align-middle"
-                />
-              )}
+            <div className="hidden shrink-0 min-h-[3rem] items-start justify-between gap-3 sm:flex">
+              <div className="flex-1 text-[15px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
+                {displayedGreeting}
+                {displayedGreeting.length < greeting.length && (
+                  <motion.span
+                    animate={{ opacity: [1, 0] }}
+                    transition={{ repeat: Infinity, duration: 0.8 }}
+                    className="ml-1 inline-block h-[15px] w-2 bg-sky-400/70 align-middle"
+                  />
+                )}
+              </div>
+              {/* Permission mode 徽章：桌面端紧贴 greeting 右侧；Shift+Tab 切换 */}
+              <div className="shrink-0">
+                <PermissionModeBadge />
+              </div>
             </div>
 
+            <div className="relative">
             <textarea
               ref={textareaRef}
               value={task}
               onChange={(e) => update({ task: e.target.value })}
-              placeholder="和团长对话……  (Enter 发送，Shift+Enter 换行)"
+              placeholder="和团长对话……  (Enter 发送，Shift+Enter 换行，/ 查看命令)"
               // 移动端 min-h 100px 给足输入区；桌面端 min-h-[100px]
               className="min-h-[100px] max-h-[40vh] w-full resize-none rounded-xl border border-black/5 bg-white/50 p-3 text-base text-zinc-800 outline-none transition-all placeholder:text-zinc-400 focus:border-sky-400/50 focus:bg-white/80 focus:ring-2 focus:ring-sky-400/15 sm:max-h-none sm:p-3.5 sm:text-sm dark:border-white/5 dark:bg-slate-900/40 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-sky-400/40 dark:focus:bg-slate-900/60 dark:focus:ring-sky-400/10"
               onCompositionStart={() => {
@@ -198,6 +233,9 @@ export function InputBubble(): JSX.Element {
                 isComposingRef.current = false;
               }}
               onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
+                // 斜杠面板可见时优先处理（方向键 / Tab 补全 / Esc 清空）；
+                // Enter+exactMatch 时 hook 返回 false，让下面的 launch 接管。
+                if (slash.handleKeyDown(e)) return;
                 if (e.key !== "Enter") return;
                 if (e.shiftKey) return;
                 // IME 候选词期间按 Enter 是选词，跳过发送
@@ -209,6 +247,11 @@ export function InputBubble(): JSX.Element {
                 void handleLaunch();
               }}
             />
+            {/* 斜杠命令下拉面板 */}
+            <AnimatePresence>
+              {slash.show && <SlashCommandPanel {...slash.panelProps} />}
+            </AnimatePresence>
+            </div>
 
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 sm:gap-3">
               {!projectPath && (

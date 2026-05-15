@@ -28,7 +28,10 @@ export type CliBlockType =
   | "stderr"
   /// 用户原始 prompt：前端启动 turn 时自己 append 进去（不来自 backend），
   /// 流式区右对齐渲染成蓝色气泡。多轮会话能看清"用户 / agent"交替顺序。
-  | "user-prompt";
+  | "user-prompt"
+  /// permission-prompt-tool 桥过来的工具审批请求；PermissionCard 渲染 Allow/Deny。
+  /// 用户决策完成后 status 改 "approved"/"denied"，按钮收起。
+  | "permission-request";
 
 export interface CliTodoItem {
   id: string;
@@ -74,4 +77,19 @@ export interface CliBlock {
 
   // 当用户切换会话时丢弃旧 block 用
   streamId?: string;
+
+  // permission-request 专属
+  /// MCP 桥发来的 request_id；用户决策时回传给后端解阻塞
+  permissionRequestId?: string;
+  /// Claude 提议要调的工具名
+  permissionToolName?: string;
+  /// Claude 提议的工具入参（JSON 原文）
+  permissionInput?: unknown;
+  /// 关联到的 tool_use_id（同 turn 多个 tool 用不同 id）
+  permissionToolUseId?: string;
+  /// 用户决策结果："approved" | "denied" | undefined（未决）
+  permissionDecision?: string;
+
+  /// 块开始时间（ms epoch）。Task / 长跑工具用来算"已运行 X 秒"。
+  startedAt?: number;
 }
