@@ -238,13 +238,17 @@ jobs:
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          # Extract release notes from tag annotation (fallback to notes/<tag>.md)
+          # Release notes 优先级：notes/<tag>.md > tag annotation > 兜底标题
+          #
+          # 为什么文件优先：release.mjs 已经把当版日志原样归档到 notes/<tag>.md，
+          # 它是源真值；tag annotation 经过 git cleanup 处理，历史上出现过
+          # Markdown 小标题（以 # 开头）被当成注释剥掉的事故。文件兜底能让
+          # workflow_dispatch 重跑老 tag 时也拿到完整的日志。
           NOTES_FILE=release-notes.md
-          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null 2>&1; then
-            git tag -l --format='%(contents)' "$TAG" > "$NOTES_FILE"
-          fi
-          if [ ! -s "$NOTES_FILE" ] && [ -f "notes/$TAG.md" ]; then
+          if [ -f "notes/$TAG.md" ]; then
             cp "notes/$TAG.md" "$NOTES_FILE"
+          elif git rev-parse -q --verify "refs/tags/$TAG" > /dev/null 2>&1; then
+            git tag -l --format='%(contents)' "$TAG" > "$NOTES_FILE"
           fi
           if [ ! -s "$NOTES_FILE" ]; then
             echo "Galcode Island $TAG" > "$NOTES_FILE"

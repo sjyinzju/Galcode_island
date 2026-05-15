@@ -218,9 +218,12 @@ run(`git commit -m "${tagName}"`);
 
 info(`打注解 tag ${tagName}（注解内容 = 更新日志）`);
 if (!dryRun) {
+  // --cleanup=verbatim：原样保留更新日志内容。
+  // 默认的 strip 模式会把 `#`/`##` 开头的 Markdown 标题当作注释行剥掉，
+  // 导致 CI 从 tag annotation 取到的 release notes 里小标题全部消失。
   const result = spawnSync(
     "git",
-    ["tag", "-a", tagName, "-F", archivedNotesPath],
+    ["tag", "-a", tagName, "-F", archivedNotesPath, "--cleanup=verbatim"],
     { cwd: rootDir, stdio: "inherit" },
   );
   if (result.status !== 0) fail("git tag 失败");
