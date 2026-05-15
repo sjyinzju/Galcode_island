@@ -14,11 +14,14 @@
 // 桌面边距自然对齐；不用 fixed 避免被祖先 transform 影响 containing block。
 // 玻璃容器内的 motion.div 同时 pt-7 把内容下移 28px 让位。
 //
-// 拖窗双机制：data-tauri-drag-region（Tauri 原生处理，mac/Windows 稳定）+
-// onMouseDown startDragging()（Linux WebKitGTK 上 drag-region 经常失效需要 JS
-// 兜底）。两者并存时不冲突（startDragging 已在拖即忽略二次调用）。
+// 拖窗：仅挂 data-tauri-drag-region，Tauri 自己处理 mousedown→startDragging
+// 与双击→toggleMaximize 两件事。**不要叠加 onMouseDown startDragging()**：
+// 那会让双击 #2 的 mousedown 又启动一次 drag，把 drag-region 刚触发的最大化
+// 立刻通过 drag mode 还原回去 — 视觉上就是"跳一下缩回去"的那个 bug。
+// Linux WebKitGTK 上 drag-region 历史上不稳定，如果将来有用户报告再用平台
+// 探测条件挂 onMouseDown 兜底，先优先保证 mac/Windows 双击正常。
 
-import { useEffect, useState, type MouseEvent } from "react";
+import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isTauri } from "../lib/bridge";
 
@@ -67,15 +70,6 @@ export function WindowsTopBar(): JSX.Element | null {
     };
   }, [appWindow]);
 
-  const handleDragMouseDown = async (e: MouseEvent<HTMLDivElement>): Promise<void> => {
-    if (e.button !== 0) return;
-    try {
-      await appWindow.startDragging();
-    } catch {
-      /* 已经在拖 / 窗口已销毁 — 静默 */
-    }
-  };
-
   const handleMin = async (): Promise<void> => {
     try { await appWindow.minimize(); } catch { /* noop */ }
   };
@@ -95,12 +89,8 @@ export function WindowsTopBar(): JSX.Element | null {
       // z-[60]：高于 MobileTopBar (z-40)、低于 SettingsModal 等弹层 (z-200+)。
       className="absolute top-0 left-0 right-0 z-[60] flex h-7 items-stretch"
     >
-      {/* 拖窗区：占满左侧到按钮之前的所有空间 */}
-      <div
-        data-tauri-drag-region
-        onMouseDown={(e) => { void handleDragMouseDown(e); }}
-        className="h-full flex-1"
-      />
+      {/* 拖窗区：data-tauri-drag-region 自己处理拖窗 + 双击最大化，不挂 JS handler */}
+      <div data-tauri-drag-region className="h-full flex-1" />
 
       <button
         type="button"
