@@ -10,6 +10,7 @@
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useTabsStore } from "../stores/useTabsStore";
 import { useUiStore } from "../stores/useUiStore";
+import { PermissionModeBadge } from "./PermissionModeBadge";
 
 export function MobileTopBar(): JSX.Element {
   const toggleDrawer = useUiStore((s) => s.toggleMobileLeftDrawer);
@@ -61,6 +62,8 @@ export function MobileTopBar(): JSX.Element {
           {subtitle}
         </div>
       </div>
+
+      <PermissionModeBadge compact />
 
       <button
         type="button"

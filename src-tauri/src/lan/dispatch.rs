@@ -41,6 +41,7 @@ struct StartAgentArgs {
     agent: Option<String>,
     run_id: Option<String>,
     session_id: Option<String>,
+    permission_mode: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -103,6 +104,7 @@ struct UpdateBackendPreferencesArgs {
     provider: Option<String>,
     api_key: Option<String>,
     auth_mode: Option<String>,
+    default_permission_mode: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -135,6 +137,15 @@ struct ClaudeLoginOpenArgs {
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+struct ClaudeRunInTerminalArgs {
+    args: Vec<String>,
+    binary: Option<String>,
+    proxy: Option<String>,
+    success_message: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct ClaudeSendPromptArgs {
     run_id: Option<String>,
     text: String,
@@ -144,6 +155,7 @@ struct ClaudeSendPromptArgs {
     effort: Option<String>,
     binary: Option<String>,
     proxy: Option<String>,
+    permission_mode: Option<String>,
     stream_id: Option<String>,
 }
 
@@ -273,6 +285,15 @@ struct PermissionResponseArgs {
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+struct PermissionDecisionArgs {
+    request_id: String,
+    decision: String,
+    message: Option<String>,
+    updated_input: Option<Value>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct StorageGetArgs {
     key: String,
 }
@@ -324,6 +345,7 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                     p.agent,
                     p.run_id,
                     p.session_id,
+                    p.permission_mode,
                 )
                 .await?,
             )
@@ -341,6 +363,15 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                 p.session_id,
                 p.tool_use_id,
                 p.decision,
+            )?)
+        }
+        "respond_permission_decision" => {
+            let p: PermissionDecisionArgs = parse(args)?;
+            to_value(commands::respond_permission_decision(
+                p.request_id,
+                p.decision,
+                p.message,
+                p.updated_input,
             )?)
         }
         "get_session_logs" => {
@@ -385,8 +416,16 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
         "update_backend_preferences" => {
             let p: UpdateBackendPreferencesArgs = parse(args)?;
             commands::update_backend_preferences(
-                runtime_state, p.backend, p.model, p.effort, p.proxy, p.binary, p.provider,
-                p.api_key, p.auth_mode,
+                runtime_state,
+                p.backend,
+                p.model,
+                p.effort,
+                p.proxy,
+                p.binary,
+                p.provider,
+                p.api_key,
+                p.auth_mode,
+                p.default_permission_mode,
             )?;
             Ok(Value::Null)
         }
@@ -415,6 +454,19 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
             let p: ClaudeLoginOpenArgs = parse(args)?;
             to_value(commands::claude_login_open(app.clone(), p.binary, p.proxy).await?)
         }
+        "claude_run_in_terminal" => {
+            let p: ClaudeRunInTerminalArgs = parse(args)?;
+            to_value(
+                commands::claude_run_in_terminal(
+                    app.clone(),
+                    p.args,
+                    p.binary,
+                    p.proxy,
+                    p.success_message,
+                )
+                .await?,
+            )
+        }
         "claude_send_prompt" => {
             let p: ClaudeSendPromptArgs = parse(args)?;
             to_value(
@@ -429,6 +481,7 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                     p.effort,
                     p.binary,
                     p.proxy,
+                    p.permission_mode,
                     p.stream_id,
                 )
                 .await?,

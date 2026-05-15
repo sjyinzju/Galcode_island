@@ -7,6 +7,7 @@ import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { motion, AnimatePresence } from "framer-motion";
 import { PetCharacter } from "../pet-character/PetCharacter";
 import { ErrorDiagnosisCard } from "../status-monitor/ErrorDiagnosisCard";
+import { PermissionModeBadge } from "../PermissionModeBadge";
 
 export function ResultCard(): JSX.Element {
   const tab = useActiveTab();
@@ -136,12 +137,17 @@ export function ResultCard(): JSX.Element {
               max-h cap + 滚动） / 底。不用 flex-1，避免在无具体父高度时 flex-1=0
               导致 summary 区高度坍塌的 CSS 循环依赖问题。 */}
           <div className="relative flex w-full flex-col gap-3 overflow-hidden rounded-2xl border border-white/60 bg-white/70 p-3.5 backdrop-blur-2xl sm:p-4 dark:border-white/10 dark:bg-slate-800/60">
-            {/* ===== 顶部：状态徽章 ===== */}
+            {/* ===== 顶部：状态徽章 + 权限模式 ===== */}
             <div className="flex shrink-0 items-center gap-2">
               <div className={`h-2.5 w-2.5 rounded-full ${isError ? "bg-rose-400 shadow-[0_0_6px_rgba(251,113,133,0.5)]" : "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]"} animate-pulse`} />
               <span className={`text-[13px] font-extrabold uppercase tracking-widest sm:text-sm ${headerColor}`}>
                 {mode || "COMPLETE"}
               </span>
+              {/* 桌面端：让用户在 result 阶段也能改 mode；下一轮就生效。
+                  移动端 MobileTopBar 已有，不重复。 */}
+              <div className="ml-auto hidden sm:block">
+                <PermissionModeBadge compact />
+              </div>
             </div>
 
             {/* 移动端嵌入式头部：左 桌宠 compact + 右 emotion 气泡 */}

@@ -174,6 +174,9 @@ pub fn launch_claude_agent(
     // 前端持久化的 tab.sessionId hint：用作 resume 候选。重启 app 后内存
     // last_session_per_context 空了，前端持久化的 sessionId 能续上下文。
     resume_hint: Option<String>,
+    // Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
+    // None 时由 claude.rs 内部 fallback 到 acceptEdits（保留老行为）。
+    permission_mode: Option<String>,
 ) -> Result<LaunchResult, String> {
     let trimmed = task_zh.trim().to_string();
     if trimmed.is_empty() {
@@ -217,6 +220,7 @@ pub fn launch_claude_agent(
     let sid = session_id.clone();
     let user_zh = trimmed.clone();
     let cwd_owned = cwd.clone();
+    let permission_mode_owned = permission_mode.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -254,6 +258,7 @@ pub fn launch_claude_agent(
             prefs.effort.as_deref(),
             prefs.binary.as_deref(),
             prefs.proxy.as_deref(),
+            permission_mode_owned.as_deref(),
             Some(&stream_id),
         );
 

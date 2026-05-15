@@ -14,13 +14,40 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { createSharedStorage, onStorageExternalChange } from "../lib/sharedStorage";
+import { useSettingsStore } from "./useSettingsStore";
 import type {
   AgentStatus,
   AgentType,
   LastStage,
+  PermissionMode,
   UiState,
 } from "../types/agent";
 import type { CliBlock } from "../types/blocks";
+
+const PERMISSION_MODE_VALUES: readonly PermissionMode[] = [
+  "default",
+  "auto",
+  "acceptEdits",
+  "plan",
+  "bypassPermissions",
+];
+
+function sanitizePermissionMode(value: unknown): PermissionMode {
+  return typeof value === "string" &&
+    (PERMISSION_MODE_VALUES as readonly string[]).includes(value)
+    ? (value as PermissionMode)
+    : "acceptEdits";
+}
+
+/// 从 useSettingsStore 读 Claude Code 的全局默认 permission mode。
+/// settings store 不反向 import tabs store，所以这里 top-level import 不会形成循环。
+function resolveDefaultPermissionModeFromSettings(): PermissionMode | undefined {
+  const value = useSettingsStore.getState().backends["claude-code"]?.defaultPermissionMode;
+  if (typeof value === "string" && value.length > 0) {
+    return sanitizePermissionMode(value);
+  }
+  return undefined;
+}
 
 const MAX_BLOCKS = 200;
 const TRIM_TARGET = 180;
@@ -82,6 +109,14 @@ export interface TabState {
   /// 最近一次启动用的中文 prompt（截断），左栏项目卡作为摘要标题展示。
   /// 没启动过的 tab 为 null —— 显示 fallback "新会话"或 projectPath basename。
   lastUserPrompt: string | null;
+  /// Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
+  /// start_agent 时作为 `--permission-mode` 传给 Claude CLI；Shift+Tab 在 tab 内循环切换。
+  /// 顶部模式徽章读这个字段。仅对 claude-code backend 生效，其它 backend 忽略。
+  permissionMode: PermissionMode;
+  /// 用户在 PermissionCard 上点过"Always allow this tool"的工具名列表。
+  /// 下次 Claude 通过 permission-prompt-tool 桥过来同名工具时，前端直接 auto-allow，
+  /// 不再弹卡片。生命周期跟 tab 走（持久化），关 tab 后清掉。
+  autoApprovedTools: string[];
 }
 
 /// 已关闭项目的归档摘要 —— 关闭 tab 时把核心元数据塞进 history 里，
@@ -141,6 +176,11 @@ export interface TabsStoreState {
   /// 用于"清屏"或开始新一轮 turn 前的清理。
   resetTabSession: (id: string) => void;
 
+  /// 把某个工具名加入 tab 的 auto-approve 白名单（用户点过"Always allow this tool"）。
+  /// 重复加幂等。下次 Claude 通过 permission-prompt-tool 桥过来同名工具时，
+  /// usePermissionRequests 直接 invoke allow，不再弹卡。
+  addAutoApprovedTool: (id: string, toolName: string) => void;
+
   // CliBlock 操作 —— 跟旧 useAppStore 的语义一致，但每次都按 tab 路由
   appendCliBlock: (id: string, block: CliBlock) => void;
   upsertCliBlock: (id: string, block: CliBlock) => void;
@@ -199,6 +239,10 @@ function makeDefaultTab(init?: Partial<TabState>): TabState {
     createdAt: 0,
     lastActiveAt: init?.lastActiveAt ?? 0,
     lastUserPrompt: init?.lastUserPrompt ?? null,
+    permissionMode: sanitizePermissionMode(init?.permissionMode),
+    autoApprovedTools: Array.isArray(init?.autoApprovedTools)
+      ? init.autoApprovedTools.slice()
+      : [],
   };
 }
 
@@ -275,8 +319,17 @@ export const useTabsStore = create<TabsStoreState>()(
     }
     const id = requestedId ?? generateTabId();
     const now = Date.now();
+    // 新 tab 的 permissionMode：调用方显式传 > 全局 Settings 默认 > "default"
+    // 用动态 import 避免顶部循环依赖；Settings store 已经在 App.tsx 初始化时
+    // 早于任何 createTab 调用，因此 getState() 不会拿到空值。
+    const settingsDefault =
+      init?.permissionMode ??
+      (resolveDefaultPermissionModeFromSettings() as PermissionMode | undefined);
     const tab: TabState = {
-      ...makeDefaultTab(init),
+      ...makeDefaultTab({
+        ...init,
+        permissionMode: settingsDefault,
+      }),
       id,
       createdAt: now,
       lastActiveAt: init?.lastActiveAt ?? now,
@@ -365,6 +418,21 @@ export const useTabsStore = create<TabsStoreState>()(
       const tab = state.tabs[id];
       if (!tab) return state;
       return { tabs: { ...state.tabs, [id]: { ...tab, ...patch } } };
+    });
+  },
+
+  addAutoApprovedTool: (id, toolName) => {
+    set((state) => {
+      const tab = state.tabs[id];
+      if (!tab) return state;
+      const existing = Array.isArray(tab.autoApprovedTools) ? tab.autoApprovedTools : [];
+      if (existing.includes(toolName)) return state;
+      return {
+        tabs: {
+          ...state.tabs,
+          [id]: { ...tab, autoApprovedTools: [...existing, toolName] },
+        },
+      };
     });
   },
 
@@ -530,7 +598,26 @@ export const useTabsStore = create<TabsStoreState>()(
     }),
     {
       name: "galcode_tabs",
-      version: 1,
+      version: 2,
+      // v1 → v2 迁移：把 permissionMode === "default" 改成 "acceptEdits"。
+      //
+      // 原因：Claude CLI 的 stream-json 非交互模式下，default mode 把所有工具
+      // 调用直接 deny（"no human to ask"）。Galcode Island 暂未实现内联审批 UI，
+      // 所以 default mode 实际不可用。在 v2 一次性升级老数据避免用户继续踩坑；
+      // 之后用户仍可手动通过 Shift+Tab 切回 default。
+      migrate: (persistedState: unknown, version: number) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const state = (persistedState ?? {}) as any;
+        if (version < 2 && state && typeof state === "object" && state.tabs) {
+          for (const id of Object.keys(state.tabs)) {
+            const tab = state.tabs[id];
+            if (tab && tab.permissionMode === "default") {
+              tab.permissionMode = "acceptEdits";
+            }
+          }
+        }
+        return state as TabsStoreState;
+      },
       // 共享 storage：桌面端写 localStorage + 同步推 Rust 镜像；移动端纯走 IPC
       // 拿镜像。后端镜像没有配额限制；只有桌面端 localStorage 可能撞 quota，
       // 这种情况下 onLocalQuotaError 砍 cliBlocks 后自己重试 localStorage（IPC 已写）。

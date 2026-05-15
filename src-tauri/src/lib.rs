@@ -13,21 +13,23 @@ mod agent;
 mod ipc;
 mod lan;
 mod llm;
+mod permission_mcp;
 mod session;
 mod window_utils;
 
 use tauri::Manager;
 
 use ipc::commands::{
-    claude_login_open, claude_models, claude_send_prompt, claude_status, claude_verify,
-    codex_login_open, codex_models, codex_send_prompt, codex_status, codex_verify, finalize_pending,
-    get_session_logs, lan_clear_password, lan_get_state, lan_get_storage, lan_list_storage,
-    lan_remove_storage, lan_revoke_all_devices, lan_set_enabled, lan_set_password, lan_set_port,
-    lan_set_storage, lan_sync_projects, list_directory, list_llm_models, list_sessions,
-    opencode_create_session, opencode_list_providers, opencode_login_open, opencode_send_prompt,
-    opencode_set_auth, opencode_start, opencode_status, opencode_stop, respond_permission,
-    select_project_folder, set_click_through, start_agent, stop_agent, translate_only,
-    update_backend_preferences, update_llm_settings,
+    claude_login_open, claude_models, claude_run_in_terminal, claude_send_prompt, claude_status,
+    claude_verify, codex_login_open, codex_models, codex_send_prompt, codex_status, codex_verify,
+    finalize_pending, get_session_logs, lan_clear_password, lan_get_state, lan_get_storage,
+    lan_list_storage, lan_remove_storage, lan_revoke_all_devices, lan_set_enabled,
+    lan_set_password, lan_set_port, lan_set_storage, lan_sync_projects, list_directory,
+    list_llm_models, list_project_slash_commands, list_sessions, opencode_create_session,
+    opencode_list_providers, opencode_login_open, opencode_send_prompt, opencode_set_auth,
+    opencode_start, opencode_status, opencode_stop, respond_permission,
+    respond_permission_decision, select_project_folder, set_click_through, start_agent,
+    stop_agent, translate_only, update_backend_preferences, update_llm_settings,
 };
 use ipc::git::{
     git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
@@ -82,6 +84,13 @@ pub fn run() {
             // 启动时清理上一轮崩溃 / 强退留下的 opencode/codex/claude 孤儿子进程，
             // 避免端口被占用或重复消耗 token。
             agent::sysutils::cleanup_stale_runtime_orphans(&handle);
+
+            // 启动本地 HTTP MCP 服务用于桥接 Claude Code 的 permission-prompt-tool。
+            // 失败不阻塞主流程：MCP 起不来时 Claude CLI 启动会自动跳过桥接、退化到
+            // 纯 --permission-mode 行为（与本特性出现前一致）。
+            if let Err(e) = permission_mcp::spawn(handle.clone()) {
+                log::warn!("[permission-mcp] 启动失败: {e}");
+            }
 
             // 把 Tauri emit 的核心事件 forward 到 LAN 事件总线（浏览器端 listen 用）
             lan::event_bus::register_forwarders(&handle);
@@ -195,9 +204,11 @@ pub fn run() {
             // 通用
             select_project_folder,
             list_directory,
+            list_project_slash_commands,
             start_agent,
             stop_agent,
             respond_permission,
+            respond_permission_decision,
             get_session_logs,
             list_sessions,
             finalize_pending,
@@ -211,6 +222,7 @@ pub fn run() {
             claude_models,
             claude_verify,
             claude_login_open,
+            claude_run_in_terminal,
             claude_send_prompt,
             // Codex
             codex_status,

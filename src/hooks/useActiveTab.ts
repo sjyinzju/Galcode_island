@@ -37,6 +37,8 @@ const EMPTY_TAB: TabState = Object.freeze({
   createdAt: 0,
   lastActiveAt: 0,
   lastUserPrompt: null,
+  permissionMode: "acceptEdits",
+  autoApprovedTools: [],
 }) as TabState;
 
 export function useActiveTabId(): string | null {

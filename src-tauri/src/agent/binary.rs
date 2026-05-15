@@ -503,9 +503,50 @@ fn lookup_in_user_shell_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// bundled 不存在时的兜底 path：先查 user shell 的真实 PATH，最后才退回到裸名字
-/// （让 std::process::Command 自己走系统 PATH 兜兜兜底）。
+/// Windows 上扫描父进程 PATH 寻找 CLI。
+///
+/// Rust 的 `Command::new(name)` 走 `CreateProcessW`，**只追加 `.exe` 后缀**，
+/// 找不到 npm-global 装的 `claude.cmd`/`bun.cmd` 这种 shim。CMD 提示符里
+/// `claude` 能跑通是因为 cmd.exe 自己处理 PATHEXT；CreateProcessW 不会。
+///
+/// 这里手动按 `.exe → .cmd → .bat → .ps1` 顺序探查，找到第一个存在的就返回。
+/// 没有任何扩展名也接受（用户可能放了 UNIX 风格的可执行）。
+#[cfg(windows)]
+fn lookup_in_process_path(name: &str) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    let extensions: &[&str] = &["exe", "cmd", "bat", "ps1"];
+    for dir in std::env::split_paths(&path_env) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        // 先尝试裸名字（用户给的 name 可能已经带扩展名）
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare);
+        }
+        // 再按 PATHEXT 顺序补扩展名
+        for ext in extensions {
+            let candidate = dir.join(format!("{name}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// bundled 不存在时的兜底 path。
+///
+/// - macOS：先查 login-shell PATH（GUI 启动 launchd 给的 PATH 太窄）
+/// - Windows：先扫父进程 PATH 找 `.exe/.cmd/.bat/.ps1` shim
+/// - Linux：继承的 PATH 已经够用，直接退到裸名字让 Command::new 走 PATH 查找
 fn fallback_binary_path(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(found) = lookup_in_process_path(name) {
+            return found;
+        }
+    }
     lookup_in_user_shell_path(name).unwrap_or_else(|| PathBuf::from(name))
 }
 
