@@ -10,6 +10,7 @@
 // 下半部分：InputBubble / RunningBubble / ResultCard 跟过去一致。
 
 import { AnimatePresence, motion } from "framer-motion";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useActiveTab, useActiveTabId } from "../hooks/useActiveTab";
 import { PetCharacter } from "./pet-character/PetCharacter";
 
@@ -49,11 +50,14 @@ export function MainView(): JSX.Element {
       // 由 MobileTopBar sticky 占位，MainView 直接从 pt-2 起步即可。
       // pb 移动端额外加 env(safe-area-inset-bottom) 给 iPhone home indicator 让位
       // —— 否则卡片底部输入框会被刘海/底栏遮挡。
-      className="flex h-full w-full flex-col gap-2 px-2 pt-2 sm:gap-3 sm:px-4 sm:pt-3 lg:pt-7"
+      className="flex h-full w-full flex-col gap-2 px-2 pt-2 sm:gap-3 sm:px-4 sm:pt-3"
       style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
     >
       {/* 上半部分：按状态切换 GlobalOverview / ProjectOverview / StatusMonitor。
           AnimatePresence 用 wait 模式做柔和切换，避免三种视图叠加闪烁。 */}
+      {/* 桌面端拖拽条，对应 SidebarLeft 顶部 28px */}
+      <div data-tauri-drag-region
+           onMouseDown={async (e) => { if (e.button !== 0) return; try { await getCurrentWindow().startDragging(); } catch {} }} className="hidden lg:block shrink-0 h-7 w-full" />
       <AnimatePresence mode="wait">
         {showGlobalOverview ? (
           <motion.div

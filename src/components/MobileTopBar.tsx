@@ -7,6 +7,7 @@
 //
 // 高度 44px；safe-area-top 让刘海屏不顶到状态栏。
 
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useTabsStore } from "../stores/useTabsStore";
 import { useUiStore } from "../stores/useUiStore";
@@ -26,6 +27,8 @@ export function MobileTopBar(): JSX.Element {
 
   return (
     <header
+      data-tauri-drag-region
+      onMouseDown={async (e) => { if (e.button !== 0) return; try { await getCurrentWindow().startDragging(); } catch {} }}
       className="lg:hidden sticky top-0 z-40 flex shrink-0 items-center gap-2 border-b border-black/5 bg-white/70 px-2 backdrop-blur-md dark:border-white/5 dark:bg-slate-900/70"
       // sticky + min-h 让 safe-area-top 计入容器高度，下方主区不会被刘海遮挡
       style={{
