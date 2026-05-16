@@ -30,7 +30,7 @@ use ipc::commands::{
     opencode_start, opencode_status, opencode_stop, respond_permission,
     respond_permission_decision, select_project_folder, set_click_through, start_agent,
     stop_agent, translate_only, update_backend_preferences, update_llm_settings,
-    generate_welcome_speech,
+    generate_welcome_speech, generate_poke_speech,
 };
 use ipc::git::{
     git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
@@ -218,6 +218,7 @@ pub fn run() {
             finalize_pending,
             translate_only,
             generate_welcome_speech,
+            generate_poke_speech,
             set_click_through,
             update_llm_settings,
             update_backend_preferences,

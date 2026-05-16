@@ -1,11 +1,14 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { motion } from "framer-motion";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { useActiveTabField } from "../../hooks/useActiveTab";
+import { invoke } from "../../lib/bridge";
 import type { AgentStatus } from "../../types/agent";
 import {
   usePetAssetsStore,
   type PetCategory,
 } from "../../stores/usePetAssetsStore";
+import { useProfileStore } from "../../stores/useProfileStore";
+import { usePetInteractionStore } from "../../stores/usePetInteractionStore";
 
 const DEFAULT_OTHERS_GIFS: string[] = [
   "/pet/others/对手指.gif",
@@ -158,14 +161,59 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visualState, customEnabled, customCategoryToken]);
 
+  // 戳/触摸互动台词的冷却：5s 内多次点击仍然切图，但只生成一次台词。
+  // 用 ref 避免 setState 触发额外渲染；同时持 inflight token 拦截 race。
+  const lastPokeAtRef = useRef<number>(0);
+  const pokeTokenRef = useRef<number>(0);
+
+  /// 选一张当前刚被点击切换到的 others 类图（决定 prompt 来源）。
+  /// 自定义未启用 / others 类无图 → null（用默认凉宫风）
+  function pickPokeImageForPersona(): {
+    persona: string | null;
+    imageId: string | null;
+  } {
+    if (!customEnabled) return { persona: null, imageId: null };
+    const list = customAssets.others ?? [];
+    if (list.length === 0) return { persona: null, imageId: null };
+    const meta = list[Math.floor(Math.random() * list.length)]!;
+    const p = meta.communityPrompt?.trim();
+    return { persona: p && p.length > 0 ? p : null, imageId: meta.id };
+  }
+
   const handleClick = useCallback(() => {
     if (!canSwapExpression) return;
+    // 1) 切图（保留原行为）
     if (customEnabled) {
       setDisplayGif(pickCustomOthersGif(customAssets.others, customBlobUrls));
     } else {
       setDisplayGif(pickDefaultOthersGif());
     }
+    // 2) 5s 冷却内：只切图不生成台词
+    const now = Date.now();
+    if (now - lastPokeAtRef.current < 5000) return;
+    lastPokeAtRef.current = now;
+    // 3) 异步生成"被戳"反应台词
+    const myToken = ++pokeTokenRef.current;
+    const { persona, imageId } = pickPokeImageForPersona();
+    invoke<string>("generate_poke_speech", {
+      persona,
+      nickname: useProfileStore.getState().nickname?.trim() || null,
+    })
+      .then((speech) => {
+        // race 拦截：如果在等待期间又有更新点击发起新生成，旧的丢弃
+        if (myToken !== pokeTokenRef.current) return;
+        const text = (speech ?? "").trim();
+        if (text) {
+          usePetInteractionStore.getState().setPoke(text, imageId);
+        }
+      })
+      .catch(() => {
+        // LLM 未配 / 任何错误：静默 fallback —— 不显示气泡（不影响切图）
+      });
   }, [canSwapExpression, customEnabled, customAssets, customBlobUrls]);
+
+  // 订阅气泡 store（任一桌宠实例点过的台词都会显示——目前应用只有一个 active tab 桌宠）
+  const interactionSpeech = usePetInteractionStore((s) => s.speech);
 
   const { wrap, img } = SIZE_CLASSES[size];
 
@@ -197,6 +245,32 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
         className={`object-contain drop-shadow-xl ${img}`}
         draggable={false}
       />
+      {/* "被戳"反应气泡：浮于桌宠**正上方**（水平居中），5s 自动消失。
+          位置策略：
+            - bottom-full + mb-2 ：紧贴桌宠顶部上方，留一点缝隙
+            - left-1/2 + -translate-x-1/2 ：水平居中，避免被左右卡片挤
+            - z-50 ：高于普通卡片 z-index，确保不被遮挡
+            - pointer-events-none ：点击直接穿透到桌宠（连点继续触发 handleClick）
+            - whitespace-normal + w-max + max-w-[260px] ：文字自然水平换行；不会被父级
+              overflow 挤成竖排
+            - 底部三角小尾巴用 ::after 伪元素，指向桌宠头顶 */}
+      <AnimatePresence>
+        {interactionSpeech ? (
+          <motion.div
+            key={interactionSpeech}
+            initial={{ opacity: 0, y: 6, scale: 0.85 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -4, scale: 0.9 }}
+            transition={{ type: "spring", damping: 18, stiffness: 320 }}
+            style={{ width: "max-content" }}
+            className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-2 -translate-x-1/2 whitespace-normal break-words rounded-2xl border border-white/60 bg-white/95 px-3 py-1.5 text-center text-[12px] font-medium leading-snug text-zinc-800 shadow-lg backdrop-blur after:absolute after:left-1/2 after:top-full after:-mt-px after:-translate-x-1/2 after:border-[6px] after:border-transparent after:border-t-white/95 after:content-[''] dark:border-white/15 dark:bg-slate-800/95 dark:text-zinc-100 dark:after:border-t-slate-800/95"
+          >
+            <span style={{ display: "inline-block", maxWidth: "260px" }}>
+              {interactionSpeech}
+            </span>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </motion.div>
   );
 }

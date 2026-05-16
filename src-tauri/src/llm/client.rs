@@ -241,6 +241,36 @@ pub fn translate_zh_to_en(cfg: &LlmConfig, text: &str) -> Result<String, String>
     chat_completion(cfg, prompt::translate_zh_to_en_system(), text, Some(false))
 }
 
+/// 用户点击桌宠时生成的"被戳/触摸"互动台词。
+/// 与 welcome_speech 同形参；冷却由前端控制（5s 一次）。
+pub fn generate_poke_speech(
+    cfg: &LlmConfig,
+    persona: Option<&str>,
+    nickname: Option<&str>,
+) -> Result<String, String> {
+    let system = prompt::poke_speech_system_prompt(persona);
+    let user_msg = match nickname.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => format!("用户（称呼：{}）戳了你一下。请生成一句反应台词。", n),
+        None => "用户戳了你一下。请生成一句反应台词。".to_string(),
+    };
+    let text = chat_completion(cfg, &system, &user_msg, Some(false))?;
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim_matches(|c: char| c == '"' || c == '\u{201c}' || c == '\u{201d}' || c == '\u{2018}' || c == '\u{2019}')
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return Err("LLM 返回空台词".to_string());
+    }
+    let chars: Vec<char> = cleaned.chars().collect();
+    if chars.len() > 32 {
+        return Ok(chars.iter().take(32).collect::<String>() + "…");
+    }
+    Ok(cleaned)
+}
+
 /// 生成进入软件时的欢迎语。
 /// persona 非空时整段替换凉宫人设；空时用默认凉宫风。
 /// nickname 是给 LLM 的"用户称呼"，可空（则不提及具体称呼）。

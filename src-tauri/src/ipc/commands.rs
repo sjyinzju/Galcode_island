@@ -643,13 +643,40 @@ pub fn translate_only(text_zh: String) -> Result<String, String> {
 /// 用 LLM 实时生成"进入软件时的欢迎语"。
 /// 前端在 welcome 状态时检查当前 welcome 类图是否带 prompt，有则调本命令生成。
 /// 未配 LLM_API_KEY / 任何错误：返回 Err 让前端回退到内置 GREETINGS。
+///
+/// **关键**：标 async + 用 spawn_blocking 把同步 reqwest::blocking 分流到工作线程，
+/// 不会阻塞 Tauri 主线程（否则 webview 会冻 3-4s）。
 #[tauri::command]
-pub fn generate_welcome_speech(
+pub async fn generate_welcome_speech(
     persona: Option<String>,
     nickname: Option<String>,
 ) -> Result<String, String> {
-    let cfg = crate::llm::load_llm_config().ok_or_else(|| "未配置 LLM_API_KEY".to_string())?;
-    crate::llm::generate_welcome_speech(&cfg, persona.as_deref(), nickname.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = crate::llm::load_llm_config()
+            .ok_or_else(|| "未配置 LLM_API_KEY".to_string())?;
+        crate::llm::generate_welcome_speech(&cfg, persona.as_deref(), nickname.as_deref())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking err: {e}"))?
+}
+
+/// 用户点击桌宠时生成"被戳/触摸"互动台词。
+/// 前端在 PetCharacter handleClick 触发，自带 5s 冷却（连点不重复 fire）。
+///
+/// 同 welcome_speech：async + spawn_blocking，避免 reqwest::blocking 占主线程导致
+/// 点桌宠时 UI 卡 3-4s。
+#[tauri::command]
+pub async fn generate_poke_speech(
+    persona: Option<String>,
+    nickname: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = crate::llm::load_llm_config()
+            .ok_or_else(|| "未配置 LLM_API_KEY".to_string())?;
+        crate::llm::generate_poke_speech(&cfg, persona.as_deref(), nickname.as_deref())
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking err: {e}"))?
 }
 
 #[tauri::command]

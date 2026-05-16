@@ -72,6 +72,24 @@ pub fn haruhi_system_prompt() -> String {
     compose_system_prompt(None)
 }
 
+/// "被戳/触摸"互动台词的 system prompt。用户点击桌宠时触发。
+/// 与 welcome_speech 同模板但任务换成"被戳"主题。
+pub fn poke_speech_system_prompt(custom_persona: Option<&str>) -> String {
+    let persona: &str = match custom_persona {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => haruhi_persona_section(),
+    };
+    format!(
+        "{}\n\n【任务】\n用户**戳了你/摸了你/碰了你的脸**，生成一句反应台词。要求：\n\
+- 直接输出**1 句中文台词**，不要 JSON 不要解释\n\
+- 字数严格控制在 6–30 字\n\
+- 风格符合上面的人设；可以微微傲娇 / 害羞 / 嬉笑 / 抗议，任意一种合适即可\n\
+- 这是一种被打扰 / 被搭话的反应，可以用「啊？」「嘿！」「怎么了？」等口头反应起手\n\
+- 不要带引号 / Markdown / Emoji 围栏",
+        persona,
+    )
+}
+
 /// 欢迎语生成的 system prompt。给定 persona（可为默认凉宫春日，也可由桌宠图自带）
 /// + 输出契约（只输出 1 句开场话，不要 JSON 不要解释）。
 /// 用户称呼由调用方在 user 消息里给。
