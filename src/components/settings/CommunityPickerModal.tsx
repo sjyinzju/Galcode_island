@@ -93,6 +93,8 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
   // 若图属于多个图集：点"查看所属图集"先在浮层底部展开 album 选择子菜单
   const [albumPickList, setAlbumPickList] = useState<AlbumDto[] | null>(null);
   const [albumLoading, setAlbumLoading] = useState<boolean>(false);
+  // "用到「xx」"分裂按钮的角标 popover 开关：展开后显示 6 类别选项，可跨类应用
+  const [applyMenuOpen, setApplyMenuOpen] = useState<boolean>(false);
   const enabled = isCommunityEnabled();
 
   const saveCommunityImageLocally = usePetAssetsStore((s) => s.saveCommunityImageLocally);
@@ -146,11 +148,13 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, enabled]);
 
-  // ESC 关闭：优先关浮层 → 然后退出 album view → 最后关 modal
+  // ESC 关闭：优先关 popover → 关浮层 → 退出 album view → 关 modal
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === "Escape") {
-        if (pickedFor) {
+        if (applyMenuOpen) {
+          setApplyMenuOpen(false);
+        } else if (pickedFor) {
           setPickedFor(null);
           setAlbumPickList(null);
         } else if (view.kind === "album") {
@@ -162,7 +166,12 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pickedFor, onClose, view]);
+  }, [pickedFor, onClose, view, applyMenuOpen]);
+
+  // 关闭 picked overlay 时也关 popover
+  useEffect(() => {
+    if (!pickedFor) setApplyMenuOpen(false);
+  }, [pickedFor]);
 
   // toast 自动消失
   useEffect(() => {
@@ -199,13 +208,17 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
     [state.topHot, state.timeline],
   );
 
+  /// 把社区图保存到本地。
+  /// targetCategory 缺省 = img.category（图本身的来源类）；调用方传别的就走"跨类应用"。
+  /// 设计：所有"用到「X」"入口（主按钮、popover 内每个类别按钮）都走这一个函数，
+  /// 行为一致，UI 怎么切换都不会出第二条路径产生差异。
   const handleUse = useCallback(
-    async (img: CommunityImageDto) => {
+    async (img: CommunityImageDto, targetCategory: PetCategory = img.category) => {
       setBusy(true);
       try {
         const blob = await fetchCommunityBlob(img);
-        await saveCommunityImageLocally(active, img, blob);
-        setToast(`已添加到「${PET_CATEGORY_LABEL[active]}」`);
+        await saveCommunityImageLocally(targetCategory, img, blob);
+        setToast(`已添加到「${PET_CATEGORY_LABEL[targetCategory]}」`);
         // 异步通知 server 计数，不阻塞 UI
         recordImageUse(img.id)
           .then((res) => {
@@ -230,6 +243,7 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
             /* 计数失败 silently */
           });
         setPickedFor(null);
+        setApplyMenuOpen(false);
       } catch (err) {
         const msg =
           err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
@@ -238,7 +252,7 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
         setBusy(false);
       }
     },
-    [active, saveCommunityImageLocally],
+    [saveCommunityImageLocally],
   );
 
   /// 点"查看所属图集"：拉该图所属 album 元数据
@@ -415,7 +429,14 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
               if (e.target === e.currentTarget) setPickedFor(null);
             }}
           >
-            <div className="w-[min(360px,88vw)] overflow-hidden rounded-xl border border-white/30 bg-white/95 shadow-xl dark:border-white/10 dark:bg-slate-900/95">
+            <div
+              className="w-[min(360px,88vw)] overflow-hidden rounded-xl border border-white/30 bg-white/95 shadow-xl dark:border-white/10 dark:bg-slate-900/95"
+              onClick={() => {
+                // 点卡片任意位置（不包括 popover 和角标本身——它们 stopPropagation 了）
+                // 自动收起跨类应用 popover，避免它一直挂着遮挡视线
+                if (applyMenuOpen) setApplyMenuOpen(false);
+              }}
+            >
               <div className="aspect-video w-full overflow-hidden bg-zinc-100 dark:bg-slate-800">
                 <img src={pickedFor.url} alt="" className="h-full w-full object-contain" />
               </div>
@@ -501,14 +522,78 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
                   >
                     取消
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleUse(pickedFor)}
-                    disabled={busy}
-                    className="rounded-md border border-emerald-400/60 bg-emerald-500 px-3 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {busy ? "处理中…" : `用到「${PET_CATEGORY_LABEL[active]}」`}
-                  </button>
+                  {/* "用到「xx」" 分裂按钮：
+                        - 主体（左半）= 默认用到 img.category（图自带的类别）
+                        - 角标（右半）= 点开 popover 选其它类别（跨类应用）
+                      整组 button 用 relative + 弹层用 absolute 锚到组的右边底部上方。
+                      用 div 包裹 → 让左右两个 button 视觉合一（中间细分隔线），但分别可点。 */}
+                  <div className="relative inline-flex">
+                    <button
+                      type="button"
+                      onClick={() => void handleUse(pickedFor)}
+                      disabled={busy}
+                      className="rounded-l-md border border-emerald-400/60 border-r-emerald-700/30 bg-emerald-500 px-3 py-1 text-[11px] font-medium text-white shadow-sm hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {busy
+                        ? "处理中…"
+                        : `用到「${PET_CATEGORY_LABEL[pickedFor.category]}」`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setApplyMenuOpen((v) => !v);
+                      }}
+                      disabled={busy}
+                      aria-label="应用到其它类别"
+                      aria-expanded={applyMenuOpen}
+                      title="应用到其它类别"
+                      className="flex items-center justify-center rounded-r-md border border-l-0 border-emerald-400/60 bg-emerald-500 px-1.5 text-white shadow-sm hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <svg
+                        viewBox="0 0 10 10"
+                        className={`h-2.5 w-2.5 transition-transform ${applyMenuOpen ? "rotate-180" : ""}`}
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                      >
+                        <path d="M2 4l3 3 3-3" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+
+                    {applyMenuOpen ? (
+                      <div
+                        className="absolute bottom-full right-0 z-20 mb-1 min-w-[160px] overflow-hidden rounded-md border border-emerald-300/40 bg-white shadow-lg dark:border-emerald-300/20 dark:bg-slate-900"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="border-b border-black/5 px-2.5 py-1 text-[10px] text-zinc-500 dark:border-white/5 dark:text-zinc-400">
+                          应用到类别
+                        </div>
+                        <ul className="max-h-56 overflow-y-auto py-0.5">
+                          {PET_CATEGORIES.map((cat) => {
+                            const isDefault = cat === pickedFor.category;
+                            return (
+                              <li key={cat}>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleUse(pickedFor, cat)}
+                                  disabled={busy}
+                                  className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] text-zinc-800 transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:text-zinc-100 dark:hover:bg-emerald-500/15"
+                                >
+                                  <span>{PET_CATEGORY_LABEL[cat]}</span>
+                                  {isDefault ? (
+                                    <span className="rounded bg-emerald-500/15 px-1 text-[9px] text-emerald-700 dark:text-emerald-300">
+                                      默认
+                                    </span>
+                                  ) : null}
+                                </button>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </div>
             </div>
