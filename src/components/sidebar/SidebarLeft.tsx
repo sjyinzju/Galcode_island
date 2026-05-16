@@ -54,6 +54,7 @@ export function SidebarLeft(): JSX.Element {
   const openSettingsModal = useSettingsStore((s) => s.openSettingsModal);
   const openProfileModal = useProfileStore((s) => s.openProfileModal);
   const openAboutModal = useAboutStore((s) => s.openAboutModal);
+  const openPersonalizationModal = useUiStore((s) => s.openPersonalizationModal);
   const profileNickname = useProfileStore((s) => s.nickname);
   const theme = useAppStore((s) => s.theme);
   const toggleTheme = useAppStore((s) => s.toggleTheme);
@@ -198,6 +199,23 @@ export function SidebarLeft(): JSX.Element {
                 <path d="M14 8.5A6 6 0 117.5 2a4.5 4.5 0 006.5 6.5z" strokeLinejoin="round" />
               </svg>
             )
+          }
+        />
+        <MenuButton
+          label="个性化"
+          onClick={openPersonalizationModal}
+          icon={
+            // 调色板：圆盘 + 三个色点 + 拇指孔，对应"个人化装扮"的语义
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3.5 w-3.5">
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M8 2a6 6 0 100 12 1.5 1.5 0 001.4-2.1c-.3-.7.2-1.4.9-1.4h1.2A2.5 2.5 0 0014 8a6 6 0 00-6-6z"
+              />
+              <circle cx="5.5" cy="6.5" r="0.7" fill="currentColor" stroke="none" />
+              <circle cx="8" cy="5" r="0.7" fill="currentColor" stroke="none" />
+              <circle cx="10.5" cy="6.5" r="0.7" fill="currentColor" stroke="none" />
+            </svg>
           }
         />
         <MenuButton

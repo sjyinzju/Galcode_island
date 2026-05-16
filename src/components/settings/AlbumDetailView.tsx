@@ -22,7 +22,7 @@ export interface AlbumDetailViewProps {
   albumId: string;
   onBack: () => void;
   onPick: (image: CommunityImageDto) => void;
-  /// "应用全套"：一键把整个图集按各自类别落到本地。父组件已有 handleApplyAlbum 走批量逻辑。
+  /// "下载为预设"：把整个图集作为一份新预设安装到本地预设库。父组件已有 handleApplyAlbum 走批量逻辑。
   onApplyAll: (albumId: string) => Promise<void>;
   /// 父级有正在跑的批量操作时为 true，用于 disable 按钮
   busy: boolean;
@@ -137,15 +137,15 @@ export function AlbumDetailView({
                   onLike={handleLike}
                   size="md"
                 />
-                {/* 应用全套：一键把整套图按各自类别落到本地 */}
+                {/* 下载为本地预设：作为一份新预设安装到本地预设库，并切到该预设 */}
                 <button
                   type="button"
                   onClick={() => void onApplyAll(album.id)}
                   disabled={busy || album.imageCount === 0}
-                  title="把整个图集按各自类别一次性应用到本地"
+                  title="把整个图集作为一份预设安装到本地预设库，并切到该预设"
                   className="ml-auto rounded-md border border-emerald-400/60 bg-emerald-500 px-3 py-1 text-[11px] font-medium text-white shadow-sm transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {busy ? "应用中…" : `应用全套 (${album.imageCount} 张)`}
+                  {busy ? "下载中…" : `下载为预设 (${album.imageCount} 张)`}
                 </button>
               </div>
               <div className="text-[10px] text-zinc-500 dark:text-zinc-400">

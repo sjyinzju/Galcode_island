@@ -4,6 +4,7 @@ import { useEffect, useMemo } from "react";
 import { MainView } from "./components/MainView";
 import { MobileTopBar } from "./components/MobileTopBar";
 import { SettingsModal } from "./components/settings/SettingsModal";
+import { PersonalizationModal } from "./components/personalization/PersonalizationModal";
 import { ProfileModal } from "./components/profile/ProfileModal";
 import { SidebarLeft } from "./components/sidebar/SidebarLeft";
 import { SidebarRight } from "./components/sidebar/SidebarRight";
@@ -180,6 +181,7 @@ function App(): JSX.Element {
           </motion.div>
         </AnimatePresence>
         <SettingsModal />
+        <PersonalizationModal />
         <ProfileModal />
       </div>
       {/* Windows / Linux 自画顶栏。组件内部用 createPortal 挂到 document.body

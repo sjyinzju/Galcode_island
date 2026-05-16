@@ -4,6 +4,8 @@ import { useActiveTabField } from "../../hooks/useActiveTab";
 import { invoke } from "../../lib/bridge";
 import type { AgentStatus } from "../../types/agent";
 import {
+  getActiveCategories,
+  isCustomPresetActive,
   usePetAssetsStore,
   type PetCategory,
 } from "../../stores/usePetAssetsStore";
@@ -117,9 +119,10 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
   const agentStatus = useActiveTabField("agentStatus");
   const mode = useActiveTabField("mode");
 
-  // 自定义桌宠资源（开关 + 各类元数据 + ObjectURL 映射）
-  const customEnabled = usePetAssetsStore((s) => s.enabled);
-  const customAssets = usePetAssetsStore((s) => s.assets);
+  // 自定义桌宠资源：用当前活动预设（非 default 即视为"自定义"）的各类资源。
+  // getActiveCategories 在 active 预设不变时返回稳定引用，让选择器 shallow-eq 生效。
+  const customEnabled = usePetAssetsStore(isCustomPresetActive);
+  const customAssets = usePetAssetsStore(getActiveCategories);
   const customBlobUrls = usePetAssetsStore((s) => s.blobUrls);
 
   const visualState = useMemo(

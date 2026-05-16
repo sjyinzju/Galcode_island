@@ -77,10 +77,11 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
   const [pickedDailyRemaining, setPickedDailyRemaining] = useState<number | null>(null);
   const enabled = isCommunityEnabled();
 
-  const saveCommunityImageLocally = usePetAssetsStore((s) => s.saveCommunityImageLocally);
-  const batchAddCommunityImagesLocally = usePetAssetsStore(
-    (s) => s.batchAddCommunityImagesLocally,
+  const addCommunityImageToActive = usePetAssetsStore(
+    (s) => s.addCommunityImageToActive,
   );
+  const installAlbumAsPreset = usePetAssetsStore((s) => s.installAlbumAsPreset);
+  const setActivePreset = usePetAssetsStore((s) => s.setActivePreset);
 
   // 切换 mode / sort 时把 page 重置到 1，避免落到不存在的页
   useEffect(() => {
@@ -193,30 +194,26 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
     [],
   );
 
-  /// 把社区图保存到本地。
+  /// 把社区图加进"当前 active 预设"的指定类别。
   /// targetCategory 缺省 = img.category（图本身的来源类）；调用方传别的就走"跨类应用"。
-  /// 设计：所有"用到「X」"入口（主按钮、popover 内每个类别按钮）都走这一个函数，
-  /// 行为一致，UI 怎么切换都不会出第二条路径产生差异。
+  /// 若 active 是 default 或 community 来源，store 内部会 auto-fork 一份 mine 副本再写——
+  /// 这里只关心结果：图最终落在当前生效的预设里。
   const handleUse = useCallback(
     async (img: CommunityImageDto, targetCategory: PetCategory = img.category) => {
       setBusy(true);
       try {
         const blob = await fetchCommunityBlob(img);
-        await saveCommunityImageLocally(targetCategory, img, blob);
-        setToast(`已添加到「${PET_CATEGORY_LABEL[targetCategory]}」`);
-        // 异步通知 server 计数，不阻塞 UI
+        await addCommunityImageToActive(targetCategory, img, blob);
+        setToast(`已加到当前预设的「${PET_CATEGORY_LABEL[targetCategory]}」`);
         recordImageUse(img.id)
           .then((res) => {
             if (!res.counted) return;
-            // 用 popularity = useCount + 3 * likes 同步更新（保持与 server 一致）
             patchImageInList(img.id, {
               useCount: res.useCount,
               popularity: res.useCount + 3 * (img.likes ?? 0),
             });
           })
-          .catch(() => {
-            /* 计数失败 silently */
-          });
+          .catch(() => {});
         setPickedFor(null);
         setApplyMenuOpen(false);
       } catch (err) {
@@ -227,7 +224,7 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
         setBusy(false);
       }
     },
-    [saveCommunityImageLocally, patchImageInList],
+    [addCommunityImageToActive, patchImageInList],
   );
 
   /// 点赞当前 pickedFor（也用于卡片角心形按钮）。
@@ -255,13 +252,14 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
     [patchImageInList],
   );
 
-  /// "应用全套" —— 一键把图集所有图按各自 category **追加**到本地（不覆盖现有图）。
+  /// "下载整套预设" —— 把图集作为一份完整的 community 来源预设安装到本地预设库，
+  /// 并切换 active 到它。原有预设和原 active 不变。
   /// 流程：
-  ///   1. getAlbum 拿图集所有图
-  ///   2. 顺序 fetchCommunityBlob 收集 {category, dto, blob}[]
-  ///   3. 单次 batchAddCommunityImagesLocally 原子追加 —— 避免循环 set 时 zustand
-  ///      persist 多次 setItem 导致疑似"覆盖"现象
-  ///   4. 通知 server 计数（per-image fire-and-forget）
+  ///   1. getAlbum 拿图集元数据 + 全部图
+  ///   2. 顺序 fetchCommunityBlob 收集 {image, blob}[]
+  ///   3. installAlbumAsPreset 一次性写入并生成新预设
+  ///   4. setActivePreset 切到新预设
+  ///   5. 通知 server 计数（per-image fire-and-forget）
   /// 任一步失败的图 skip 不阻塞其它；toast 显示成功/失败计数。
   const handleApplyAlbum = useCallback(
     async (albumId: string): Promise<void> => {
@@ -274,52 +272,48 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
           setToast("该图集是空的，无可应用");
           return;
         }
-        // 第 1 阶段：顺序下载 blob（顺序避免一次性挤爆服务器 CDN）
-        const items: Array<{
-          category: PetCategory;
-          dto: CommunityImageDto;
-          blob: Blob;
-        }> = [];
+        const items: Array<{ image: CommunityImageDto; blob: Blob }> = [];
         let downloadFailed = 0;
         for (let i = 0; i < total; i += 1) {
           const img = res.images[i]!;
           setToast(`下载中 ${i + 1}/${total}…`);
           try {
             const blob = await fetchCommunityBlob(img);
-            items.push({ category: img.category, dto: img, blob });
+            items.push({ image: img, blob });
           } catch {
             downloadFailed += 1;
           }
         }
-        // 第 2 阶段：原子追加（单次 set）
-        setToast(`写入本地…`);
-        const succeeded = await batchAddCommunityImagesLocally(items);
-        // 第 3 阶段：异步通知 server 计数（不阻塞）
+        setToast(`安装为本地预设…`);
+        const newPresetId = await installAlbumAsPreset(res.album, items);
+        setActivePreset(newPresetId);
         for (const item of items) {
-          recordImageUse(item.dto.id)
+          recordImageUse(item.image.id)
             .then((r) => {
               if (!r.counted) return;
-              patchImageInList(item.dto.id, {
+              patchImageInList(item.image.id, {
                 useCount: r.useCount,
-                popularity: r.useCount + 3 * (item.dto.likes ?? 0),
+                popularity: r.useCount + 3 * (item.image.likes ?? 0),
               });
             })
             .catch(() => {});
         }
-        if (downloadFailed === 0 && succeeded === total) {
-          setToast(`已追加整套 ${succeeded} 张图到对应类别（原有图保留）`);
+        if (downloadFailed === 0) {
+          setToast(`已下载并启用预设：「${res.album.name}」`);
         } else {
-          setToast(`追加 ${succeeded}/${total} 张成功（${downloadFailed} 张下载失败）`);
+          setToast(
+            `已下载预设「${res.album.name}」：${items.length}/${total} 张成功，${downloadFailed} 张下载失败`,
+          );
         }
       } catch (err) {
         const msg =
           err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
-        setToast(`应用全套失败：${msg}`);
+        setToast(`下载预设失败：${msg}`);
       } finally {
         setBusy(false);
       }
     },
-    [batchAddCommunityImagesLocally, patchImageInList],
+    [installAlbumAsPreset, setActivePreset, patchImageInList],
   );
 
   const handleLikeAlbum = useCallback(
@@ -888,7 +882,7 @@ function AlbumCard({
           >
             {descText || "（无描述）"}
           </div>
-          {/* 底部两行布局：上行 点赞（左对齐）；下行 应用全套 + 进入图集 并排等宽对称 */}
+          {/* 底部两行布局：上行 点赞（左对齐）；下行 下载预设 + 进入图集 并排等宽对称 */}
           <div className="mt-auto flex flex-col gap-1.5">
             <div>
               <LikeButton likes={album.likes} dailyRemaining={null} onLike={onLike} />
@@ -898,10 +892,10 @@ function AlbumCard({
                 type="button"
                 onClick={() => void onApplyAll()}
                 disabled={busy}
-                title="一键把整套图按各自类别应用到本地"
+                title="把整套图作为一份预设安装到本地预设库，并切到该预设"
                 className="flex-1 rounded-md border border-emerald-400/60 bg-emerald-500/10 px-2 py-1 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-300/40 dark:text-emerald-300"
               >
-                应用全套
+                下载预设
               </button>
               <button
                 type="button"

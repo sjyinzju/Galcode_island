@@ -12,7 +12,11 @@ import { PetCharacter } from "../pet-character/PetCharacter";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
 import { selectPromptOverride } from "../../lib/petPromptOverride";
-import { usePetAssetsStore } from "../../stores/usePetAssetsStore";
+import {
+  getActiveCategories,
+  isCustomPresetActive,
+  usePetAssetsStore,
+} from "../../stores/usePetAssetsStore";
 
 const GREETINGS = [
   "喂，[称呼]，发什么呆呢？今天的部团活动要开始咯，有什么有趣的企划快交上来看看。",
@@ -91,8 +95,8 @@ export function InputBubble(): JSX.Element {
     };
     const tryCustom = async (): Promise<void> => {
       const petState = usePetAssetsStore.getState();
-      if (!petState.enabled) return fallback();
-      const welcomeList = petState.assets.welcome ?? [];
+      if (!isCustomPresetActive(petState)) return fallback();
+      const welcomeList = getActiveCategories(petState).welcome ?? [];
       // 找一张有非空 prompt 的（任意一张即可，random pick 让多张时风格也多样）
       const withPrompt = welcomeList.filter((m) => m.communityPrompt?.trim());
       if (withPrompt.length === 0) return fallback();

@@ -1,7 +1,8 @@
-// usePetAssetsStore 的图集快照变动检测纯函数测试。
+// usePetAssetsStore 的预设选择器纯函数测试。
 //
-// hasAlbumChanges 是 PetCharacterSection "保存到云端图集" 按钮 active 状态的依据，
-// 误判会让用户错过保存或被反复弹提示——必须有覆盖正反向用例的单测兜底。
+// 重构后旧的"图集快照变动检测"被移除（hasAlbumChanges / collectAllAssetIds /
+// markAlbumUploaded），由"预设系统"接管：每个预设独立维护自己的 communityAlbumId。
+// 这里只验证基础读路径的稳定性，避免选择器在 zustand 中失去 shallow-eq 优势。
 
 import { beforeAll, describe, expect, it } from "vitest";
 
@@ -24,176 +25,72 @@ beforeAll(() => {
   }
 });
 
-function meta(id: string) {
-  // 仅 hasAlbumChanges 用到的字段
-  return {
-    id,
-    fileName: `${id}.png`,
-    mime: "image/png",
-    sizeBytes: 100,
-    addedAt: 1,
-  };
-}
-
-function emptyAssets() {
-  return {
-    welcome: [],
-    thinking: [],
-    waiting: [],
-    complete: [],
-    error: [],
-    others: [],
-  };
-}
-
-describe("hasAlbumChanges", () => {
-  it("从未保存过（snapshot=null）→ 始终 true", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    expect(hasAlbumChanges(emptyAssets(), null)).toBe(true);
-    expect(
-      hasAlbumChanges(
-        { ...emptyAssets(), welcome: [meta("a")] },
-        null,
-      ),
-    ).toBe(true);
+describe("默认预设", () => {
+  it("DEFAULT_PRESET 含 6 个空 categories", async () => {
+    const { DEFAULT_PRESET, PET_CATEGORIES } = await import("./usePetAssetsStore");
+    expect(DEFAULT_PRESET.id).toBe("default");
+    expect(DEFAULT_PRESET.source).toBe("default");
+    for (const cat of PET_CATEGORIES) {
+      expect(DEFAULT_PRESET.categories[cat]).toEqual([]);
+    }
   });
 
-  it("当前 ids 和快照 ids 完全一致 → false（无变动）", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    const assets = {
-      ...emptyAssets(),
-      welcome: [meta("a")],
-      thinking: [meta("b"), meta("c")],
-    };
-    expect(
-      hasAlbumChanges(assets, {
-        albumId: "x",
-        name: "n",
-        imageIds: ["a", "b", "c"],
-        createdAt: 1,
-      }),
-    ).toBe(false);
+  it("getPresetById('default') 始终返回 DEFAULT_PRESET，与 presets[] 无关", async () => {
+    const { DEFAULT_PRESET, getPresetById } = await import("./usePetAssetsStore");
+    expect(getPresetById({ presets: [] }, "default")).toBe(DEFAULT_PRESET);
   });
 
-  it("顺序不同 → 还是 false（无变动）", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    const assets = {
-      ...emptyAssets(),
-      welcome: [meta("a")],
-      thinking: [meta("b")],
-    };
-    expect(
-      hasAlbumChanges(assets, {
-        albumId: "x",
-        name: "n",
-        imageIds: ["b", "a"], // 倒序
-        createdAt: 1,
-      }),
-    ).toBe(false);
-  });
-
-  it("当前多了一张图 → true", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    const assets = {
-      ...emptyAssets(),
-      welcome: [meta("a"), meta("new")],
-    };
-    expect(
-      hasAlbumChanges(assets, {
-        albumId: "x",
-        name: "n",
-        imageIds: ["a"],
-        createdAt: 1,
-      }),
-    ).toBe(true);
-  });
-
-  it("当前少了一张图 → true", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    const assets = {
-      ...emptyAssets(),
-      welcome: [meta("a")],
-    };
-    expect(
-      hasAlbumChanges(assets, {
-        albumId: "x",
-        name: "n",
-        imageIds: ["a", "b"],
-        createdAt: 1,
-      }),
-    ).toBe(true);
-  });
-
-  it("数量一样但 id 不同 → true", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    const assets = {
-      ...emptyAssets(),
-      welcome: [meta("a")],
-      thinking: [meta("b")],
-    };
-    expect(
-      hasAlbumChanges(assets, {
-        albumId: "x",
-        name: "n",
-        imageIds: ["a", "different"],
-        createdAt: 1,
-      }),
-    ).toBe(true);
-  });
-
-  it("跨类别移动同一张图 → false（id 集合未变）", async () => {
-    const { hasAlbumChanges } = await import("./usePetAssetsStore");
-    // 同一 id 出现在不同类别是 store 不会发生的，但函数应稳健
-    const a1 = { ...emptyAssets(), welcome: [meta("a")] };
-    const a2 = { ...emptyAssets(), thinking: [meta("a")] };
-    const snap = { albumId: "x", name: "n", imageIds: ["a"], createdAt: 1 };
-    expect(hasAlbumChanges(a1, snap)).toBe(false);
-    expect(hasAlbumChanges(a2, snap)).toBe(false);
+  it("getPresetById 找未知 id 返回 null", async () => {
+    const { getPresetById } = await import("./usePetAssetsStore");
+    expect(getPresetById({ presets: [] }, "nope")).toBeNull();
   });
 });
 
-describe("collectAllAssetIds", () => {
-  it("空 → 空数组", async () => {
-    const { collectAllAssetIds } = await import("./usePetAssetsStore");
-    expect(collectAllAssetIds(emptyAssets())).toEqual([]);
+describe("active 状态选择器", () => {
+  it("activePresetId='default' 时 isCustomPresetActive=false，getActiveCategories=DEFAULT 空映射", async () => {
+    const { DEFAULT_PRESET, isCustomPresetActive, getActiveCategories } = await import(
+      "./usePetAssetsStore"
+    );
+    const state = { presets: [], activePresetId: "default" };
+    expect(isCustomPresetActive(state)).toBe(false);
+    expect(getActiveCategories(state)).toBe(DEFAULT_PRESET.categories);
   });
 
-  it("按类别顺序铺平 + 去保留同类内顺序", async () => {
-    const { collectAllAssetIds } = await import("./usePetAssetsStore");
-    const assets = {
-      ...emptyAssets(),
-      welcome: [meta("w1"), meta("w2")],
-      complete: [meta("c1")],
+  it("activePresetId 指向已有预设时返回该预设的 categories（引用稳定）", async () => {
+    const { isCustomPresetActive, getActiveCategories } = await import(
+      "./usePetAssetsStore"
+    );
+    const cats = {
+      welcome: [],
+      thinking: [],
+      waiting: [],
+      complete: [],
+      error: [],
+      others: [],
     };
-    const got = collectAllAssetIds(assets);
-    // welcome 类先于 complete（按 PET_CATEGORIES 顺序）
-    expect(got).toEqual(["w1", "w2", "c1"]);
-  });
-});
-
-describe("markAlbumUploaded", () => {
-  it("set state 后 hasAlbumChanges 返回 false", async () => {
-    const { usePetAssetsStore, hasAlbumChanges, collectAllAssetIds } =
-      await import("./usePetAssetsStore");
-    // 准备：写一些资源到 store
-    usePetAssetsStore.setState({
-      assets: {
-        ...emptyAssets(),
-        welcome: [meta("a")],
-        thinking: [meta("b")],
+    const presets = [
+      {
+        id: "p1",
+        name: "我的",
+        description: "",
+        source: "mine" as const,
+        authorName: null,
+        communityAlbumId: null,
+        createdAt: 0,
+        updatedAt: 0,
+        categories: cats,
       },
-    });
-    const ids = collectAllAssetIds(usePetAssetsStore.getState().assets);
-    usePetAssetsStore.getState().markAlbumUploaded({
-      albumId: "abc",
-      name: "init",
-      imageIds: ids,
-      createdAt: Date.now(),
-    });
-    const snap = usePetAssetsStore.getState().lastAlbumSnapshot;
-    expect(snap?.albumId).toBe("abc");
-    expect(
-      hasAlbumChanges(usePetAssetsStore.getState().assets, snap),
-    ).toBe(false);
+    ];
+    const state = { presets, activePresetId: "p1" };
+    expect(isCustomPresetActive(state)).toBe(true);
+    // 同一 categories 对象引用，方便 zustand 选择器 shallow-eq 跳过重渲染
+    expect(getActiveCategories(state)).toBe(cats);
+  });
+
+  it("activePresetId 指向不存在的预设时回退到 DEFAULT_PRESET", async () => {
+    const { DEFAULT_PRESET, getActiveCategories } = await import("./usePetAssetsStore");
+    expect(getActiveCategories({ presets: [], activePresetId: "ghost" })).toBe(
+      DEFAULT_PRESET.categories,
+    );
   });
 });

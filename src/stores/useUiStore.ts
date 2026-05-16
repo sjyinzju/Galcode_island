@@ -46,6 +46,13 @@ interface UiState {
   inputFocusRequest: number;
   /// 触发输入框 focus（编辑重发场景：把 user-prompt 内容回填到 task 后调）
   bumpInputFocus: () => void;
+
+  /// 个性化弹窗（自定义桌宠图片 / 云端图集等）开关。从原"全局设置"中拆出来，
+  /// 因为这块功能独立且使用频率高（普通 LLM 设置一次配完就不动了，桌宠图片
+  /// 用户会反复换 / 上传），值得占侧栏一个一级入口。
+  isPersonalizationModalOpen: boolean;
+  openPersonalizationModal: () => void;
+  closePersonalizationModal: () => void;
 }
 
 /// 当前焦点匹配：定位"哪个块的哪个字段的第几次出现"
@@ -80,4 +87,8 @@ export const useUiStore = create<UiState>((set) => ({
 
   inputFocusRequest: 0,
   bumpInputFocus: () => set((s) => ({ inputFocusRequest: s.inputFocusRequest + 1 })),
+
+  isPersonalizationModalOpen: false,
+  openPersonalizationModal: () => set({ isPersonalizationModalOpen: true }),
+  closePersonalizationModal: () => set({ isPersonalizationModalOpen: false }),
 }));

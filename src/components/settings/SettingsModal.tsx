@@ -9,7 +9,8 @@ import {
 import { useProfileStore } from "../../stores/useProfileStore";
 import { AgentBackendsSection } from "./AgentBackendsSection";
 import { LanAccessPanel } from "./LanAccessPanel";
-import { PetCharacterSection } from "./PetCharacterSection";
+// 自定义桌宠图片相关配置已迁移到「个性化」弹窗（侧栏一级入口），
+// 因为这块功能独立且使用频率明显高于其它"配置一次"类项。
 // 应用更新已经移到「关于」弹窗（左栏底部入口），SettingsModal 只保留 LLM /
 // backend / 局域网这些"配置"类的项
 
@@ -348,10 +349,6 @@ export function SettingsModal(): JSX.Element {
                 <hr className="border-black/5 dark:border-white/5" />
 
                 <AgentBackendsSection isVisible={isSettingsModalOpen} />
-
-                <hr className="border-black/5 dark:border-white/5" />
-
-                <PetCharacterSection />
 
                 <hr className="border-black/5 dark:border-white/5" />
 

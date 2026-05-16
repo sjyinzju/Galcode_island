@@ -12,7 +12,12 @@
 //
 // 单元测试覆盖：见 petPromptOverride.test.ts。
 
-import { usePetAssetsStore, type PetAssetMeta } from "../stores/usePetAssetsStore";
+import {
+  getActiveCategories,
+  isCustomPresetActive,
+  usePetAssetsStore,
+  type PetAssetMeta,
+} from "../stores/usePetAssetsStore";
 
 export interface PromptOverrideSelection {
   /// 实际传给后端的 prompt 字符串（null = 不替换人设，用默认凉宫风）
@@ -47,7 +52,10 @@ export function pickPromptOverride(
 /// 读 store 当前状态做一次选择。InputBubble / ResultCard 在 invoke 前调一次。
 export function selectPromptOverride(): PromptOverrideSelection | null {
   const state = usePetAssetsStore.getState();
-  return pickPromptOverride(state.enabled, state.assets.complete ?? []);
+  return pickPromptOverride(
+    isCustomPresetActive(state),
+    getActiveCategories(state).complete ?? [],
+  );
 }
 
 /// 兼容老调用方：单纯拿 prompt string（不需要 source info）
