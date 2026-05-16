@@ -7,7 +7,7 @@ import { useActivityStore } from "../../stores/useActivityStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { motion, AnimatePresence } from "framer-motion";
 import { PetCharacter } from "../pet-character/PetCharacter";
-import { getActivePromptOverride } from "../../lib/petPromptOverride";
+import { selectPromptOverride } from "../../lib/petPromptOverride";
 import { ErrorDiagnosisCard } from "../status-monitor/ErrorDiagnosisCard";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
@@ -97,7 +97,15 @@ export function ResultCard(): JSX.Element {
         agent: tab.agent,
         runId: activeTabId,
         sessionId: resumeHint,
-        promptOverride: getActivePromptOverride(),
+        promptOverride: (() => {
+          const sel = selectPromptOverride();
+          if (sel) {
+            console.log(
+              `[community-prompt] tab=${activeTabId.slice(0, 8)} use prompt from "${sel.sourceFileName}" preview="${(sel.prompt ?? "<no prompt – default 凉宫>").slice(0, 60)}"`,
+            );
+          }
+          return sel?.prompt ?? null;
+        })(),
       });
       if (res?.sessionId) update({ sessionId: res.sessionId });
       // 计入当天活跃 —— 跟 InputBubble 启动路径口径一致

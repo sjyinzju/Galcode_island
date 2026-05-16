@@ -22,6 +22,10 @@ export interface AlbumDetailViewProps {
   albumId: string;
   onBack: () => void;
   onPick: (image: CommunityImageDto) => void;
+  /// "应用全套"：一键把整个图集按各自类别落到本地。父组件已有 handleApplyAlbum 走批量逻辑。
+  onApplyAll: (albumId: string) => Promise<void>;
+  /// 父级有正在跑的批量操作时为 true，用于 disable 按钮
+  busy: boolean;
 }
 
 function formatDate(ts: number): string {
@@ -38,6 +42,8 @@ export function AlbumDetailView({
   albumId,
   onBack,
   onPick,
+  onApplyAll,
+  busy,
 }: AlbumDetailViewProps): JSX.Element {
   const [album, setAlbum] = useState<AlbumDto | null>(null);
   const [images, setImages] = useState<CommunityImageDto[]>([]);
@@ -131,6 +137,16 @@ export function AlbumDetailView({
                   onLike={handleLike}
                   size="md"
                 />
+                {/* 应用全套：一键把整套图按各自类别落到本地 */}
+                <button
+                  type="button"
+                  onClick={() => void onApplyAll(album.id)}
+                  disabled={busy || album.imageCount === 0}
+                  title="把整个图集按各自类别一次性应用到本地"
+                  className="ml-auto rounded-md border border-emerald-400/60 bg-emerald-500 px-3 py-1 text-[11px] font-medium text-white shadow-sm transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {busy ? "应用中…" : `应用全套 (${album.imageCount} 张)`}
+                </button>
               </div>
               <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
                 上传者：{album.uploaderName?.trim() || "匿名"} · 上传时间：

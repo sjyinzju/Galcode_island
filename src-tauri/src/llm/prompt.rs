@@ -72,6 +72,24 @@ pub fn haruhi_system_prompt() -> String {
     compose_system_prompt(None)
 }
 
+/// 欢迎语生成的 system prompt。给定 persona（可为默认凉宫春日，也可由桌宠图自带）
+/// + 输出契约（只输出 1 句开场话，不要 JSON 不要解释）。
+/// 用户称呼由调用方在 user 消息里给。
+pub fn welcome_speech_system_prompt(custom_persona: Option<&str>) -> String {
+    let persona: &str = match custom_persona {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => haruhi_persona_section(),
+    };
+    format!(
+        "{}\n\n【任务】\n给用户生成一句**开场欢迎语**（即用户启动应用时看到的一句话）。要求：\n\
+- 直接输出**1 句中文台词**，不要 JSON 不要解释不要前缀 \"好的\"\n\
+- 字数严格控制在 10–35 字\n\
+- 风格符合上面的人设；可以提及用户称呼，但别每次都用\n\
+- 不要带引号 / Markdown / Emoji 围栏",
+        persona,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

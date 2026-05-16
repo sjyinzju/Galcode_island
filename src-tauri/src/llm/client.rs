@@ -241,6 +241,41 @@ pub fn translate_zh_to_en(cfg: &LlmConfig, text: &str) -> Result<String, String>
     chat_completion(cfg, prompt::translate_zh_to_en_system(), text, Some(false))
 }
 
+/// 生成进入软件时的欢迎语。
+/// persona 非空时整段替换凉宫人设；空时用默认凉宫风。
+/// nickname 是给 LLM 的"用户称呼"，可空（则不提及具体称呼）。
+/// 调用方负责 LLM 配置存在性检查；本函数失败时返回 Err，前端回退到默认 GREETINGS。
+pub fn generate_welcome_speech(
+    cfg: &LlmConfig,
+    persona: Option<&str>,
+    nickname: Option<&str>,
+) -> Result<String, String> {
+    let system = prompt::welcome_speech_system_prompt(persona);
+    let user_msg = match nickname.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => format!("用户称呼：{}\n请给我生成一句开场欢迎语。", n),
+        None => "请给我生成一句开场欢迎语。".to_string(),
+    };
+    // 欢迎语是机械生成，强制关思考避免 reasoning model 跑几十秒
+    let text = chat_completion(cfg, &system, &user_msg, Some(false))?;
+    // 兜底清理：去引号 / 代码围栏；超长截断到 40 字防 LLM 不听话
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim_matches(|c: char| c == '"' || c == '\u{201c}' || c == '\u{201d}' || c == '\u{2018}' || c == '\u{2019}')
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        return Err("LLM 返回空欢迎语".to_string());
+    }
+    let chars: Vec<char> = cleaned.chars().collect();
+    if chars.len() > 40 {
+        let truncated: String = chars.iter().take(40).collect::<String>() + "…";
+        return Ok(truncated);
+    }
+    Ok(cleaned)
+}
+
 pub fn translate_en_to_zh(cfg: &LlmConfig, text: &str) -> Result<String, String> {
     chat_completion(cfg, prompt::translate_en_to_zh_system(), text, Some(false))
 }

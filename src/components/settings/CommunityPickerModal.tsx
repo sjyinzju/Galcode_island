@@ -21,6 +21,7 @@ import {
 } from "../../stores/usePetAssetsStore";
 import {
   fetchCommunityBlob,
+  getAlbum,
   getAlbumsByImage,
   isCommunityEnabled,
   likeAlbum,
@@ -77,6 +78,9 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
   const enabled = isCommunityEnabled();
 
   const saveCommunityImageLocally = usePetAssetsStore((s) => s.saveCommunityImageLocally);
+  const batchAddCommunityImagesLocally = usePetAssetsStore(
+    (s) => s.batchAddCommunityImagesLocally,
+  );
 
   // 切换 mode / sort 时把 page 重置到 1，避免落到不存在的页
   useEffect(() => {
@@ -249,6 +253,73 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
       }
     },
     [patchImageInList],
+  );
+
+  /// "应用全套" —— 一键把图集所有图按各自 category **追加**到本地（不覆盖现有图）。
+  /// 流程：
+  ///   1. getAlbum 拿图集所有图
+  ///   2. 顺序 fetchCommunityBlob 收集 {category, dto, blob}[]
+  ///   3. 单次 batchAddCommunityImagesLocally 原子追加 —— 避免循环 set 时 zustand
+  ///      persist 多次 setItem 导致疑似"覆盖"现象
+  ///   4. 通知 server 计数（per-image fire-and-forget）
+  /// 任一步失败的图 skip 不阻塞其它；toast 显示成功/失败计数。
+  const handleApplyAlbum = useCallback(
+    async (albumId: string): Promise<void> => {
+      setBusy(true);
+      try {
+        setToast("加载图集…");
+        const res = await getAlbum(albumId);
+        const total = res.images.length;
+        if (total === 0) {
+          setToast("该图集是空的，无可应用");
+          return;
+        }
+        // 第 1 阶段：顺序下载 blob（顺序避免一次性挤爆服务器 CDN）
+        const items: Array<{
+          category: PetCategory;
+          dto: CommunityImageDto;
+          blob: Blob;
+        }> = [];
+        let downloadFailed = 0;
+        for (let i = 0; i < total; i += 1) {
+          const img = res.images[i]!;
+          setToast(`下载中 ${i + 1}/${total}…`);
+          try {
+            const blob = await fetchCommunityBlob(img);
+            items.push({ category: img.category, dto: img, blob });
+          } catch {
+            downloadFailed += 1;
+          }
+        }
+        // 第 2 阶段：原子追加（单次 set）
+        setToast(`写入本地…`);
+        const succeeded = await batchAddCommunityImagesLocally(items);
+        // 第 3 阶段：异步通知 server 计数（不阻塞）
+        for (const item of items) {
+          recordImageUse(item.dto.id)
+            .then((r) => {
+              if (!r.counted) return;
+              patchImageInList(item.dto.id, {
+                useCount: r.useCount,
+                popularity: r.useCount + 3 * (item.dto.likes ?? 0),
+              });
+            })
+            .catch(() => {});
+        }
+        if (downloadFailed === 0 && succeeded === total) {
+          setToast(`已追加整套 ${succeeded} 张图到对应类别（原有图保留）`);
+        } else {
+          setToast(`追加 ${succeeded}/${total} 张成功（${downloadFailed} 张下载失败）`);
+        }
+      } catch (err) {
+        const msg =
+          err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
+        setToast(`应用全套失败：${msg}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [batchAddCommunityImagesLocally, patchImageInList],
   );
 
   const handleLikeAlbum = useCallback(
@@ -446,6 +517,8 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
               albumId={view.albumId}
               onBack={() => setView({ kind: "list" })}
               onPick={(img) => setPickedFor(img)}
+              onApplyAll={(albumId) => handleApplyAlbum(albumId)}
+              busy={busy}
             />
           </div>
         ) : (
@@ -481,8 +554,10 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
                 <AlbumCard
                   key={album.id}
                   album={album}
+                  busy={busy}
                   onOpen={() => setView({ kind: "album", albumId: album.id })}
                   onLike={() => handleLikeAlbum(album)}
+                  onApplyAll={() => handleApplyAlbum(album.id)}
                 />
               ))}
             </ul>
@@ -753,12 +828,16 @@ function CommunityCard({
 
 function AlbumCard({
   album,
+  busy,
   onOpen,
   onLike,
+  onApplyAll,
 }: {
   album: AlbumDto;
+  busy: boolean;
   onOpen: () => void;
   onLike: () => Promise<void>;
+  onApplyAll: () => Promise<void>;
 }): JSX.Element {
   // 卡片高度统一策略：
   //   - <li> + 内卡 div 加 h-full：让 grid 同 row stretch 把高度传到内部
@@ -809,15 +888,29 @@ function AlbumCard({
           >
             {descText || "（无描述）"}
           </div>
-          <div className="mt-auto flex items-center gap-2">
-            <LikeButton likes={album.likes} dailyRemaining={null} onLike={onLike} />
-            <button
-              type="button"
-              onClick={onOpen}
-              className="ml-auto rounded-md border border-fuchsia-400/50 bg-fuchsia-500/10 px-2 py-0.5 text-[10px] text-fuchsia-700 hover:bg-fuchsia-500/20 dark:border-fuchsia-300/40 dark:text-fuchsia-300"
-            >
-              进入图集
-            </button>
+          {/* 底部两行布局：上行 点赞（左对齐）；下行 应用全套 + 进入图集 并排等宽对称 */}
+          <div className="mt-auto flex flex-col gap-1.5">
+            <div>
+              <LikeButton likes={album.likes} dailyRemaining={null} onLike={onLike} />
+            </div>
+            <div className="flex gap-1.5">
+              <button
+                type="button"
+                onClick={() => void onApplyAll()}
+                disabled={busy}
+                title="一键把整套图按各自类别应用到本地"
+                className="flex-1 rounded-md border border-emerald-400/60 bg-emerald-500/10 px-2 py-1 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-300/40 dark:text-emerald-300"
+              >
+                应用全套
+              </button>
+              <button
+                type="button"
+                onClick={onOpen}
+                className="flex-1 rounded-md border border-fuchsia-400/50 bg-fuchsia-500/10 px-2 py-1 text-[10px] font-medium text-fuchsia-700 hover:bg-fuchsia-500/20 dark:border-fuchsia-300/40 dark:text-fuchsia-300"
+              >
+                进入图集
+              </button>
+            </div>
           </div>
         </div>
       </div>

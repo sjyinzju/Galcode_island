@@ -640,6 +640,18 @@ pub fn translate_only(text_zh: String) -> Result<String, String> {
     crate::llm::translate_zh_to_en(&cfg, &text_zh)
 }
 
+/// 用 LLM 实时生成"进入软件时的欢迎语"。
+/// 前端在 welcome 状态时检查当前 welcome 类图是否带 prompt，有则调本命令生成。
+/// 未配 LLM_API_KEY / 任何错误：返回 Err 让前端回退到内置 GREETINGS。
+#[tauri::command]
+pub fn generate_welcome_speech(
+    persona: Option<String>,
+    nickname: Option<String>,
+) -> Result<String, String> {
+    let cfg = crate::llm::load_llm_config().ok_or_else(|| "未配置 LLM_API_KEY".to_string())?;
+    crate::llm::generate_welcome_speech(&cfg, persona.as_deref(), nickname.as_deref())
+}
+
 #[tauri::command]
 pub fn update_llm_settings(
     base_url: String,

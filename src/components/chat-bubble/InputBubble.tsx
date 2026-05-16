@@ -11,7 +11,8 @@ import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { PetCharacter } from "../pet-character/PetCharacter";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
-import { getActivePromptOverride } from "../../lib/petPromptOverride";
+import { selectPromptOverride } from "../../lib/petPromptOverride";
+import { usePetAssetsStore } from "../../stores/usePetAssetsStore";
 
 const GREETINGS = [
   "喂，[称呼]，发什么呆呢？今天的部团活动要开始咯，有什么有趣的企划快交上来看看。",
@@ -20,6 +21,10 @@ const GREETINGS = [
   "既然来了，就一起来找点乐子吧。有什么代码或者麻烦的任务需要我出马吗？",
   "[称呼]，今天有没有带来能让我眼前一亮的需求？普通的任务我可是会打哈欠的哦。",
 ];
+
+/// 进程内缓存：同 (persona, nickname) 一次会话内只调一次 LLM 生成欢迎语，
+/// 避免反复"idle → 重新生成"耗 token。重启进程清空。
+const welcomeSpeechCache = new Map<string, string>();
 
 export function InputBubble(): JSX.Element {
   const nickname = useProfileStore((s) => s.nickname);
@@ -75,11 +80,57 @@ export function InputBubble(): JSX.Element {
   }, [inputFocusRequest]);
 
   useEffect(() => {
-    if (agentStatus === "idle") {
+    if (agentStatus !== "idle") return;
+    // 优先策略：若启用了自定义桌宠且 welcome 类有任意一张图带 communityPrompt，
+    // 调 LLM 用该 prompt 当人设生成一句开场欢迎语；失败 / 无 prompt → 回退默认 GREETINGS。
+    let cancelled = false;
+    const fallback = (): void => {
       const g = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
-      setGreeting(g.replace(/\[称呼\]/g, displayNickname));
+      setGreeting(g!.replace(/\[称呼\]/g, displayNickname));
       setDisplayedGreeting("");
-    }
+    };
+    const tryCustom = async (): Promise<void> => {
+      const petState = usePetAssetsStore.getState();
+      if (!petState.enabled) return fallback();
+      const welcomeList = petState.assets.welcome ?? [];
+      // 找一张有非空 prompt 的（任意一张即可，random pick 让多张时风格也多样）
+      const withPrompt = welcomeList.filter((m) => m.communityPrompt?.trim());
+      if (withPrompt.length === 0) return fallback();
+      const picked = withPrompt[Math.floor(Math.random() * withPrompt.length)]!;
+      const persona = picked.communityPrompt!.trim();
+      // 缓存：同 persona 一次会话内只调一次 LLM（避免反复"idle → 重新生成"耗 token）
+      const cacheKey = `welcome:${persona}:${displayNickname}`;
+      const cached = welcomeSpeechCache.get(cacheKey);
+      if (cached) {
+        if (!cancelled) {
+          setGreeting(cached);
+          setDisplayedGreeting("");
+        }
+        return;
+      }
+      try {
+        const speech = await invoke<string>("generate_welcome_speech", {
+          persona,
+          nickname: displayNickname,
+        });
+        if (cancelled) return;
+        const final = speech.trim() || "";
+        if (final) {
+          welcomeSpeechCache.set(cacheKey, final);
+          setGreeting(final);
+          setDisplayedGreeting("");
+        } else {
+          fallback();
+        }
+      } catch {
+        // LLM 未配置 / 失败 → fallback
+        if (!cancelled) fallback();
+      }
+    };
+    void tryCustom();
+    return () => {
+      cancelled = true;
+    };
   }, [agentStatus, displayNickname]);
 
   useEffect(() => {
@@ -140,7 +191,15 @@ export function InputBubble(): JSX.Element {
         sessionId: resumeHint,
         // 仅 claude-code 后端读取；codex/opencode 在 Rust 侧忽略
         permissionMode: tab.agent === "claude-code" ? tab.permissionMode : null,
-        promptOverride: getActivePromptOverride(),
+        promptOverride: (() => {
+          const sel = selectPromptOverride();
+          if (sel) {
+            console.log(
+              `[community-prompt] tab=${activeTabId.slice(0, 8)} use prompt from "${sel.sourceFileName}" (id=${sel.sourceImageId.slice(0, 8)}) preview="${(sel.prompt ?? "<no prompt – default 凉宫>").slice(0, 60)}"`,
+            );
+          }
+          return sel?.prompt ?? null;
+        })(),
       });
       if (res?.sessionId) {
         update({ sessionId: res.sessionId });

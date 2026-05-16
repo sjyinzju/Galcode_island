@@ -141,6 +141,13 @@ interface PetAssetsState {
     dto: CommunityImageDto,
     blob: Blob,
   ) => Promise<PetAssetMeta>;
+  /// "应用全套"专用：一次性把多张图原子追加进 assets。
+  /// 避免循环调 saveCommunityImageLocally 时多次 set 触发 zustand persist 串入串出，
+  /// 也避免用户感知到"覆盖"假象（同一 tick 内只渲染一次最终状态）。
+  /// 内部不抛错；失败的图会从输入里 skip 掉，返回成功 count。
+  batchAddCommunityImagesLocally: (
+    items: ReadonlyArray<{ category: PetCategory; dto: CommunityImageDto; blob: Blob }>,
+  ) => Promise<number>;
   /// 删除一张图片：从 IDB 删 blob + revoke URL + 在 store 移除元数据。
   /// 删完最后一张会自动关闭 enabled。
   removeAsset: (category: PetCategory, id: string) => Promise<void>;
@@ -277,6 +284,60 @@ export const usePetAssetsStore = create<PetAssetsState>()(
         }));
 
         return { uploadedToCommunity, communityImageId, uploadError };
+      },
+
+      batchAddCommunityImagesLocally: async (items) => {
+        // 先并行把 blob 全部落 IDB 拿到 ObjectURL（IDB 写入是真异步），然后一次 set 追加
+        const tuples: Array<{
+          category: PetCategory;
+          meta: PetAssetMeta;
+          id: string;
+          url: string | null;
+        }> = [];
+        for (const item of items) {
+          try {
+            const id = generateId();
+            await putAssetBlob(id, item.blob);
+            const url = await getAssetUrl(id);
+            const meta: PetAssetMeta = {
+              id,
+              fileName: `${item.dto.id}.${item.dto.mime.split("/")[1] ?? "img"}`,
+              mime: item.dto.mime,
+              sizeBytes: item.dto.sizeBytes,
+              addedAt: Date.now(),
+              source: "community",
+              communityImageId: item.dto.id,
+              communityPrompt:
+                item.dto.prompt && item.dto.prompt.trim()
+                  ? item.dto.prompt.trim()
+                  : null,
+            };
+            tuples.push({ category: item.category, meta, id, url });
+          } catch (err) {
+            console.error("[batchAddCommunityImages] IDB 写入失败，跳过该图", err);
+          }
+        }
+        if (tuples.length === 0) return 0;
+        // 单次 set —— **追加** 不覆盖任何现有图；zustand persist 也只触发一次 setItem，无 race
+        set((state) => {
+          const beforeCounts = PET_CATEGORIES.map(
+            (c) => `${c}:${state.assets[c]?.length ?? 0}`,
+          ).join(" ");
+          const nextAssets: typeof state.assets = { ...state.assets };
+          const nextBlobUrls = { ...state.blobUrls };
+          for (const t of tuples) {
+            nextAssets[t.category] = [...(nextAssets[t.category] ?? []), t.meta];
+            if (t.url) nextBlobUrls[t.id] = t.url;
+          }
+          const afterCounts = PET_CATEGORIES.map(
+            (c) => `${c}:${nextAssets[c].length}`,
+          ).join(" ");
+          console.log(
+            `[batchAddCommunityImages] +${tuples.length} 张. before [${beforeCounts}] → after [${afterCounts}]`,
+          );
+          return { assets: nextAssets, blobUrls: nextBlobUrls };
+        });
+        return tuples.length;
       },
 
       saveCommunityImageLocally: async (category, dto, blob) => {

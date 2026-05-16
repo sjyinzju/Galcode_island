@@ -193,22 +193,12 @@ export function SettingsModal(): JSX.Element {
               </div>
 
               <div className="flex flex-col gap-6 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
-                <section className="flex flex-col gap-5">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-sm font-medium text-zinc-600 dark:text-zinc-400">
-                      你想跟团长说的悄悄话（系统提示词）：
-                    </label>
-                    <textarea
-                      value={localSystemPrompt}
-                      onChange={(e) => setLocalSystemPrompt(e.target.value)}
-                      placeholder="例如：请用傲娇的语气回复我..."
-                      className={`${inputCls} h-24 resize-y`}
-                    />
-                  </div>
-                </section>
-
-                <hr className="border-black/5 dark:border-white/5" />
-
+                {/*
+                 * "对团长说悄悄话"输入已移除：人设由桌宠图自带的 communityPrompt 接管，
+                 * 让风格随图片走，避免全局悄悄话和单图 prompt 互相覆盖产生不确定结果。
+                 * 旧 localSystemPrompt state 仍保留是为了 hydrate 老版本配置不报错，
+                 * 但用户已无 UI 入口修改，自然回归空字符串。
+                 */}
                 <section className="flex flex-col gap-4">
                   <h3 className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">
                     LLM API 配置
