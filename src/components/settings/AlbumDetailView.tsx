@@ -9,13 +9,14 @@
 // 数据：mount 时调 getAlbum(albumId)。loading / error / empty 三态。
 
 import { useEffect, useState } from "react";
-import { getAlbum } from "../../lib/communityClient";
+import { getAlbum, likeAlbum } from "../../lib/communityClient";
 import {
   CommunityError,
   type AlbumDto,
   type CommunityImageDto,
 } from "../../types/community";
 import { PET_CATEGORY_LABEL } from "../../stores/usePetAssetsStore";
+import { LikeButton } from "./community/LikeButton";
 
 export interface AlbumDetailViewProps {
   albumId: string;
@@ -42,6 +43,34 @@ export function AlbumDetailView({
   const [images, setImages] = useState<CommunityImageDto[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>("");
+  const [dailyRemaining, setDailyRemaining] = useState<number | null>(null);
+  const [toast, setToast] = useState<string>("");
+
+  const handleLike = async (): Promise<void> => {
+    if (!album) return;
+    try {
+      const res = await likeAlbum(album.id);
+      setAlbum((prev) =>
+        prev ? { ...prev, likes: res.likes, popularity: 3 * res.likes } : prev,
+      );
+      setDailyRemaining(res.dailyRemaining);
+    } catch (err) {
+      if (err instanceof CommunityError && err.code === "daily_limit") {
+        setDailyRemaining(0);
+        setToast("今日点赞配额已用完");
+      } else {
+        const msg =
+          err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
+        setToast(`点赞失败：${msg}`);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = window.setTimeout(() => setToast(""), 2500);
+    return () => window.clearTimeout(t);
+  }, [toast]);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,6 +124,13 @@ export function AlbumDetailView({
                 <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-700 dark:text-emerald-300">
                   {album.imageCount} 张
                 </span>
+                {/* 图集本身的点赞按钮 */}
+                <LikeButton
+                  likes={album.likes}
+                  dailyRemaining={dailyRemaining}
+                  onLike={handleLike}
+                  size="md"
+                />
               </div>
               <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
                 上传者：{album.uploaderName?.trim() || "匿名"} · 上传时间：
@@ -109,6 +145,12 @@ export function AlbumDetailView({
           ) : null}
         </div>
       </header>
+
+      {toast ? (
+        <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full bg-black/80 px-4 py-1.5 text-[11px] text-white shadow-lg backdrop-blur-sm">
+          {toast}
+        </div>
+      ) : null}
 
       {/* 主区 */}
       <div className="flex-1 overflow-y-auto px-5 py-4">

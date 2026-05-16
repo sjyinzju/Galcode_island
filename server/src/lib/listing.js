@@ -1,20 +1,106 @@
-// 列表组装逻辑（Top10 + 时间倒序游标分页）。抽出来便于测试。
+// 列表组装逻辑。
 //
-// 入参用 db handle + category + cursor + pageSize；
-// 输出 { items, nextCursor, topHotIds }。
+// 现有两套：
+//   1) listImagesPaged({category, sort, page, pageSize}) — 新分页 + 排序（图片维度）
+//   2) listImages({category, rawCursor, pageSize, excludeIds}) — 旧 Top10 + cursor 翻页
+//      保留兼容老 endpoint / 测试；新前端不再用。
 //
-// 设计要点：
-//   - 首页（cursor 空）：先查 Top10 by (use_count DESC, created_at DESC)，再查 pageSize 条
-//     按 created_at DESC，排除前面 Top10 的 id。前端拼接展示。
-//   - 翻页（cursor 非空）：纯按 created_at DESC 翻页，但仍把 Top10 的 id 排除（这些已经在
-//     首页展示过，避免重复）。Top10 集合用首次返回的 topHotIds 还原。
-//     -> 前端要把首次拿到的 topHotIds 缓存住，每次翻页带回（query: ?exclude=id1,id2...）
-//        这样后端无状态。
-//   - status='approved' 严格过滤；hidden_by_owner / hidden_by_admin / rejected / pending_ai 都不出现。
-//   - 热度并列时（use_count 相同）按 created_at DESC 兜底；时间并列时按 id DESC 兜底，保证排序稳定。
+// listAlbumsPaged 同形 —— 给图集维度列表用。
+//
+// status='approved'（image） / 'active'（album） 严格过滤；hidden / rejected / pending_ai 都不出现。
+// 排序稳定：人气并列 → created_at DESC 兜底；时间并列 → id DESC 兜底。
 
 import { STATUS, config } from "../config.js";
 import { decodeCursor, encodeCursor } from "./cursor.js";
+
+const ALBUM_ACTIVE = "active";
+
+const IMAGE_SORTS = {
+  popular: "popularity DESC, created_at DESC, id DESC",
+  time: "created_at DESC, id DESC",
+};
+
+const ALBUM_SORTS = {
+  popular: "popularity DESC, created_at DESC, id DESC",
+  time: "created_at DESC, id DESC",
+};
+
+function clampPage(raw) {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return n;
+}
+function clampPageSize(raw) {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return config.defaultPageSize;
+  return Math.min(n, config.maxPageSize);
+}
+
+/// 图片维度分页 + 排序。
+/// 返回 { items, page, pageSize, total, totalPages, sort }。
+export function listImagesPaged(
+  db,
+  { category, sort = "popular", rawPage, rawPageSize },
+) {
+  const orderBy = IMAGE_SORTS[sort] ?? IMAGE_SORTS.popular;
+  const page = clampPage(rawPage);
+  const pageSize = clampPageSize(rawPageSize);
+  const offset = (page - 1) * pageSize;
+  // total
+  const total = db
+    .prepare(
+      "SELECT COUNT(*) AS c FROM images WHERE category = ? AND status = ?",
+    )
+    .get(category, STATUS.APPROVED).c;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const items = db
+    .prepare(
+      `SELECT id, device_id, category, file_hash, file_ext, mime, size_bytes,
+              width, height, prompt, uploader_name, status, use_count, likes, popularity,
+              created_at, updated_at
+       FROM images
+       WHERE category = ? AND status = ?
+       ORDER BY ${orderBy}
+       LIMIT ? OFFSET ?`,
+    )
+    .all(category, STATUS.APPROVED, pageSize, offset);
+  return { items, page, pageSize, total, totalPages, sort: sort in IMAGE_SORTS ? sort : "popular" };
+}
+
+/// 图集维度分页 + 排序。
+/// 返回 { items, page, pageSize, total, totalPages, sort }。
+/// 每个 album 附带 imageCount。
+export function listAlbumsPaged(
+  db,
+  { sort = "popular", rawPage, rawPageSize },
+) {
+  const orderBy = ALBUM_SORTS[sort] ?? ALBUM_SORTS.popular;
+  const page = clampPage(rawPage);
+  const pageSize = clampPageSize(rawPageSize);
+  const offset = (page - 1) * pageSize;
+  const total = db
+    .prepare("SELECT COUNT(*) AS c FROM albums WHERE status = ?")
+    .get(ALBUM_ACTIVE).c;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const items = db
+    .prepare(
+      `SELECT a.*,
+              (SELECT COUNT(*) FROM album_images WHERE album_id = a.id) AS image_count
+       FROM albums a
+       WHERE a.status = ?
+       ORDER BY ${orderBy}
+       LIMIT ? OFFSET ?`,
+    )
+    .all(ALBUM_ACTIVE, pageSize, offset);
+  return {
+    items,
+    page,
+    pageSize,
+    total,
+    totalPages,
+    sort: sort in ALBUM_SORTS ? sort : "popular",
+  };
+}
 
 export function fetchTopHot(db, category) {
   const stmt = db.prepare(`

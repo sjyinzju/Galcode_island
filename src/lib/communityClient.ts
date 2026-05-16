@@ -30,6 +30,10 @@ import {
   type CommunityUseResult,
   type CreateAlbumInput,
   type CreateAlbumResult,
+  type LikeResult,
+  type PagedAlbumsResponse,
+  type PagedImagesResponse,
+  type SortMode,
 } from "../types/community";
 import type { PetCategory } from "../stores/usePetAssetsStore";
 
@@ -284,6 +288,58 @@ export async function listImages(
         ? params.excludeIds.join(",")
         : undefined,
     },
+  });
+}
+
+/// 新版分页排序图片列表（替代 listImages 的 Top10 + cursor 形态）。
+/// page 默认 1；pageSize 默认 server 配置；sort 默认 'popular'。
+export async function listImagesPaged(params: {
+  category: PetCategory;
+  sort?: SortMode;
+  page?: number;
+  pageSize?: number;
+}): Promise<PagedImagesResponse> {
+  return callJson<PagedImagesResponse>("/api/images", {
+    method: "GET",
+    query: {
+      category: params.category,
+      sort: params.sort ?? "popular",
+      page: params.page ? String(params.page) : undefined,
+      pageSize: params.pageSize ? String(params.pageSize) : undefined,
+    },
+  });
+}
+
+/// 图集维度的分页列表（新端点）。
+export async function listAlbumsPaged(params: {
+  sort?: SortMode;
+  page?: number;
+  pageSize?: number;
+}): Promise<PagedAlbumsResponse> {
+  return callJson<PagedAlbumsResponse>("/api/albums", {
+    method: "GET",
+    query: {
+      sort: params.sort ?? "popular",
+      page: params.page ? String(params.page) : undefined,
+      pageSize: params.pageSize ? String(params.pageSize) : undefined,
+    },
+  });
+}
+
+/// 对单张图 +1 点赞。返回当前 likes 总数 + 当日剩余配额。
+/// 配额耗尽时 server 返 429，客户端在调用方需要 catch CommunityError(code='daily_limit')。
+export async function likeImage(imageId: string): Promise<LikeResult> {
+  return callJson<LikeResult>(`/api/images/${encodeURIComponent(imageId)}/like`, {
+    method: "POST",
+    body: { deviceId: getDeviceId() },
+  });
+}
+
+/// 对单个图集 +1 点赞。
+export async function likeAlbum(albumId: string): Promise<LikeResult> {
+  return callJson<LikeResult>(`/api/albums/${encodeURIComponent(albumId)}/like`, {
+    method: "POST",
+    body: { deviceId: getDeviceId() },
   });
 }
 

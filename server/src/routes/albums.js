@@ -20,10 +20,17 @@ import { newId } from "../lib/ids.js";
 import {
   albumToDto,
   fetchAlbumIdsForImages,
+  fetchCoverUrls,
   imageToDto,
 } from "../lib/serialize.js";
 import { inferBaseUrl } from "../lib/baseUrl.js";
 import { rateLimitRead, rateLimitWrite } from "../lib/rateLimit.js";
+import {
+  DAILY_LIKE_LIMIT,
+  computeAlbumPopularity,
+  utcDateStr,
+} from "../lib/popularity.js";
+import { listAlbumsPaged } from "../lib/listing.js";
 
 const ALBUM_STATUS = {
   ACTIVE: "active",
@@ -105,6 +112,40 @@ function loadImagesByIds(db, imageIds) {
 
 export function createAlbumsRouter() {
   const router = express.Router();
+
+  // -------------------------------------------------------------------------
+  // GET /api/albums?sort=popular|time&page=N&pageSize=  图集维度列表（带分页 + 排序）
+  // 返回 { items, page, pageSize, total, totalPages, sort }
+  // 每个 album 携带 coverUrl（第一张图的 url）+ likes + popularity + imageCount
+  // -------------------------------------------------------------------------
+  router.get("/", rateLimitRead, (req, res, next) => {
+    try {
+      const sort = req.query.sort === "time" ? "time" : "popular";
+      const db = getDb();
+      const result = listAlbumsPaged(db, {
+        sort,
+        rawPage: req.query.page,
+        rawPageSize: req.query.pageSize,
+      });
+      const baseUrl = inferBaseUrl(req);
+      const coverMap = fetchCoverUrls(db, result.items.map((r) => r.id), baseUrl);
+      res.json({
+        items: result.items.map((r) =>
+          albumToDto(r, {
+            imageCount: r.image_count,
+            coverUrl: coverMap.get(r.id) ?? null,
+          }),
+        ),
+        page: result.page,
+        pageSize: result.pageSize,
+        total: result.total,
+        totalPages: result.totalPages,
+        sort: result.sort,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   // -------------------------------------------------------------------------
   // POST /api/albums   {name, description?, imageIds[], uploaderName?, deviceId?}
@@ -249,6 +290,69 @@ export function createAlbumsRouter() {
       next(err);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // POST /api/albums/:id/like  点赞（每设备每图集每天最多 DAILY_LIKE_LIMIT 次）
+  // 行为与 images/:id/like 一致；album popularity = 3 * likes
+  // -------------------------------------------------------------------------
+  router.post(
+    "/:id/like",
+    (req, _res, next) => {
+      req.deviceId = req.body?.deviceId ?? req.headers["x-device-id"]?.toString();
+      next();
+    },
+    rateLimitWrite,
+    express.json(),
+    (req, res, next) => {
+      try {
+        const deviceId = validateDeviceId(req.body?.deviceId);
+        const { id } = req.params;
+        const db = getDb();
+        const album = db
+          .prepare("SELECT id, likes, status FROM albums WHERE id = ?")
+          .get(id);
+        if (!album || album.status !== ALBUM_STATUS.ACTIVE) {
+          res.status(404).json({ error: "not_found" });
+          return;
+        }
+        const dateStr = utcDateStr();
+        let dailyRemaining = -1;
+        let newLikes = album.likes;
+        const tx = db.transaction(() => {
+          const quota = db
+            .prepare(
+              "SELECT consumed_count FROM daily_like_quota WHERE target_type='album' AND target_id=? AND device_id=? AND date_str=?",
+            )
+            .get(id, deviceId, dateStr);
+          const consumed = quota?.consumed_count ?? 0;
+          if (consumed >= DAILY_LIKE_LIMIT) {
+            dailyRemaining = 0;
+            return;
+          }
+          db.prepare(
+            `INSERT INTO daily_like_quota (target_type, target_id, device_id, date_str, consumed_count, updated_at)
+             VALUES ('album', ?, ?, ?, 1, ?)
+             ON CONFLICT(target_type, target_id, device_id, date_str)
+             DO UPDATE SET consumed_count = consumed_count + 1, updated_at = excluded.updated_at`,
+          ).run(id, deviceId, dateStr, Date.now());
+          newLikes = album.likes + 1;
+          const newPop = computeAlbumPopularity(newLikes);
+          db.prepare(
+            "UPDATE albums SET likes = ?, popularity = ?, updated_at = ? WHERE id = ?",
+          ).run(newLikes, newPop, Date.now(), id);
+          dailyRemaining = DAILY_LIKE_LIMIT - (consumed + 1);
+        });
+        tx();
+        if (dailyRemaining === 0 && newLikes === album.likes) {
+          res.status(429).json({ error: "daily_limit", dailyRemaining: 0 });
+          return;
+        }
+        res.json({ likes: newLikes, dailyRemaining });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 
   // -------------------------------------------------------------------------
   // PATCH /api/albums/:id/visibility  上传者自助隐藏 / 恢复

@@ -23,6 +23,10 @@ export interface CommunityImageDto {
   uploaderName: string | null;
   status: CommunityImageStatus;
   useCount: number;
+  /// 总点赞数（所有 device 累计）
+  likes: number;
+  /// 人气值（= useCount + 3*likes，物化在 server）
+  popularity: number;
   createdAt: number;
   updatedAt: number;
   url: string;
@@ -41,6 +45,11 @@ export interface AlbumDto {
   uploaderName: string | null;
   status: AlbumStatus;
   imageCount: number;
+  likes: number;
+  popularity: number;
+  /// 图集封面 url（第一张图的 url）。从 /api/albums 列表返回时填；
+  /// /api/albums/:id 详情可能为 null（图列表已含完整图，无需再返封面）。
+  coverUrl: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -64,6 +73,35 @@ export interface CreateAlbumInput {
   imageIds: string[];
   uploaderName?: string | null;
 }
+
+/// 新版分页排序的图片列表响应（/api/images?sort=&page=&pageSize=）
+export interface PagedImagesResponse {
+  items: CommunityImageDto[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  sort: "popular" | "time";
+}
+
+/// 图集维度的分页列表响应（/api/albums?sort=&page=&pageSize=）
+export interface PagedAlbumsResponse {
+  items: AlbumDto[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  sort: "popular" | "time";
+}
+
+/// 点赞操作的响应。dailyRemaining = 当日该目标的剩余可点次数（[0,10]）。
+export interface LikeResult {
+  likes: number;
+  dailyRemaining: number;
+}
+
+export type SortMode = "popular" | "time";
+export type ViewDimension = "images" | "albums";
 
 /// GET /api/images 返回。
 /// - 首页 cursor=空：topHot 最多 10 条 + timeline 一页；nextCursor 非空则可继续翻

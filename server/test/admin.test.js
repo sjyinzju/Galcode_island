@@ -179,7 +179,7 @@ describe("上下架", () => {
     // 公开 list 应该能看到
     const r2 = await fetch(`${baseUrl}/api/images?category=thinking`);
     const body = await r2.json();
-    expect(body.topHot.map((i) => i.id)).toContain("x");
+    expect(body.items.map((i) => i.id)).toContain("x");
   });
 
   it("PATCH hidden_by_admin → 公开列表消失", async () => {
@@ -192,7 +192,7 @@ describe("上下架", () => {
     });
     const r2 = await fetch(`${baseUrl}/api/images?category=thinking`);
     const body = await r2.json();
-    expect(body.topHot.map((i) => i.id)).not.toContain("y");
+    expect(body.items.map((i) => i.id)).not.toContain("y");
   });
 
   it("PATCH 非法 status → 400", async () => {

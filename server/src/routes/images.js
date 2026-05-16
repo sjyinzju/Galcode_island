@@ -20,8 +20,13 @@ import {
 } from "../lib/validate.js";
 import { newId } from "../lib/ids.js";
 import { sha256File } from "../lib/hash.js";
-import { listImages } from "../lib/listing.js";
+import { listImages, listImagesPaged } from "../lib/listing.js";
 import { imageToDto, fetchAlbumIdsForImages } from "../lib/serialize.js";
+import {
+  DAILY_LIKE_LIMIT,
+  computeImagePopularity,
+  utcDateStr,
+} from "../lib/popularity.js";
 import { inferBaseUrl } from "../lib/baseUrl.js";
 import { moderateImage } from "../lib/moderation/index.js";
 import { rateLimitRead, rateLimitWrite } from "../lib/rateLimit.js";
@@ -201,37 +206,70 @@ export function createImagesRouter() {
   );
 
   // -------------------------------------------------------------------------
-  // GET /api/images?category=&cursor=&pageSize=&exclude=id1,id2
+  // GET /api/images?category=&sort=popular|time&page=N&pageSize=
+  //   新形态：分页 + 排序。返回 { items, page, pageSize, total, totalPages, sort }
+  //
+  // 兼容老调用：检测到 ?cursor= 或 ?exclude= 时走旧 Top10 + cursor 接口（一段过渡期）。
+  // 新前端发 ?sort= 或 ?page=（无 cursor/exclude）→ 走新分页接口。
   // -------------------------------------------------------------------------
   router.get("/", rateLimitRead, (req, res, next) => {
     try {
       const category = validateCategory(req.query.category);
-      const pageSize = clampPageSize(req.query.pageSize);
-      const rawCursor = typeof req.query.cursor === "string" ? req.query.cursor : "";
-      const excludeRaw = typeof req.query.exclude === "string" ? req.query.exclude : "";
-      const excludeIds = excludeRaw
-        ? excludeRaw.split(",").map((s) => s.trim()).filter(Boolean)
-        : [];
+      const useLegacy =
+        typeof req.query.cursor === "string" ||
+        typeof req.query.exclude === "string";
 
-      const result = listImages(getDb(), {
+      if (useLegacy) {
+        const pageSize = clampPageSize(req.query.pageSize);
+        const rawCursor = typeof req.query.cursor === "string" ? req.query.cursor : "";
+        const excludeRaw = typeof req.query.exclude === "string" ? req.query.exclude : "";
+        const excludeIds = excludeRaw
+          ? excludeRaw.split(",").map((s) => s.trim()).filter(Boolean)
+          : [];
+        const result = listImages(getDb(), {
+          category,
+          rawCursor,
+          pageSize,
+          excludeIds,
+        });
+        const baseUrl = inferBaseUrl(req);
+        const allRows = [...result.topHot, ...result.timeline];
+        const albumIdsMap = fetchAlbumIdsForImages(getDb(), allRows.map((r) => r.id));
+        const toDto = (r) =>
+          imageToDto(r, { baseUrl, albumIds: albumIdsMap.get(r.id) ?? [] });
+        res.json({
+          topHot: result.topHot.map(toDto),
+          timeline: result.timeline.map(toDto),
+          nextCursor: result.nextCursor,
+          topHotIds: result.topHotIds,
+        });
+        return;
+      }
+
+      // 新分页路径
+      const sort = req.query.sort === "time" ? "time" : "popular";
+      const result = listImagesPaged(getDb(), {
         category,
-        rawCursor,
-        pageSize,
-        excludeIds,
+        sort,
+        rawPage: req.query.page,
+        rawPageSize: req.query.pageSize,
       });
-
       const baseUrl = inferBaseUrl(req);
-      // 一次性反向查所有图的所属图集，避免 N+1
-      const allRows = [...result.topHot, ...result.timeline];
-      const albumIdsMap = fetchAlbumIdsForImages(getDb(), allRows.map((r) => r.id));
-      const toDto = (r) =>
-        imageToDto(r, { baseUrl, albumIds: albumIdsMap.get(r.id) ?? [] });
+      const albumIdsMap = fetchAlbumIdsForImages(
+        getDb(),
+        result.items.map((r) => r.id),
+      );
       res.json({
-        topHot: result.topHot.map(toDto),
-        timeline: result.timeline.map(toDto),
-        nextCursor: result.nextCursor,
-        topHotIds: result.topHotIds,
+        items: result.items.map((r) =>
+          imageToDto(r, { baseUrl, albumIds: albumIdsMap.get(r.id) ?? [] }),
+        ),
+        page: result.page,
+        pageSize: result.pageSize,
+        total: result.total,
+        totalPages: result.totalPages,
+        sort: result.sort,
       });
+      return;
     } catch (err) {
       next(err);
     }
@@ -265,12 +303,96 @@ export function createImagesRouter() {
           .run(id, deviceId, Date.now());
         let useCount = row.use_count;
         if (insert.changes === 1) {
+          // 同步更新 popularity（= use_count + 3*likes）—— 读 likes 一次保持原子
+          const cur = db
+            .prepare("SELECT use_count, likes FROM images WHERE id = ?")
+            .get(id);
+          const newPop = computeImagePopularity(cur.use_count + 1, cur.likes);
           db.prepare(
-            "UPDATE images SET use_count = use_count + 1, updated_at = ? WHERE id = ?",
-          ).run(Date.now(), id);
+            "UPDATE images SET use_count = use_count + 1, popularity = ?, updated_at = ? WHERE id = ?",
+          ).run(newPop, Date.now(), id);
           useCount += 1;
         }
         res.json({ useCount, counted: insert.changes === 1 });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /api/images/:id/like  点赞（每设备每图每天最多 DAILY_LIKE_LIMIT=10 次）
+  // body: { deviceId }
+  // 响应：
+  //   200 { likes, dailyRemaining }      —— 加成功
+  //   429 { error: 'daily_limit', dailyRemaining: 0 }  —— 当日额度已满
+  //   404 { error: 'not_found' }         —— 图不存在 / 已 hidden
+  // -------------------------------------------------------------------------
+  router.post(
+    "/:id/like",
+    (req, _res, next) => {
+      req.deviceId = req.body?.deviceId ?? req.headers["x-device-id"]?.toString();
+      next();
+    },
+    rateLimitWrite,
+    express.json(),
+    (req, res, next) => {
+      try {
+        const deviceId = validateDeviceId(req.body?.deviceId);
+        const { id } = req.params;
+        const db = getDb();
+        const img = db
+          .prepare("SELECT id, use_count, likes, status FROM images WHERE id = ?")
+          .get(id);
+        if (!img) {
+          res.status(404).json({ error: "not_found" });
+          return;
+        }
+        // 已被隐藏 / 拒绝的图不允许再点赞（避免点赞数被脏数据继续推高）
+        if (img.status !== STATUS.APPROVED) {
+          res.status(404).json({ error: "not_found" });
+          return;
+        }
+
+        const dateStr = utcDateStr();
+        // 用事务保证 quota 和 likes 一起更新
+        let dailyRemaining = -1;
+        let newLikes = img.likes;
+        const tx = db.transaction(() => {
+          // 当前 quota
+          const quota = db
+            .prepare(
+              "SELECT consumed_count FROM daily_like_quota WHERE target_type='image' AND target_id=? AND device_id=? AND date_str=?",
+            )
+            .get(id, deviceId, dateStr);
+          const consumed = quota?.consumed_count ?? 0;
+          if (consumed >= DAILY_LIKE_LIMIT) {
+            dailyRemaining = 0;
+            return; // 不更新，外层根据 dailyRemaining 决定 429
+          }
+          // upsert quota +1
+          db.prepare(
+            `INSERT INTO daily_like_quota (target_type, target_id, device_id, date_str, consumed_count, updated_at)
+             VALUES ('image', ?, ?, ?, 1, ?)
+             ON CONFLICT(target_type, target_id, device_id, date_str)
+             DO UPDATE SET consumed_count = consumed_count + 1, updated_at = excluded.updated_at`,
+          ).run(id, deviceId, dateStr, Date.now());
+          // 更新 likes + popularity
+          newLikes = img.likes + 1;
+          const newPop = computeImagePopularity(img.use_count, newLikes);
+          db.prepare(
+            "UPDATE images SET likes = ?, popularity = ?, updated_at = ? WHERE id = ?",
+          ).run(newLikes, newPop, Date.now(), id);
+          dailyRemaining = DAILY_LIKE_LIMIT - (consumed + 1);
+        });
+        tx();
+
+        if (dailyRemaining === 0 && newLikes === img.likes) {
+          // 进 tx 前 consumed 已达上限
+          res.status(429).json({ error: "daily_limit", dailyRemaining: 0 });
+          return;
+        }
+        res.json({ likes: newLikes, dailyRemaining });
       } catch (err) {
         next(err);
       }

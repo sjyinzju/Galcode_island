@@ -15,6 +15,8 @@ export function imageToDto(row, { baseUrl, albumIds = [] }) {
     uploaderName: row.uploader_name ?? null,
     status: row.status,
     useCount: row.use_count,
+    likes: row.likes ?? 0,
+    popularity: row.popularity ?? 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     url: `${baseUrl}/uploads/${row.file_hash}.${row.file_ext}`,
@@ -48,7 +50,7 @@ export function fetchAlbumIdsForImages(db, imageIds) {
   return result;
 }
 
-export function albumToDto(row, { imageCount }) {
+export function albumToDto(row, { imageCount, coverUrl = null }) {
   return {
     id: row.id,
     deviceId: row.device_id,
@@ -57,7 +59,34 @@ export function albumToDto(row, { imageCount }) {
     uploaderName: row.uploader_name ?? null,
     status: row.status,
     imageCount,
+    likes: row.likes ?? 0,
+    popularity: row.popularity ?? 0,
+    coverUrl, // 图集封面（取第一张图的 url）；列表时填，单查时按需
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/// 给一批 album 批量取每个图集的"封面图 url"（即 position 最小的那张图）。
+/// 一次 SQL 不走 N+1。
+export function fetchCoverUrls(db, albumIds, baseUrl) {
+  const result = new Map();
+  if (albumIds.length === 0) return result;
+  const placeholders = albumIds.map(() => "?").join(",");
+  // 每个 album 找 position 最小的那张图作为封面
+  const rows = db
+    .prepare(
+      `SELECT ai.album_id, i.file_hash, i.file_ext
+       FROM album_images ai
+       INNER JOIN images i ON i.id = ai.image_id
+       WHERE ai.album_id IN (${placeholders})
+         AND ai.position = (
+           SELECT MIN(position) FROM album_images WHERE album_id = ai.album_id
+         )`,
+    )
+    .all(...albumIds);
+  for (const r of rows) {
+    result.set(r.album_id, `${baseUrl}/uploads/${r.file_hash}.${r.file_ext}`);
+  }
+  return result;
 }

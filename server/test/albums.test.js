@@ -279,7 +279,7 @@ describe("/api/images?category= 返回的 image.albumIds 包含所属图集", ()
     const a2 = await createAlbum({ name: "2", imageIds: ["shared"] });
     const res = await fetch(`${baseUrl}/api/images?category=thinking`);
     const body = await res.json();
-    const img = body.topHot.find((x) => x.id === "shared");
+    const img = body.items.find((x) => x.id === "shared");
     expect(img).toBeTruthy();
     expect(img.albumIds.sort()).toEqual(
       [a1.body.album.id, a2.body.album.id].sort(),
@@ -290,7 +290,7 @@ describe("/api/images?category= 返回的 image.albumIds 包含所属图集", ()
     insertImage({ id: "free", category: "welcome" });
     const res = await fetch(`${baseUrl}/api/images?category=welcome`);
     const body = await res.json();
-    const img = body.topHot.find((x) => x.id === "free");
+    const img = body.items.find((x) => x.id === "free");
     expect(img.albumIds).toEqual([]);
   });
 });

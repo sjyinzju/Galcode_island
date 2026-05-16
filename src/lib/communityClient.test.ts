@@ -200,6 +200,89 @@ describe("错误处理", () => {
   });
 });
 
+describe("分页 + 点赞 API（需求 3）", () => {
+  it("listImagesPaged 默认 sort=popular，URL 含分页参数", async () => {
+    const { listImagesPaged } = await setup();
+    const fetchMock = mockFetchOnce({
+      status: 200,
+      body: { items: [], page: 1, pageSize: 24, total: 0, totalPages: 1, sort: "popular" },
+    });
+    await listImagesPaged({ category: "welcome", page: 2, pageSize: 12 });
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("category=welcome");
+    expect(url).toContain("sort=popular");
+    expect(url).toContain("page=2");
+    expect(url).toContain("pageSize=12");
+  });
+
+  it("listImagesPaged sort=time 透传", async () => {
+    const { listImagesPaged } = await setup();
+    const fetchMock = mockFetchOnce({
+      status: 200,
+      body: { items: [], page: 1, pageSize: 24, total: 0, totalPages: 1, sort: "time" },
+    });
+    await listImagesPaged({ category: "thinking", sort: "time" });
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("sort=time");
+  });
+
+  it("listAlbumsPaged 走 /api/albums", async () => {
+    const { listAlbumsPaged } = await setup();
+    const fetchMock = mockFetchOnce({
+      status: 200,
+      body: { items: [], page: 1, pageSize: 24, total: 0, totalPages: 1, sort: "popular" },
+    });
+    await listAlbumsPaged({ sort: "time", page: 3 });
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("/api/albums?");
+    expect(url).toContain("sort=time");
+    expect(url).toContain("page=3");
+  });
+
+  it("likeImage 发 POST 带 deviceId", async () => {
+    const { likeImage, deviceId } = await setup();
+    const fetchMock = mockFetchOnce({
+      status: 200,
+      body: { likes: 5, dailyRemaining: 6 },
+    });
+    const result = await likeImage("img-x");
+    expect(result.likes).toBe(5);
+    expect(result.dailyRemaining).toBe(6);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toContain("/api/images/img-x/like");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init!.body as string)).toEqual({ deviceId });
+  });
+
+  it("likeAlbum 发 POST 带 deviceId", async () => {
+    const { likeAlbum, deviceId } = await setup();
+    const fetchMock = mockFetchOnce({
+      status: 200,
+      body: { likes: 1, dailyRemaining: 9 },
+    });
+    await likeAlbum("alb-y");
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toContain("/api/albums/alb-y/like");
+    expect(JSON.parse(init!.body as string)).toEqual({ deviceId });
+  });
+
+  it("likeImage 在 429 时抛 CommunityError(code=daily_limit)", async () => {
+    const { likeImage } = await setup();
+    mockFetchOnce({
+      status: 429,
+      body: { error: "daily_limit", dailyRemaining: 0 },
+    });
+    const { CommunityError } = await import("../types/community");
+    try {
+      await likeImage("img-q");
+      throw new Error("should throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(CommunityError);
+      expect((e as InstanceType<typeof CommunityError>).code).toBe("daily_limit");
+    }
+  });
+});
+
 describe("图集 API", () => {
   it("createAlbum 发 POST /api/albums，带 name/description/imageIds/deviceId", async () => {
     const { createAlbum, deviceId } = await setup();

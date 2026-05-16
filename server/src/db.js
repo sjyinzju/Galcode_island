@@ -34,15 +34,16 @@ CREATE TABLE IF NOT EXISTS images (
   status          TEXT NOT NULL,
   ai_verdict      TEXT,
   use_count       INTEGER NOT NULL DEFAULT 0,
+  likes           INTEGER NOT NULL DEFAULT 0,
+  popularity      INTEGER NOT NULL DEFAULT 0,    -- 物化 = use_count + 3*likes，like/use 时同步更新
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
 
--- 列表主索引：(category, status) 等值 + (use_count DESC, created_at DESC) 排序
-CREATE INDEX IF NOT EXISTS idx_images_list
-  ON images(category, status, use_count DESC, created_at DESC);
+-- 注意：idx_images_popular 引用 popularity 列，但老库的 popularity 列要 migrateAddLikesPopularity
+-- 之后才存在。所以**不**放在 SCHEMA_SQL 里，挪到 migrateAddLikesPopularity 末尾建。
 
--- 翻页时按时间倒序，能让 cursor (created_at, id) 走索引
+-- 翻页时按时间倒序：(category, status) 等值 + (created_at DESC) 排序
 CREATE INDEX IF NOT EXISTS idx_images_time
   ON images(category, status, created_at DESC, id DESC);
 
@@ -86,10 +87,16 @@ CREATE TABLE IF NOT EXISTS albums (
   description     TEXT,
   uploader_name   TEXT,
   status          TEXT NOT NULL,            -- active / hidden_by_owner / hidden_by_admin
+  likes           INTEGER NOT NULL DEFAULT 0,
+  popularity      INTEGER NOT NULL DEFAULT 0,    -- 物化 = 3*likes（album 无 use 概念）
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_albums_by_device ON albums(device_id, created_at DESC);
+-- 注意：idx_albums_popular 引用 popularity 列，由 migrateAddLikesPopularity 建（同上）
+-- 图集列表按时间倒序
+CREATE INDEX IF NOT EXISTS idx_albums_time
+  ON albums(status, created_at DESC, id DESC);
 
 -- 图集 → 图 多对多关联（一张图可属于多个图集）
 CREATE TABLE IF NOT EXISTS album_images (
@@ -103,6 +110,23 @@ CREATE TABLE IF NOT EXISTS album_images (
 );
 -- 反向查询：一张图属于哪些图集（"查看所属图集" 入口走的索引）
 CREATE INDEX IF NOT EXISTS idx_album_images_by_image ON album_images(image_id);
+
+-- 每个 device 对每个 image/album 每天的"点赞配额"使用记录。
+-- date_str 用 UTC YYYY-MM-DD（toISOString().slice(0,10)）—— 简单、不依赖 server 时区，
+-- 用户在 UTC 0 点重置（对 CST 用户 = 早 8 点，可接受）。
+-- consumed_count 软上限 10，由路由层校验；这里允许 > 10 用于日志审计（不约束）。
+CREATE TABLE IF NOT EXISTS daily_like_quota (
+  target_type      TEXT NOT NULL,            -- 'image' | 'album'
+  target_id        TEXT NOT NULL,
+  device_id        TEXT NOT NULL,
+  date_str         TEXT NOT NULL,            -- 'YYYY-MM-DD'，UTC
+  consumed_count   INTEGER NOT NULL DEFAULT 0,
+  updated_at       INTEGER NOT NULL,
+  PRIMARY KEY (target_type, target_id, device_id, date_str)
+);
+-- 反向查询：某 image/album 一共被多少 device 点过赞（管理面板未来要用）
+CREATE INDEX IF NOT EXISTS idx_daily_like_quota_by_target
+  ON daily_like_quota(target_type, target_id);
 `;
 
 /// 检查老库的 images 表 schema 里 file_hash 是否单列 UNIQUE。
@@ -300,6 +324,69 @@ function migrateBrokenFkReferences(db) {
   }
 }
 
+/// 给已存在的 images / albums 表 ALTER ADD COLUMN 加入 likes / popularity 列。
+/// CREATE TABLE IF NOT EXISTS 在表已存在时**不会**追加新列——必须显式 ALTER。
+/// 用 PRAGMA table_info 检测是否已有该列实现幂等。
+function migrateAddLikesPopularity(db) {
+  function hasCol(table, col) {
+    return db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .some((r) => r.name === col);
+  }
+  const targets = [
+    { table: "images", col: "likes", sql: "ALTER TABLE images ADD COLUMN likes INTEGER NOT NULL DEFAULT 0" },
+    { table: "images", col: "popularity", sql: "ALTER TABLE images ADD COLUMN popularity INTEGER NOT NULL DEFAULT 0" },
+    { table: "albums", col: "likes", sql: "ALTER TABLE albums ADD COLUMN likes INTEGER NOT NULL DEFAULT 0" },
+    { table: "albums", col: "popularity", sql: "ALTER TABLE albums ADD COLUMN popularity INTEGER NOT NULL DEFAULT 0" },
+  ];
+  let added = 0;
+  for (const t of targets) {
+    // 跳过：表不存在（首启动时 SCHEMA_SQL 会建表，这次 migration 在 SCHEMA_SQL 之后跑 → 表必然存在）；
+    // 列已存在
+    const tableExists = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+      .get(t.table);
+    if (!tableExists) continue;
+    if (hasCol(t.table, t.col)) continue;
+    db.exec(t.sql);
+    added += 1;
+  }
+  // 物化 popularity 列：用现有 use_count + 3 * likes 回填（likes 初值都是 0）
+  // 第一次运行迁移时所有 row 的 popularity = use_count + 3*0 = use_count；
+  // 之后 like/use 写入会维护 popularity 一致。
+  if (added > 0) {
+    db.exec(
+      "UPDATE images SET popularity = use_count + 3 * likes WHERE popularity = 0 AND (use_count > 0 OR likes > 0)",
+    );
+    db.exec(
+      "UPDATE albums SET popularity = 3 * likes WHERE popularity = 0 AND likes > 0",
+    );
+    console.log(`[migration] 加列 likes/popularity 完成 (+${added} 列)`);
+  }
+  // 引用 popularity 列的索引：只能在 ADD COLUMN 之后建（无论新装 / 老库）。
+  // CREATE INDEX IF NOT EXISTS 自身幂等。
+  const imagesHasPopularity = db
+    .prepare("PRAGMA table_info(images)")
+    .all()
+    .some((r) => r.name === "popularity");
+  if (imagesHasPopularity) {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_images_popular ON images(category, status, popularity DESC, created_at DESC)",
+    );
+  }
+  const albumsHasPopularity = db
+    .prepare("PRAGMA table_info(albums)")
+    .all()
+    .some((r) => r.name === "popularity");
+  if (albumsHasPopularity) {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_albums_popular ON albums(status, popularity DESC, created_at DESC)",
+    );
+  }
+  return added > 0;
+}
+
 export function initSchema(db) {
   // 先把可能存在的老库迁移到新表结构，再用 CREATE TABLE IF NOT EXISTS 跑常规 schema
   // —— 新表已经存在时这些 CREATE 是 no-op，索引也是 IF NOT EXISTS。
@@ -307,12 +394,18 @@ export function initSchema(db) {
   // 接着修一遍 FK 引用：处理上一版 migration 留下的损坏（生产数据库 schema 文本里
   // 仍有 images_legacy_unique_hash 引用）。新装的库走不到这一支。
   migrateBrokenFkReferences(db);
+  // SCHEMA_SQL 用 CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS 跑一遍：
+  // 新装库会建出含 likes/popularity 的表 + 新表 daily_like_quota；
+  // 已装库 SCHEMA_SQL 是 no-op 但会建 daily_like_quota（IF NOT EXISTS）
   db.exec(SCHEMA_SQL);
+  // 最后给已存在的 images/albums 加 likes/popularity 列（如果还没有）
+  migrateAddLikesPopularity(db);
 }
 
 export {
   migrateImagesUniqueHash,
   migrateBrokenFkReferences,
+  migrateAddLikesPopularity,
   detectLegacyHashUnique,
 };
 

@@ -2,28 +2,17 @@
 //
 // 形态：全屏遮罩 + 居中卡片（占视口 90% 高），毛玻璃 + 暗色适配。
 // 布局：
-//   - 顶栏：标题"看看大家的图" + 6 类 tab + 右上角关闭按钮
-//   - 主区：滚动列表
-//     * 首行 Top10 热门（角标"热度 #N"）
-//     * Top10 下面 timeline，按时间倒序
-//     * 滚到底自动加载下一页（IntersectionObserver 监听 sentinel）
-//   - 选中某张图后弹出"用到 {类别} / 举报 / 取消"小卡片（落在被点击的卡片中央偏右）
+//   - 顶栏：标题 + 关闭按钮
+//   - 维度切换栏：图片 | 图集
+//   - 排序栏：人气 | 时间
+//   - （图片维度）类别 tab：6 类
+//   - 主区：网格列表 + 分页栏（页码 + 跳转输入框）
+//   - 选中后弹出操作浮层（用 / 举报 / 跨类应用 popover / 查看所属图集）
 //
-// 性能：
-//   - 一次加载 24 张，不一次拉完
-//   - 触底（sentinel 进入视口）触发下一页 fetch
-//   - 图片 <img loading="lazy">，浏览器自动延迟解码
-//
-// 不分类列表：每个类别独立的 state（一进 modal 默认第一个类别；切 tab 只是切显示，
-//   各类的列表 / cursor / loading 状态独立维护）。
-//
-// 选用流程：
-//   1) 用户点"用到本类别"→ 调 fetchCommunityBlob 把图下载下来
-//   2) saveCommunityImageLocally 落到本地（带 communityImageId + communityPrompt）
-//   3) recordImageUse 异步通知 server 计数 +1（失败 silently；不影响本地体验）
-//   4) toast 提示"已添加到 {类别}"，关闭小卡片
+// 数据：mode/sort/category/page 任一变化 → 重新 fetch；点赞 / 使用计数原地局部更新。
+// 跨平台：纯 DOM + Tailwind，无 OS 专属 API；翻页输入框支持数字键和方向键。
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   PET_CATEGORIES,
   PET_CATEGORY_LABEL,
@@ -33,120 +22,100 @@ import {
 import {
   fetchCommunityBlob,
   getAlbumsByImage,
-  listImages,
+  isCommunityEnabled,
+  likeAlbum,
+  likeImage,
+  listAlbumsPaged,
+  listImagesPaged,
   recordImageUse,
   reportImage,
-  isCommunityEnabled,
 } from "../../lib/communityClient";
-import type { AlbumDto, CommunityImageDto } from "../../types/community";
+import type {
+  AlbumDto,
+  CommunityImageDto,
+  PagedAlbumsResponse,
+  PagedImagesResponse,
+  SortMode,
+  ViewDimension,
+} from "../../types/community";
 import { CommunityError } from "../../types/community";
 import { AlbumDetailView } from "./AlbumDetailView";
+import { PaginationBar } from "./community/PaginationBar";
+import { LikeButton } from "./community/LikeButton";
 
 export interface CommunityPickerModalProps {
   initialCategory: PetCategory;
   onClose: () => void;
 }
 
-interface CategoryState {
-  topHot: CommunityImageDto[];
-  timeline: CommunityImageDto[];
-  topHotIds: string[];
-  nextCursor: string | null;
-  loading: boolean;
-  loadedOnce: boolean;
-  exhausted: boolean;
-  error: string | null;
-}
-
-const emptyState: CategoryState = {
-  topHot: [],
-  timeline: [],
-  topHotIds: [],
-  nextCursor: null,
-  loading: false,
-  loadedOnce: false,
-  exhausted: false,
-  error: null,
-};
-
 export const CommunityPickerModal = memo(function CommunityPickerModal({
   initialCategory,
   onClose,
 }: CommunityPickerModalProps): JSX.Element {
+  // ----- 查询参数 -----
+  const [mode, setMode] = useState<ViewDimension>("images");
+  const [sort, setSort] = useState<SortMode>("popular");
   const [active, setActive] = useState<PetCategory>(initialCategory);
-  // 每个类别一份独立状态；不一进 modal 就一次性把 6 类都拉了，按需触发
-  const [byCat, setByCat] = useState<Record<PetCategory, CategoryState>>(() => ({
-    welcome: { ...emptyState },
-    thinking: { ...emptyState },
-    waiting: { ...emptyState },
-    complete: { ...emptyState },
-    error: { ...emptyState },
-    others: { ...emptyState },
-  }));
+  const [page, setPage] = useState<number>(1);
+  // ----- 列表数据：根据 mode 区分两套 -----
+  const [imagesData, setImagesData] = useState<PagedImagesResponse | null>(null);
+  const [albumsData, setAlbumsData] = useState<PagedAlbumsResponse | null>(null);
+  const [listLoading, setListLoading] = useState<boolean>(false);
+  const [listError, setListError] = useState<string>("");
+  // ----- 浮层 / 视图状态 -----
   const [pickedFor, setPickedFor] = useState<CommunityImageDto | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
   const [toast, setToast] = useState<string>("");
-  // view 切换：'list' = 6 类列表；'album' = 看图集详情
   const [view, setView] = useState<
     { kind: "list" } | { kind: "album"; albumId: string }
   >({ kind: "list" });
-  // 若图属于多个图集：点"查看所属图集"先在浮层底部展开 album 选择子菜单
   const [albumPickList, setAlbumPickList] = useState<AlbumDto[] | null>(null);
   const [albumLoading, setAlbumLoading] = useState<boolean>(false);
-  // "用到「xx」"分裂按钮的角标 popover 开关：展开后显示 6 类别选项，可跨类应用
   const [applyMenuOpen, setApplyMenuOpen] = useState<boolean>(false);
+  // 当前 pickedFor / 当前 picked album 的"我对它点赞"日剩余配额（null = 还没点过 = 未知）
+  const [pickedDailyRemaining, setPickedDailyRemaining] = useState<number | null>(null);
   const enabled = isCommunityEnabled();
 
   const saveCommunityImageLocally = usePetAssetsStore((s) => s.saveCommunityImageLocally);
 
-  const loadMore = useCallback(
-    async (category: PetCategory) => {
-      const cur = byCat[category];
-      if (!enabled) return;
-      if (cur.loading || cur.exhausted) return;
-      setByCat((prev) => ({ ...prev, [category]: { ...prev[category], loading: true, error: null } }));
-      try {
-        const res = await listImages({
-          category,
-          cursor: cur.nextCursor,
-          excludeIds: cur.loadedOnce ? cur.topHotIds : undefined,
-        });
-        setByCat((prev) => {
-          const merged = prev[category];
-          return {
-            ...prev,
-            [category]: {
-              topHot: merged.loadedOnce ? merged.topHot : res.topHot,
-              timeline: [...merged.timeline, ...res.timeline],
-              topHotIds: merged.loadedOnce ? merged.topHotIds : res.topHotIds,
-              nextCursor: res.nextCursor,
-              loading: false,
-              loadedOnce: true,
-              exhausted: res.nextCursor === null,
-              error: null,
-            },
-          };
-        });
-      } catch (err) {
-        const msg =
-          err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
-        setByCat((prev) => ({
-          ...prev,
-          [category]: { ...prev[category], loading: false, error: msg },
-        }));
-      }
-    },
-    [byCat, enabled],
-  );
+  // 切换 mode / sort 时把 page 重置到 1，避免落到不存在的页
+  useEffect(() => {
+    setPage(1);
+  }, [mode, sort, active]);
 
-  // 切 tab：首次访问该 tab 时拉第一页
+  // mode/sort/category/page 任一变化 → fetch 当前页数据
   useEffect(() => {
     if (!enabled) return;
-    if (byCat[active].loadedOnce || byCat[active].loading) return;
-    void loadMore(active);
-    // 依赖 active 即可；byCat 变化会让 loadMore 重新闭包，但 loadedOnce 判断会兜底
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, enabled]);
+    let cancelled = false;
+    setListLoading(true);
+    setListError("");
+    const run = async (): Promise<void> => {
+      try {
+        if (mode === "images") {
+          const res = await listImagesPaged({
+            category: active,
+            sort,
+            page,
+          });
+          if (!cancelled) setImagesData(res);
+        } else {
+          const res = await listAlbumsPaged({ sort, page });
+          if (!cancelled) setAlbumsData(res);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        const msg =
+          err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
+        setListError(msg);
+      } finally {
+        if (!cancelled) setListLoading(false);
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, mode, sort, active, page]);
 
   // ESC 关闭：优先关 popover → 关浮层 → 退出 album view → 关 modal
   useEffect(() => {
@@ -180,32 +149,44 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
     return () => window.clearTimeout(t);
   }, [toast]);
 
-  // 触底自动加载下一页
-  const sentinelRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const el = sentinelRef.current;
-    if (!el) return;
-    const obs = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) {
-            void loadMore(active);
-          }
-        }
-      },
-      { root: null, threshold: 0.1 },
-    );
-    obs.observe(el);
-    return () => obs.disconnect();
-  }, [active, loadMore]);
+  // 当前页要展示的 image items（mode=images 才用）
+  const imageItems = useMemo(
+    () => (mode === "images" ? imagesData?.items ?? [] : []),
+    [mode, imagesData],
+  );
+  // 当前页要展示的 album items（mode=albums 才用）
+  const albumItems = useMemo(
+    () => (mode === "albums" ? albumsData?.items ?? [] : []),
+    [mode, albumsData],
+  );
 
-  const state = byCat[active];
-  const combinedList = useMemo(
-    () => [
-      ...state.topHot.map((img, idx) => ({ img, hotRank: idx + 1 as number | null })),
-      ...state.timeline.map((img) => ({ img, hotRank: null })),
-    ],
-    [state.topHot, state.timeline],
+  /// 局部更新 image 列表中某张图的 likes / useCount（点赞 / 使用后调）
+  const patchImageInList = useCallback(
+    (imageId: string, patch: Partial<CommunityImageDto>) => {
+      setImagesData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((x) => (x.id === imageId ? { ...x, ...patch } : x)),
+        };
+      });
+      // pickedFor 如果是这张图，也同步更新
+      setPickedFor((prev) => (prev && prev.id === imageId ? { ...prev, ...patch } : prev));
+    },
+    [],
+  );
+  /// 局部更新 album 列表中某个图集的 likes
+  const patchAlbumInList = useCallback(
+    (albumId: string, patch: Partial<AlbumDto>) => {
+      setAlbumsData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((x) => (x.id === albumId ? { ...x, ...patch } : x)),
+        };
+      });
+    },
+    [],
   );
 
   /// 把社区图保存到本地。
@@ -222,21 +203,11 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
         // 异步通知 server 计数，不阻塞 UI
         recordImageUse(img.id)
           .then((res) => {
-            // 局部更新 useCount 让用户立刻看到 +1（同设备幂等，counted 为 false 时不变）
             if (!res.counted) return;
-            setByCat((prev) => {
-              const next: typeof prev = { ...prev };
-              for (const cat of PET_CATEGORIES) {
-                const cs = next[cat];
-                const apply = (arr: CommunityImageDto[]): CommunityImageDto[] =>
-                  arr.map((x) => (x.id === img.id ? { ...x, useCount: res.useCount } : x));
-                next[cat] = {
-                  ...cs,
-                  topHot: apply(cs.topHot),
-                  timeline: apply(cs.timeline),
-                };
-              }
-              return next;
+            // 用 popularity = useCount + 3 * likes 同步更新（保持与 server 一致）
+            patchImageInList(img.id, {
+              useCount: res.useCount,
+              popularity: res.useCount + 3 * (img.likes ?? 0),
             });
           })
           .catch(() => {
@@ -252,7 +223,55 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
         setBusy(false);
       }
     },
-    [saveCommunityImageLocally],
+    [saveCommunityImageLocally, patchImageInList],
+  );
+
+  /// 点赞当前 pickedFor（也用于卡片角心形按钮）。
+  /// 成功 → 更新本地状态 + dailyRemaining；429 → 显示 toast + 锁配额。
+  const handleLikeImage = useCallback(
+    async (img: CommunityImageDto): Promise<void> => {
+      try {
+        const res = await likeImage(img.id);
+        patchImageInList(img.id, {
+          likes: res.likes,
+          popularity: img.useCount + 3 * res.likes,
+        });
+        setPickedDailyRemaining(res.dailyRemaining);
+      } catch (err) {
+        if (err instanceof CommunityError && err.code === "daily_limit") {
+          setPickedDailyRemaining(0);
+          setToast("今日点赞配额已用完（UTC 0 点重置）");
+        } else {
+          const msg =
+            err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
+          setToast(`点赞失败：${msg}`);
+        }
+      }
+    },
+    [patchImageInList],
+  );
+
+  const handleLikeAlbum = useCallback(
+    async (album: AlbumDto): Promise<void> => {
+      try {
+        const res = await likeAlbum(album.id);
+        patchAlbumInList(album.id, {
+          likes: res.likes,
+          popularity: 3 * res.likes,
+        });
+        setPickedDailyRemaining(res.dailyRemaining);
+      } catch (err) {
+        if (err instanceof CommunityError && err.code === "daily_limit") {
+          setPickedDailyRemaining(0);
+          setToast("今日点赞配额已用完（UTC 0 点重置）");
+        } else {
+          const msg =
+            err instanceof CommunityError ? err.message : String((err as Error).message ?? err);
+          setToast(`点赞失败：${msg}`);
+        }
+      }
+    },
+    [patchAlbumInList],
   );
 
   /// 点"查看所属图集"：拉该图所属 album 元数据
@@ -339,8 +358,66 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
           </button>
         </header>
 
-        {/* 类别 tab：进入图集视图时隐藏（避免视觉竞争） */}
+        {/* mode + sort 切换栏：进入图集详情视图时隐藏 */}
         {view.kind === "list" ? (
+          <div className="flex shrink-0 items-center justify-between gap-3 border-b border-black/5 px-3 py-2 dark:border-white/5">
+            {/* mode = 维度切换 */}
+            <div className="flex gap-1">
+              <button
+                type="button"
+                onClick={() => setMode("images")}
+                className={`shrink-0 rounded-full px-3 py-1 text-[12px] transition-all ${
+                  mode === "images"
+                    ? "bg-fuchsia-500 text-white shadow-sm"
+                    : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15"
+                }`}
+              >
+                图片
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("albums")}
+                className={`shrink-0 rounded-full px-3 py-1 text-[12px] transition-all ${
+                  mode === "albums"
+                    ? "bg-fuchsia-500 text-white shadow-sm"
+                    : "bg-black/5 text-zinc-700 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-200 dark:hover:bg-white/15"
+                }`}
+              >
+                图集
+              </button>
+            </div>
+            {/* sort = 排序切换 */}
+            <div className="flex gap-1">
+              <button
+                type="button"
+                onClick={() => setSort("popular")}
+                className={`shrink-0 rounded-full px-3 py-1 text-[11px] transition-all ${
+                  sort === "popular"
+                    ? "bg-amber-500 text-white shadow-sm"
+                    : "bg-black/5 text-zinc-600 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-300 dark:hover:bg-white/15"
+                }`}
+                title="按 useCount + 3×likes 综合人气倒序"
+              >
+                人气
+              </button>
+              <button
+                type="button"
+                onClick={() => setSort("time")}
+                className={`shrink-0 rounded-full px-3 py-1 text-[11px] transition-all ${
+                  sort === "time"
+                    ? "bg-amber-500 text-white shadow-sm"
+                    : "bg-black/5 text-zinc-600 hover:bg-black/10 dark:bg-white/10 dark:text-zinc-300 dark:hover:bg-white/15"
+                }`}
+                title="按上传时间倒序"
+              >
+                时间
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* 图片维度下的 6 类 tab */}
+        {view.kind === "list" && mode === "images" ? (
           <nav className="flex shrink-0 gap-1 overflow-x-auto border-b border-black/5 px-3 py-2 dark:border-white/5">
             {PET_CATEGORIES.map((cat) => {
               const isActive = cat === active;
@@ -372,52 +449,63 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
             />
           </div>
         ) : (
-        <div className="relative flex-1 overflow-y-auto px-5 py-4">
+        <div className="relative flex flex-1 flex-col overflow-hidden">
+          <div className="flex-1 overflow-y-auto px-5 py-4">
           {!enabled ? (
             <EmptyHint
               title="未配置社区服务地址"
               hint="去 设置 → 桌宠社区 配置后端地址后，刷新这里就能看到大家的图。"
             />
-          ) : state.error && combinedList.length === 0 ? (
-            <EmptyHint title="加载失败" hint={state.error} retry={() => void loadMore(active)} />
-          ) : state.loadedOnce && combinedList.length === 0 && !state.loading ? (
+          ) : listError && (mode === "images" ? imageItems.length === 0 : albumItems.length === 0) ? (
+            <EmptyHint title="加载失败" hint={listError} retry={() => setPage((p) => p)} />
+          ) : !listLoading && (mode === "images" ? imageItems.length === 0 : albumItems.length === 0) ? (
             <EmptyHint
-              title="这个类别还没有图"
-              hint="抢沙发！上传一张让大家用上。"
+              title={mode === "images" ? "这个类别还没有图" : "还没人发布图集"}
+              hint={mode === "images" ? "抢沙发！上传一张让大家用上。" : "去保存自己的自定义图作为图集吧。"}
             />
+          ) : mode === "images" ? (
+            <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+              {imageItems.map((img) => (
+                <CommunityCard
+                  key={img.id}
+                  img={img}
+                  busy={busy}
+                  onPick={() => setPickedFor(img)}
+                  onLike={() => handleLikeImage(img)}
+                />
+              ))}
+            </ul>
           ) : (
-            <>
-              <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                {combinedList.map(({ img, hotRank }) => (
-                  <CommunityCard
-                    key={img.id}
-                    img={img}
-                    hotRank={hotRank}
-                    onPick={() => setPickedFor(img)}
-                  />
-                ))}
-              </ul>
-              {/* 触底 sentinel */}
-              <div ref={sentinelRef} className="h-10" />
-              {state.loading ? (
-                <div className="py-4 text-center text-[11px] text-zinc-500">加载中…</div>
-              ) : state.exhausted && combinedList.length > 0 ? (
-                <div className="py-4 text-center text-[10px] text-zinc-400">— 已经到底了 —</div>
-              ) : null}
-              {state.error && combinedList.length > 0 ? (
-                <div className="py-2 text-center text-[11px] text-rose-600">
-                  {state.error}{" "}
-                  <button
-                    type="button"
-                    onClick={() => void loadMore(active)}
-                    className="underline"
-                  >
-                    重试
-                  </button>
-                </div>
-              ) : null}
-            </>
+            <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {albumItems.map((album) => (
+                <AlbumCard
+                  key={album.id}
+                  album={album}
+                  onOpen={() => setView({ kind: "album", albumId: album.id })}
+                  onLike={() => handleLikeAlbum(album)}
+                />
+              ))}
+            </ul>
           )}
+          {listLoading ? (
+            <div className="py-4 text-center text-[11px] text-zinc-500">加载中…</div>
+          ) : null}
+          </div>
+          {/* 分页栏：只在有数据时显示 */}
+          {enabled && (mode === "images" ? imagesData : albumsData) ? (
+            <div className="shrink-0 border-t border-black/5 dark:border-white/5">
+              <PaginationBar
+                page={mode === "images" ? imagesData?.page ?? 1 : albumsData?.page ?? 1}
+                totalPages={
+                  mode === "images"
+                    ? imagesData?.totalPages ?? 1
+                    : albumsData?.totalPages ?? 1
+                }
+                onChange={(p) => setPage(p)}
+                disabled={listLoading}
+              />
+            </div>
+          ) : null}
         </div>
         )}
 
@@ -502,7 +590,13 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
                   </div>
                 ) : null}
 
-                <div className="mt-2 flex justify-end gap-2">
+                <div className="mt-2 flex items-center justify-end gap-2">
+                  {/* 浮层中也允许点赞，用同一个 handler；dailyRemaining 给反馈 */}
+                  <LikeButton
+                    likes={pickedFor.likes}
+                    dailyRemaining={pickedDailyRemaining}
+                    onLike={() => handleLikeImage(pickedFor)}
+                  />
                   <button
                     type="button"
                     onClick={() => void handleReport(pickedFor)}
@@ -617,19 +711,22 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
 
 function CommunityCard({
   img,
-  hotRank,
+  busy,
   onPick,
+  onLike,
 }: {
   img: CommunityImageDto;
-  hotRank: number | null;
+  busy: boolean;
   onPick: () => void;
+  onLike: () => Promise<void>;
 }): JSX.Element {
   return (
-    <li>
+    <li className="group relative">
       <button
         type="button"
         onClick={onPick}
-        className="group relative block aspect-square w-full overflow-hidden rounded-lg border border-black/10 bg-zinc-100 shadow-sm transition-transform hover:scale-[1.02] hover:shadow-md dark:border-white/10 dark:bg-slate-800"
+        disabled={busy}
+        className="block aspect-square w-full overflow-hidden rounded-lg border border-black/10 bg-zinc-100 shadow-sm transition-transform hover:scale-[1.02] hover:shadow-md disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:bg-slate-800"
         title={img.prompt ? `${img.uploaderName ?? "匿名"} · ${img.prompt}` : img.uploaderName ?? "匿名"}
       >
         <img
@@ -639,15 +736,91 @@ function CommunityCard({
           className="h-full w-full object-cover transition-opacity group-hover:opacity-90"
           draggable={false}
         />
-        {hotRank !== null ? (
-          <span className="absolute left-1.5 top-1.5 rounded-full bg-gradient-to-br from-amber-400 to-rose-500 px-2 py-0.5 text-[10px] font-semibold text-white shadow">
-            热 #{hotRank}
-          </span>
-        ) : null}
-        <span className="absolute bottom-1.5 right-1.5 rounded-full bg-black/55 px-1.5 py-0.5 text-[9px] text-white">
-          {img.useCount}
+        <span
+          className="absolute bottom-1.5 right-1.5 rounded-full bg-black/55 px-1.5 py-0.5 text-[9px] text-white"
+          title={`使用 ${img.useCount} · 人气 ${img.popularity}`}
+        >
+          使用 {img.useCount}
         </span>
       </button>
+      {/* 心形点赞按钮：右上角浮在卡片上方 */}
+      <div className="absolute left-1.5 top-1.5">
+        <LikeButton likes={img.likes} dailyRemaining={null} onLike={onLike} />
+      </div>
+    </li>
+  );
+}
+
+function AlbumCard({
+  album,
+  onOpen,
+  onLike,
+}: {
+  album: AlbumDto;
+  onOpen: () => void;
+  onLike: () => Promise<void>;
+}): JSX.Element {
+  // 卡片高度统一策略：
+  //   - <li> + 内卡 div 加 h-full：让 grid 同 row stretch 把高度传到内部
+  //   - description 区始终占两行高（line-clamp-2 + min-h）：空 description 时也保留同样高度
+  //   不再依赖内容自适应 → 所有卡片视觉等高
+  const descText = album.description?.trim() ?? "";
+  return (
+    <li className="h-full">
+      <div className="group relative flex h-full gap-3 rounded-lg border border-black/10 bg-white/80 p-2.5 shadow-sm transition-all hover:shadow-md dark:border-white/10 dark:bg-slate-800/80">
+        <button
+          type="button"
+          onClick={onOpen}
+          className="h-20 w-20 shrink-0 overflow-hidden rounded-md border border-black/10 bg-zinc-100 dark:border-white/10 dark:bg-slate-900"
+          title="点击查看图集详情"
+        >
+          {album.coverUrl ? (
+            <img
+              src={album.coverUrl}
+              alt=""
+              loading="lazy"
+              className="h-full w-full object-cover transition-transform group-hover:scale-[1.03]"
+              draggable={false}
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-[10px] text-zinc-400">
+              无封面
+            </div>
+          )}
+        </button>
+        <div className="flex min-w-0 flex-1 flex-col gap-1">
+          <button
+            type="button"
+            onClick={onOpen}
+            className="truncate text-left text-[13px] font-medium text-zinc-800 hover:text-fuchsia-600 dark:text-zinc-100 dark:hover:text-fuchsia-300"
+          >
+            {album.name}
+          </button>
+          <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
+            {album.uploaderName?.trim() || "匿名"} · {album.imageCount} 张
+          </div>
+          {/* description 始终占两行高（约 26px）；空时显示淡灰占位文案，让卡片对齐 */}
+          <div
+            className={`line-clamp-2 min-h-[26px] text-[10px] ${
+              descText
+                ? "text-zinc-500 dark:text-zinc-400"
+                : "text-zinc-300 dark:text-zinc-600 italic"
+            }`}
+          >
+            {descText || "（无描述）"}
+          </div>
+          <div className="mt-auto flex items-center gap-2">
+            <LikeButton likes={album.likes} dailyRemaining={null} onLike={onLike} />
+            <button
+              type="button"
+              onClick={onOpen}
+              className="ml-auto rounded-md border border-fuchsia-400/50 bg-fuchsia-500/10 px-2 py-0.5 text-[10px] text-fuchsia-700 hover:bg-fuchsia-500/20 dark:border-fuchsia-300/40 dark:text-fuchsia-300"
+            >
+              进入图集
+            </button>
+          </div>
+        </div>
+      </div>
     </li>
   );
 }
