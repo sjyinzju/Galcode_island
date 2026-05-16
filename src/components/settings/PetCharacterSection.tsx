@@ -33,6 +33,8 @@ import { isCommunityEnabled } from "../../lib/communityClient";
 import { UploadPromptDialog } from "./UploadPromptDialog";
 import { UploadAlbumDialog } from "./UploadAlbumDialog";
 import { CommunityPickerModal } from "./CommunityPickerModal";
+import { AssetDetailDialog } from "./AssetDetailDialog";
+import type { PetAssetMeta } from "../../stores/usePetAssetsStore";
 
 const ACCEPTED_MIME = "image/gif,image/png,image/jpeg,image/webp,image/apng";
 
@@ -149,16 +151,26 @@ function PresetSidebar({
 
       <SidebarGroup
         label={`我的预设 (${minePresets.length})`}
-        action={{
-          label: "+ 新建",
-          title: "新建一份空白预设",
-          onClick: onCreateBlank,
-        }}
+        // 有预设时小入口跟其它分组对齐；零预设时把 CTA 让位给下面的大按钮
+        action={
+          minePresets.length > 0
+            ? { label: "+ 新建", title: "新建一份空白预设", onClick: onCreateBlank }
+            : undefined
+        }
       >
         {minePresets.length === 0 ? (
-          <p className="px-2 py-1 text-[10px] text-zinc-400 dark:text-zinc-500">
-            还没有自己的预设。编辑默认预设、加图或下载社区预设后编辑都会自动生成一份。
-          </p>
+          // 空状态主入口：横排 + 单标签，比表头小按钮显眼但又不喧宾夺主
+          <button
+            type="button"
+            onClick={onCreateBlank}
+            className="flex w-full items-center justify-center gap-1.5 rounded-md border border-dashed border-sky-400/60 bg-sky-500/5 px-3 py-2 text-sky-700 transition-all hover:border-sky-400 hover:bg-sky-500/10 dark:border-sky-300/40 dark:text-sky-300 dark:hover:border-sky-300 dark:hover:bg-sky-500/15"
+            title="新建一份空白预设"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3.5 w-3.5">
+              <path d="M8 3v10M3 8h10" strokeLinecap="round" />
+            </svg>
+            <span className="text-[12px] font-semibold">新建预设</span>
+          </button>
         ) : (
           minePresets.map((p) => (
             <PresetRow
@@ -474,17 +486,7 @@ function PresetDetail({
                 删除
               </button>
             </>
-          ) : (
-            // default：只能复制
-            <button
-              type="button"
-              onClick={() => void onFork()}
-              className="rounded-md border border-sky-300/60 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-500/20 dark:border-sky-300/40 dark:text-sky-300"
-              title="复制一份到「我的预设」开始编辑"
-            >
-              复制为我的
-            </button>
-          )}
+          ) : null /* default：只读、不允许复制；想自定义请用左栏"新建预设" */}
         </div>
       </div>
 
@@ -512,7 +514,6 @@ function PresetDetail({
             preset={preset}
             category={cat}
             editable={editable}
-            onForkRequested={() => void onFork()}
           />
         ))}
       </div>
@@ -534,18 +535,15 @@ function PresetDetail({
 interface CategoryCardProps {
   preset: Preset;
   category: PetCategory;
-  /// preset.source === "mine" 时为 true：直接 + 删；否则 + 添加按钮会触发 auto-fork。
+  /// preset.source === "mine" 时为 true：直接 + 删；source=community 时 + 添加会触发
+  /// auto-fork；source=default 时整组写入入口隐藏（用户必须先"复制为我的"或"新建预设"）
   editable: boolean;
-  /// default 预设下编辑会走这条回调（虽然 addAsset 也会 auto-fork，
-  /// 但 default 下用户更可能误点，这里直接弹确认避免他先编辑后才发现已 fork）
-  onForkRequested: () => void;
 }
 
 function CategoryCard({
   preset,
   category,
   editable,
-  onForkRequested,
 }: CategoryCardProps): JSX.Element {
   const list = preset.categories[category];
   const blobUrls = usePetAssetsStore((s) => s.blobUrls);
@@ -558,6 +556,8 @@ function CategoryCard({
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [communityOpen, setCommunityOpen] = useState<boolean>(false);
   const [error, setError] = useState<string>("");
+  /// 当前打开详情 / prompt 编辑的图（null = 没打开）
+  const [detailAsset, setDetailAsset] = useState<PetAssetMeta | null>(null);
 
   // error 自动 3s 消失
   useEffect(() => {
@@ -567,10 +567,6 @@ function CategoryCard({
   }, [error]);
 
   const handleAddClick = (): void => {
-    if (preset.source === "default") {
-      onForkRequested();
-      return;
-    }
     inputRef.current?.click();
   };
 
@@ -611,6 +607,10 @@ function CategoryCard({
 
   const handleDialogCancel = (): void => setPendingFiles([]);
 
+  // 内置预设走只读路径——任何"会触发 auto-fork"的入口都不该出现在这里，
+  // 用户想动这些图请走右上角的"复制为我的"或左栏"新建预设"。
+  const isDefault = preset.source === "default";
+
   return (
     <div className="flex flex-col gap-2 rounded-md border border-black/5 bg-white/60 p-2 dark:border-white/5 dark:bg-slate-900/40">
       <div className="flex items-center justify-between">
@@ -620,43 +620,43 @@ function CategoryCard({
             {list.length} 张
           </span>
         </span>
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setCommunityOpen(true)}
-            disabled={!isCommunityEnabled()}
-            title={
-              isCommunityEnabled()
-                ? "在社区里找一张这个类别的图加进来（非 mine 会自动复制副本后再加）"
-                : "去设置配置社区地址后可用"
-            }
-            className="flex items-center gap-1 rounded border border-fuchsia-400/50 bg-fuchsia-500/10 px-1.5 py-0.5 text-[10px] font-medium text-fuchsia-700 transition-all hover:bg-fuchsia-500/20 disabled:cursor-not-allowed disabled:opacity-40 dark:border-fuchsia-300/40 dark:text-fuchsia-300"
-          >
-            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-2.5 w-2.5">
-              <circle cx="7" cy="7" r="2" />
-              <path d="M1.5 7s2-4 5.5-4 5.5 4 5.5 4-2 4-5.5 4S1.5 7 1.5 7z" strokeLinecap="round" />
-            </svg>
-            社区
-          </button>
-          <button
-            type="button"
-            onClick={handleAddClick}
-            disabled={busy}
-            title={
-              preset.source === "default"
-                ? "默认预设不可编辑；点这里会先复制一份「我的预设」"
-                : preset.source === "community"
+        {isDefault ? null : (
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setCommunityOpen(true)}
+              disabled={!isCommunityEnabled()}
+              title={
+                isCommunityEnabled()
+                  ? "在社区里找一张这个类别的图加进来（非 mine 会自动复制副本后再加）"
+                  : "去设置配置社区地址后可用"
+              }
+              className="flex items-center gap-1 rounded border border-fuchsia-400/50 bg-fuchsia-500/10 px-1.5 py-0.5 text-[10px] font-medium text-fuchsia-700 transition-all hover:bg-fuchsia-500/20 disabled:cursor-not-allowed disabled:opacity-40 dark:border-fuchsia-300/40 dark:text-fuchsia-300"
+            >
+              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-2.5 w-2.5">
+                <circle cx="7" cy="7" r="2" />
+                <path d="M1.5 7s2-4 5.5-4 5.5 4 5.5 4-2 4-5.5 4S1.5 7 1.5 7z" strokeLinecap="round" />
+              </svg>
+              社区
+            </button>
+            <button
+              type="button"
+              onClick={handleAddClick}
+              disabled={busy}
+              title={
+                preset.source === "community"
                   ? "添加图片会自动复制一份副本到「我的预设」"
                   : "添加图片"
-            }
-            className="flex items-center gap-1 rounded border border-sky-400/50 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 transition-all hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-sky-300/40 dark:text-sky-300"
-          >
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-2.5 w-2.5">
-              <path d="M6 2v8M2 6h8" strokeLinecap="round" />
-            </svg>
-            {busy ? "处理中…" : "添加"}
-          </button>
-        </div>
+              }
+              className="flex items-center gap-1 rounded border border-sky-400/50 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 transition-all hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-sky-300/40 dark:text-sky-300"
+            >
+              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-2.5 w-2.5">
+                <path d="M6 2v8M2 6h8" strokeLinecap="round" />
+              </svg>
+              {busy ? "处理中…" : "添加"}
+            </button>
+          </div>
+        )}
         <input
           ref={inputRef}
           type="file"
@@ -694,24 +694,49 @@ function CategoryCard({
       ) : (
         <div className="flex flex-wrap gap-1.5">
           {list.map((meta) => {
-            const url = blobUrls[meta.id];
+            /// 默认预设的 meta 走 staticUrl（public/pet/...）；其它走 IDB blob 转出来的 URL
+            const url = meta.staticUrl ?? blobUrls[meta.id];
+            const hasPrompt = !!meta.communityPrompt?.trim();
+            const tooltip = hasPrompt
+              ? `${meta.fileName} · ${(meta.sizeBytes / 1024).toFixed(1)} KB\n人设 prompt：${meta.communityPrompt!.trim().slice(0, 80)}${meta.communityPrompt!.trim().length > 80 ? "…" : ""}\n点击查看 / 编辑`
+              : `${meta.fileName} · ${(meta.sizeBytes / 1024).toFixed(1)} KB\n点击查看详情${editable ? " / 添加人设 prompt" : ""}`;
             return (
               <div
                 key={meta.id}
                 className="group relative h-12 w-12 shrink-0 overflow-hidden rounded border border-black/10 bg-white/50 dark:border-white/10 dark:bg-slate-900/50"
-                title={`${meta.fileName} · ${(meta.sizeBytes / 1024).toFixed(1)} KB`}
+                title={tooltip}
               >
-                {url ? (
-                  <img src={url} alt="" className="h-full w-full object-cover" draggable={false} />
-                ) : (
-                  <div className="flex h-full w-full items-center justify-center text-[9px] text-zinc-400 dark:text-zinc-500">
-                    加载中
-                  </div>
-                )}
+                {/* 整个缩略图可点：打开详情 / prompt 编辑对话框 */}
+                <button
+                  type="button"
+                  onClick={() => setDetailAsset(meta)}
+                  className="block h-full w-full"
+                  aria-label={`查看图片 ${meta.fileName} 的详情`}
+                >
+                  {url ? (
+                    <img src={url} alt="" className="h-full w-full object-cover" draggable={false} />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-[9px] text-zinc-400 dark:text-zinc-500">
+                      加载中
+                    </div>
+                  )}
+                </button>
+                {/* 有 prompt 时左下角小角标：让用户一眼看出"这张已经绑了人设" */}
+                {hasPrompt ? (
+                  <span
+                    className="pointer-events-none absolute bottom-0.5 left-0.5 flex h-3 w-3 items-center justify-center rounded-sm bg-amber-400/90 text-[7px] font-bold text-amber-900 shadow"
+                    aria-label="已绑定人设 prompt"
+                  >
+                    P
+                  </span>
+                ) : null}
                 {editable ? (
                   <button
                     type="button"
-                    onClick={() => void removeAsset(category, meta.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void removeAsset(category, meta.id);
+                    }}
                     aria-label="删除"
                     className="absolute right-0.5 top-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-black/60 text-white opacity-0 transition-opacity hover:bg-rose-500/80 group-hover:opacity-100"
                   >
@@ -728,6 +753,15 @@ function CategoryCard({
 
       {error ? (
         <div className="text-[10px] text-rose-600 dark:text-rose-400">{error}</div>
+      ) : null}
+
+      {detailAsset ? (
+        <AssetDetailDialog
+          preset={preset}
+          category={category}
+          asset={detailAsset}
+          onClose={() => setDetailAsset(null)}
+        />
       ) : null}
     </div>
   );

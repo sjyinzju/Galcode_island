@@ -26,12 +26,18 @@ beforeAll(() => {
 });
 
 describe("默认预设", () => {
-  it("DEFAULT_PRESET 含 6 个空 categories", async () => {
+  it("DEFAULT_PRESET 各类用打包 GIF 填充，meta.staticUrl 指向 /pet/<cat>/", async () => {
     const { DEFAULT_PRESET, PET_CATEGORIES } = await import("./usePetAssetsStore");
     expect(DEFAULT_PRESET.id).toBe("default");
     expect(DEFAULT_PRESET.source).toBe("default");
     for (const cat of PET_CATEGORIES) {
-      expect(DEFAULT_PRESET.categories[cat]).toEqual([]);
+      const list = DEFAULT_PRESET.categories[cat];
+      expect(list.length).toBeGreaterThan(0);
+      for (const meta of list) {
+        expect(meta.source).toBe("default");
+        expect(meta.staticUrl).toMatch(new RegExp(`^/pet/${cat}/`));
+        expect(meta.communityPrompt).toBeNull();
+      }
     }
   });
 
@@ -47,7 +53,7 @@ describe("默认预设", () => {
 });
 
 describe("active 状态选择器", () => {
-  it("activePresetId='default' 时 isCustomPresetActive=false，getActiveCategories=DEFAULT 空映射", async () => {
+  it("activePresetId='default' 时 isCustomPresetActive=false，getActiveCategories 返回 DEFAULT 的映射", async () => {
     const { DEFAULT_PRESET, isCustomPresetActive, getActiveCategories } = await import(
       "./usePetAssetsStore"
     );

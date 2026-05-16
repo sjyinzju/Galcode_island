@@ -69,13 +69,17 @@ export interface PetAssetMeta {
   mime: string;
   sizeBytes: number;
   addedAt: number;
-  /// 来源："local" = 用户本机上传；"community" = 来自社区图（含 album 安装 / 单图选用）
-  source?: "local" | "community";
+  /// 来源："local" = 用户本机上传；"community" = 来自社区图（含 album 安装 / 单图选用）；
+  ///       "default" = DEFAULT_PRESET 的内置 GIF（运行时由常量生成，不入 IDB / persist）
+  source?: "local" | "community" | "default";
   /// 关联到社区后端的 image id（上传成功 / 社区来源时非空）
   communityImageId?: string | null;
   /// 该图在桌宠显示时，替换凉宫春日 system prompt 的"团长文案风格" prompt（可选）。
   /// 空字符串与 null 等效——回退默认凉宫人设。
   communityPrompt?: string | null;
+  /// 静态资源直连地址，仅 source="default" 时填——指向 /pet/<cat>/*.gif，由 vite/Tauri
+  /// 从 public/ 直接服务，**不进 IDB**。渲染处优先用 staticUrl ?? blobUrls[id]。
+  staticUrl?: string;
 }
 
 export type PresetSource = "default" | "mine" | "community";
@@ -110,18 +114,55 @@ function emptyByCategory<T>(make: () => T): CategoryMap<T> {
 
 export const DEFAULT_PRESET_ID = "default";
 
-/// 内置预设：凉宫春日。空 categories → PetCharacter 走 pickDefaultGif 回退到打包 GIF。
+/// 与 public/pet/<cat>/*.gif 同步——这里列的就是 vite/Tauri 实际打包进 dist 的文件。
+/// 数量 / 名字变化时请同步 PetCharacter.tsx 里的 pickDefaultGif 表，避免运行时回退用到
+/// 不存在的资源。
+const DEFAULT_GIF_CATALOG: Record<PetCategory, string[]> = {
+  welcome: ["welcome.gif"],
+  thinking: ["thinking_1.gif", "thinking_2.gif"],
+  waiting: ["waiting_1.gif", "waiting_2.gif"],
+  complete: ["complete_1.gif", "complete_2.gif", "complete_3.gif"],
+  error: ["error_1.gif", "error_2.gif"],
+  others: [
+    "对手指.gif",
+    "thinking_2.gif",
+    "启动.gif",
+    "想要.gif",
+    "戳戳.gif",
+    "thinking_1.gif",
+  ],
+};
+
+function buildDefaultCategories(): CategoryMap<PetAssetMeta[]> {
+  const out = emptyByCategory<PetAssetMeta[]>(() => []);
+  for (const cat of PET_CATEGORIES) {
+    out[cat] = DEFAULT_GIF_CATALOG[cat].map((name, idx) => ({
+      id: `__default__:${cat}:${idx}`,
+      fileName: name,
+      mime: "image/gif",
+      sizeBytes: 0,
+      addedAt: 0,
+      source: "default" as const,
+      communityImageId: null,
+      communityPrompt: null,
+      staticUrl: `/pet/${cat}/${name}`,
+    }));
+  }
+  return out;
+}
+
+/// 内置预设：凉宫春日。categories 直接列出打包 GIF，让用户能在预设详情里看到实际素材。
 /// 不进 presets[] 数组，由 selector 特判返回——保持持久化数据只装用户自定义的部分。
 export const DEFAULT_PRESET: Preset = Object.freeze({
   id: DEFAULT_PRESET_ID,
   name: "凉宫春日",
-  description: "应用自带的默认桌宠形象，使用内置 GIF。",
+  description: "应用自带的默认桌宠形象。",
   source: "default" as const,
-  authorName: "内置",
+  authorName: "凉宫春日应援团",
   communityAlbumId: null,
   createdAt: 0,
   updatedAt: 0,
-  categories: emptyByCategory<PetAssetMeta[]>(() => []),
+  categories: buildDefaultCategories(),
 }) as Preset;
 
 /// addAsset 返回值：UI 据此显示"社区同步失败但本地已存"等差异化文案。
@@ -198,6 +239,17 @@ interface PetAssetsState {
 
   removeAsset: (category: PetCategory, assetId: string) => Promise<void>;
 
+  /// 改某张图的 communityPrompt（在桌宠展示该图时替换 LLM 人设的文案）。
+  /// 仅对 source=mine 预设生效；default / community / 找不到的预设静默 no-op
+  /// （UI 应在 source!==mine 时把 prompt 输入框置灰，并引导先「复制为我的副本」）。
+  /// 不走 auto-fork —— prompt 编辑成本应该和"切换预设"分得清，避免误触造成意外 fork。
+  updateAssetPrompt: (
+    presetId: string,
+    category: PetCategory,
+    assetId: string,
+    prompt: string | null,
+  ) => void;
+
   // ===== 启动 / 维护 =====
 
   hydrateBlobs: () => Promise<void>;
@@ -247,6 +299,12 @@ export function isCustomPresetActive(
 
 /// 内部 helper：把一个预设深拷贝出来（含 blob），用于 fork。
 /// 失败的图会跳过；返回新 Preset + 用于 set 的 blobUrls 增量。
+///
+/// blob 来源策略：
+///   - meta.staticUrl 非空（default 来源）→ fetch /pet/.../*.gif 拿 Blob，进 IDB
+///     —— 让 fork 出来的 mine 副本有自己的 blob，跟其它来源等价；将来用户改 prompt /
+///        删图 / 上传社区都走统一路径。
+///   - 否则 → 从 IDB 读 meta.id 对应的 blob
 async function clonePresetDeep(
   src: Preset,
   newName: string,
@@ -259,15 +317,26 @@ async function clonePresetDeep(
   for (const cat of PET_CATEGORIES) {
     for (const meta of src.categories[cat]) {
       try {
-        const blob = await getAssetBlob(meta.id);
+        let blob: Blob | null = null;
+        if (meta.staticUrl) {
+          const res = await fetch(meta.staticUrl);
+          if (res.ok) blob = await res.blob();
+        } else {
+          blob = await getAssetBlob(meta.id);
+        }
         if (!blob) continue;
         const newId = generateId();
         await putAssetBlob(newId, blob);
         const url = await getAssetUrl(newId);
+        // fork 后的 meta 必须脱离 default：去掉 staticUrl，source 落地到 local，
+        // 让所有后续操作（prompt 编辑 / 删除 / 上传社区）走统一的 IDB 路径。
+        const { staticUrl: _omit, ...rest } = meta;
         const newMeta: PetAssetMeta = {
-          ...meta,
+          ...rest,
           id: newId,
           addedAt: now,
+          source: meta.source === "default" ? "local" : (meta.source ?? "local"),
+          sizeBytes: blob.size,
         };
         newCategories[cat].push(newMeta);
         if (url) blobUrls[newId] = url;
@@ -604,6 +673,28 @@ export const usePetAssetsStore = create<PetAssetsState>()(
             blobUrls: nextBlobUrls,
           };
         });
+      },
+
+      updateAssetPrompt: (presetId, category, assetId, prompt) => {
+        if (presetId === DEFAULT_PRESET_ID) return;
+        const trimmed = prompt?.trim() ?? "";
+        const normalized = trimmed.length > 0 ? trimmed : null;
+        set((s) => ({
+          presets: s.presets.map((p) => {
+            if (p.id !== presetId) return p;
+            if (p.source !== "mine") return p;
+            return {
+              ...p,
+              categories: {
+                ...p.categories,
+                [category]: p.categories[category].map((m) =>
+                  m.id === assetId ? { ...m, communityPrompt: normalized } : m,
+                ),
+              },
+              updatedAt: Date.now(),
+            };
+          }),
+        }));
       },
 
       hydrateBlobs: async () => {

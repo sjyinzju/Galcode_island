@@ -20,6 +20,17 @@ import { isCommunityEnabled } from "../../lib/communityClient";
 
 const MAX_PROMPT_LEN = 2000;
 
+/// 与 AssetDetailDialog 共用的"消费场景表"——保持两处说法一致。
+/// null 表示该类目前还没有 LLM 文案生成，prompt 填了也暂不会被读取。
+const PROMPT_USE_BY_CATEGORY: Record<PetCategory, string | null> = {
+  welcome: "生成开场欢迎语",
+  complete: "生成任务完成总结",
+  others: "生成被戳的互动台词",
+  thinking: null,
+  waiting: null,
+  error: null,
+};
+
 export interface UploadPromptDialogProps {
   file: File;
   category: PetCategory;
@@ -133,7 +144,7 @@ export function UploadPromptDialog({
           <div className="flex flex-col gap-1.5">
             <label className="flex items-center justify-between text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
               <span>
-                团长文案风格 prompt
+                这张图绑定的人设 prompt
                 <span className="ml-1 rounded bg-zinc-200/70 px-1 text-[9px] text-zinc-500 dark:bg-zinc-700/60 dark:text-zinc-400">
                   可选
                 </span>
@@ -147,9 +158,20 @@ export function UploadPromptDialog({
               </span>
             </label>
             <p className="text-[10px] leading-relaxed text-zinc-500 dark:text-zinc-400">
-              这段文字会在使用这张图作为桌宠时，
-              <span className="font-medium text-amber-700 dark:text-amber-400">完全替换团长（凉宫春日）人设</span>
-              ，用你写的风格生成任务总结。留空就保持默认凉宫春日风。
+              {PROMPT_USE_BY_CATEGORY[category] ? (
+                <>
+                  桌宠抽中这张「{PET_CATEGORY_LABEL[category]}」类的图、要
+                  <span className="font-medium text-amber-700 dark:text-amber-400">
+                    {PROMPT_USE_BY_CATEGORY[category]}
+                  </span>
+                  时，会用这段文字替换默认人设说话。留空则沿用默认人设。
+                </>
+              ) : (
+                <>
+                  「{PET_CATEGORY_LABEL[category]}」类目前还没有需要 LLM 文案的场景，
+                  这里填的 prompt 暂时不会被读取——可以留作以后扩展用。
+                </>
+              )}
             </p>
             <textarea
               value={prompt}
