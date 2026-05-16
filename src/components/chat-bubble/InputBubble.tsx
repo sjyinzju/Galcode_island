@@ -14,6 +14,7 @@ import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
 import { selectPromptOverride } from "../../lib/petPromptOverride";
 import {
   getActiveCategories,
+  getActivePreset,
   isCustomPresetActive,
   usePetAssetsStore,
 } from "../../stores/usePetAssetsStore";
@@ -97,11 +98,18 @@ export function InputBubble(): JSX.Element {
       const petState = usePetAssetsStore.getState();
       if (!isCustomPresetActive(petState)) return fallback();
       const welcomeList = getActiveCategories(petState).welcome ?? [];
-      // 找一张有非空 prompt 的（任意一张即可，random pick 让多张时风格也多样）
+      const presetPersona = getActivePreset(petState).persona?.trim() || null;
+      // 解析顺序：先看 welcome 类有图带 prompt → 用图 prompt；否则回退到预设 persona；
+      // 都空才走静态 GREETINGS 兜底
       const withPrompt = welcomeList.filter((m) => m.communityPrompt?.trim());
-      if (withPrompt.length === 0) return fallback();
-      const picked = withPrompt[Math.floor(Math.random() * withPrompt.length)]!;
-      const persona = picked.communityPrompt!.trim();
+      let persona: string | null = null;
+      if (withPrompt.length > 0) {
+        const picked = withPrompt[Math.floor(Math.random() * withPrompt.length)]!;
+        persona = picked.communityPrompt!.trim();
+      } else if (presetPersona) {
+        persona = presetPersona;
+      }
+      if (!persona) return fallback();
       // 缓存：同 persona 一次会话内只调一次 LLM（避免反复"idle → 重新生成"耗 token）
       const cacheKey = `welcome:${persona}:${displayNickname}`;
       const cached = welcomeSpeechCache.get(cacheKey);

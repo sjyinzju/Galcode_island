@@ -5,6 +5,7 @@ import { invoke } from "../../lib/bridge";
 import type { AgentStatus } from "../../types/agent";
 import {
   getActiveCategories,
+  getActivePreset,
   isCustomPresetActive,
   usePetAssetsStore,
   type PetCategory,
@@ -124,6 +125,8 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
   const customEnabled = usePetAssetsStore(isCustomPresetActive);
   const customAssets = usePetAssetsStore(getActiveCategories);
   const customBlobUrls = usePetAssetsStore((s) => s.blobUrls);
+  // 当前预设的 persona（图无 prompt 时的兜底）；default 是 ""
+  const activePersona = usePetAssetsStore((s) => getActivePreset(s).persona);
 
   const visualState = useMemo(
     () => getVisualState(uiState, mode, agentStatus),
@@ -169,18 +172,22 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
   const lastPokeAtRef = useRef<number>(0);
   const pokeTokenRef = useRef<number>(0);
 
-  /// 选一张当前刚被点击切换到的 others 类图（决定 prompt 来源）。
-  /// 自定义未启用 / others 类无图 → null（用默认凉宫风）
+  /// 选一张刚被点击切换到的 others 类图，并决定本次 poke 用哪段 persona：
+  /// 图 prompt > 预设 persona > null（让 Rust 走凉宫春日兜底）。
   function pickPokeImageForPersona(): {
     persona: string | null;
     imageId: string | null;
   } {
     if (!customEnabled) return { persona: null, imageId: null };
+    const presetPp = activePersona?.trim() || null;
     const list = customAssets.others ?? [];
-    if (list.length === 0) return { persona: null, imageId: null };
+    if (list.length === 0) {
+      return { persona: presetPp, imageId: null };
+    }
     const meta = list[Math.floor(Math.random() * list.length)]!;
-    const p = meta.communityPrompt?.trim();
-    return { persona: p && p.length > 0 ? p : null, imageId: meta.id };
+    const ip = meta.communityPrompt?.trim();
+    const resolved = ip && ip.length > 0 ? ip : presetPp;
+    return { persona: resolved, imageId: meta.id };
   }
 
   const handleClick = useCallback(() => {

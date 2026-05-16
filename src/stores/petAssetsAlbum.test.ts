@@ -85,6 +85,7 @@ describe("active 状态选择器", () => {
         createdAt: 0,
         updatedAt: 0,
         categories: cats,
+        persona: "",
       },
     ];
     const state = { presets, activePresetId: "p1" };

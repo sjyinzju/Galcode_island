@@ -338,12 +338,15 @@ function PresetDetail({
   const [nameDraft, setNameDraft] = useState<string>(preset.name);
   const [descDraft, setDescDraft] = useState<string>(preset.description);
   const [uploadDialogOpen, setUploadDialogOpen] = useState<boolean>(false);
+  /// 人设 prompt 弹窗——从头部按钮触发；不再常驻于右列正文
+  const [personaDialogOpen, setPersonaDialogOpen] = useState<boolean>(false);
 
   // preset 改变（如左列切换、auto-fork）时把草稿同步过来
   useEffect(() => {
     setRenaming(false);
     setNameDraft(preset.name);
     setDescDraft(preset.description);
+    setPersonaDialogOpen(false);
   }, [preset.id]);
 
   const editable = preset.source === "mine";
@@ -434,6 +437,14 @@ function PresetDetail({
               应用
             </button>
           )}
+          {/* 只有 mine 预设可以进人设配置面板——default 内容全空、community
+              是下载下来的只读快照，给"查看入口"反而让用户以为可改，干脆都隐藏。 */}
+          {preset.source === "mine" ? (
+            <PersonaHeaderButton
+              preset={preset}
+              onOpen={() => setPersonaDialogOpen(true)}
+            />
+          ) : null}
           {editable ? (
             <>
               <button
@@ -524,7 +535,45 @@ function PresetDetail({
           onClose={() => setUploadDialogOpen(false)}
         />
       ) : null}
+
+      {personaDialogOpen ? (
+        <PresetPersonaDialog
+          preset={preset}
+          onClose={() => setPersonaDialogOpen(false)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+// 头部按钮：仅 mine 预设可见。persona 非空时右上角加小琥珀点，让"已配置"一眼可见。
+function PersonaHeaderButton({
+  preset,
+  onOpen,
+}: {
+  preset: Preset;
+  onOpen: () => void;
+}): JSX.Element {
+  const hasPersona = preset.persona.trim().length > 0;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="relative rounded-md border border-amber-300/50 bg-amber-50/60 px-2 py-1 text-[11px] font-medium text-amber-800 transition-colors hover:bg-amber-100/70 dark:border-amber-300/30 dark:bg-amber-400/10 dark:text-amber-300 dark:hover:bg-amber-400/15"
+      title={
+        hasPersona
+          ? "查看 / 编辑预设级人设 prompt"
+          : "未配置预设级人设 prompt（桌宠会用凉宫春日兜底）"
+      }
+    >
+      人设
+      {hasPersona ? (
+        <span
+          className="pointer-events-none absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-500 ring-1 ring-white dark:ring-slate-800"
+          aria-label="已配置"
+        />
+      ) : null}
+    </button>
   );
 }
 
@@ -538,6 +587,308 @@ interface CategoryCardProps {
   /// preset.source === "mine" 时为 true：直接 + 删；source=community 时 + 添加会触发
   /// auto-fork；source=default 时整组写入入口隐藏（用户必须先"复制为我的"或"新建预设"）
   editable: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// 人设中心：仅 mine 预设可进入。
+//   - 顶部一条带色块的解析顺序提示
+//   - 预设级 prompt（适用于所有图未单独配置时的兜底）
+//   - 按类别列出每张图的 prompt 配置；类别右侧标"用于 X" 或"未消费"
+//   - 单 Save 按钮批量提交所有改动
+// ---------------------------------------------------------------------------
+
+const MAX_PROMPT_LEN = 2000;
+
+/// 各类别"目前会读取这张图 prompt"的场景。null = 暂未消费。
+/// （跟 AssetDetailDialog / UploadPromptDialog 同义；改消费侧记得同步这三处。）
+const PROMPT_USE_BY_CATEGORY: Record<PetCategory, string | null> = {
+  welcome: "开场欢迎语",
+  complete: "任务完成总结",
+  others: "被戳互动台词",
+  thinking: null,
+  waiting: null,
+  error: null,
+};
+
+interface PresetPersonaDialogProps {
+  preset: Preset;
+  onClose: () => void;
+}
+
+function PresetPersonaDialog({
+  preset,
+  onClose,
+}: PresetPersonaDialogProps): JSX.Element {
+  const updatePresetPersona = usePetAssetsStore((s) => s.updatePresetPersona);
+  const updateAssetPrompt = usePetAssetsStore((s) => s.updateAssetPrompt);
+  const blobUrls = usePetAssetsStore((s) => s.blobUrls);
+
+  const [presetDraft, setPresetDraft] = useState<string>(preset.persona);
+  const [imageDrafts, setImageDrafts] = useState<Record<string, string>>(() =>
+    initImageDrafts(preset),
+  );
+  const [savedFlash, setSavedFlash] = useState<boolean>(false);
+
+  useEffect(() => {
+    setPresetDraft(preset.persona);
+    setImageDrafts(initImageDrafts(preset));
+    setSavedFlash(false);
+  }, [preset.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const presetOverLimit = presetDraft.length > MAX_PROMPT_LEN;
+  const presetDirty = presetDraft.trim() !== preset.persona.trim();
+  const imageOverLimit = Object.values(imageDrafts).some(
+    (v) => v.length > MAX_PROMPT_LEN,
+  );
+  const imageDirtyIds: string[] = [];
+  for (const cat of PET_CATEGORIES) {
+    for (const m of preset.categories[cat]) {
+      const d = imageDrafts[m.id] ?? "";
+      if (d.trim() !== (m.communityPrompt ?? "").trim()) imageDirtyIds.push(m.id);
+    }
+  }
+  const totalDirty = (presetDirty ? 1 : 0) + imageDirtyIds.length;
+  const overLimit = presetOverLimit || imageOverLimit;
+
+  const handleSaveAll = (): void => {
+    if (overLimit || totalDirty === 0) return;
+    if (presetDirty) updatePresetPersona(preset.id, presetDraft);
+    for (const cat of PET_CATEGORIES) {
+      for (const m of preset.categories[cat]) {
+        if (imageDirtyIds.includes(m.id)) {
+          updateAssetPrompt(preset.id, cat, m.id, imageDrafts[m.id] ?? "");
+        }
+      }
+    }
+    setSavedFlash(true);
+    window.setTimeout(() => setSavedFlash(false), 1500);
+  };
+
+  const totalImageCount = PET_CATEGORIES.reduce(
+    (n, c) => n + preset.categories[c].length,
+    0,
+  );
+
+  return (
+    <div
+      className="fixed inset-0 z-[140] flex items-center justify-center bg-black/45 backdrop-blur-sm"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="人设 prompt 配置"
+    >
+      <div className="relative w-[min(720px,94vw)] max-h-[92vh] overflow-hidden rounded-2xl border border-white/30 bg-white/85 shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-slate-900/85 flex flex-col">
+        <div className="h-1 shrink-0 bg-gradient-to-r from-amber-400 via-rose-300 to-sky-400" />
+
+        <header className="flex items-center justify-between gap-2 px-5 py-3 shrink-0">
+          <div className="min-w-0">
+            <h2 className="truncate text-base font-semibold text-zinc-800 dark:text-zinc-100">
+              人设 prompt · {preset.name}
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="关闭"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-zinc-500 transition-colors hover:bg-black/5 hover:text-zinc-800 dark:hover:bg-white/10 dark:hover:text-zinc-100"
+          >
+            <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M3 3l10 10M13 3L3 13" strokeLinecap="round" />
+            </svg>
+          </button>
+        </header>
+
+        <div className="overflow-y-auto px-5 pb-4 flex flex-col gap-4">
+          {/* 顶部解析顺序提示——优先级在前，让用户读到第一眼就理解层级关系 */}
+          <div className="rounded-md border border-amber-300/30 bg-amber-50/50 px-3 py-2 text-[11px] leading-relaxed text-zinc-700 dark:border-amber-300/15 dark:bg-amber-400/5 dark:text-zinc-200">
+            <span className="ml-2 text-zinc-500 dark:text-zinc-400">
+              优先级：
+            </span>
+            <span className="rounded bg-sky-500/15 px-1 text-sky-700 dark:text-sky-300">图片级</span>
+            {" > "}
+            <span className="rounded bg-amber-500/15 px-1 text-amber-700 dark:text-amber-300">预设级</span>
+            {" > "}
+            <span className="rounded bg-zinc-500/15 px-1 text-zinc-600 dark:text-zinc-300">凉宫春日</span>
+            <span className="ml-2 text-zinc-500 dark:text-zinc-400">
+              前两级都留空，桌宠就会用默认凉宫春日的语气说话。
+            </span>
+          </div>
+
+          {/* 预设级 */}
+          <section className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
+                预设级
+                <span className="ml-1 text-[10px] text-zinc-400 dark:text-zinc-500">
+                  · 整套图的兜底人设
+                </span>
+              </h3>
+              <span
+                className={`text-[10px] ${
+                  presetOverLimit ? "text-rose-600" : "text-zinc-400 dark:text-zinc-500"
+                }`}
+              >
+                {presetDraft.length} / {MAX_PROMPT_LEN}
+              </span>
+            </div>
+            <textarea
+              value={presetDraft}
+              onChange={(e) => setPresetDraft(e.target.value)}
+              rows={3}
+              placeholder="例：你是温柔的姐姐，说话用「呢」「哦」语气词..."
+              className="w-full resize-y rounded-md border border-black/10 bg-white/80 px-2.5 py-2 text-[12px] text-zinc-800 outline-none transition-colors placeholder:text-zinc-400 focus:border-amber-400 dark:border-white/10 dark:bg-slate-800/60 dark:text-zinc-100 dark:focus:bg-slate-800/80"
+            />
+          </section>
+
+          {/* 图片级 */}
+          <section className="flex flex-col gap-2">
+            <h3 className="text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
+              图片级
+              <span className="ml-1 text-[10px] text-zinc-400 dark:text-zinc-500">
+                · 按类别覆盖
+              </span>
+            </h3>
+            {totalImageCount === 0 ? (
+              <div className="rounded border border-dashed border-zinc-300/60 px-3 py-3 text-center text-[11px] text-zinc-400 dark:border-zinc-700/60 dark:text-zinc-500">
+                这份预设当前没有图——先回去给它加几张再来调 prompt。
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                {PET_CATEGORIES.map((cat) => {
+                  const list = preset.categories[cat];
+                  if (list.length === 0) return null;
+                  return (
+                    <CategoryPromptSection
+                      key={cat}
+                      category={cat}
+                      list={list}
+                      blobUrls={blobUrls}
+                      drafts={imageDrafts}
+                      onChange={(id, v) =>
+                        setImageDrafts((prev) => ({ ...prev, [id]: v }))
+                      }
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-black/5 px-5 py-3 dark:border-white/5">
+          {totalDirty > 0 ? (
+            <span className="mr-auto text-[10px] text-amber-700 dark:text-amber-300">
+              {totalDirty} 项未保存
+            </span>
+          ) : null}
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-black/10 bg-white/60 px-4 py-1.5 text-[12px] text-zinc-700 transition-colors hover:bg-zinc-100/80 dark:border-white/10 dark:bg-slate-800/60 dark:text-zinc-200 dark:hover:bg-slate-800"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={handleSaveAll}
+            disabled={overLimit || totalDirty === 0}
+            className="rounded-md border border-amber-400/60 bg-amber-500 px-4 py-1.5 text-[12px] font-medium text-white shadow-sm transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
+            title={
+              overLimit
+                ? "有字段超过字数上限"
+                : totalDirty > 0
+                  ? "把预设级 + 图片级改动一起保存"
+                  : "没有未保存的改动"
+            }
+          >
+            {savedFlash ? "已保存 ✓" : totalDirty > 0 ? "保存" : "无变动"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function initImageDrafts(preset: Preset): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const cat of PET_CATEGORIES) {
+    for (const m of preset.categories[cat]) {
+      out[m.id] = m.communityPrompt ?? "";
+    }
+  }
+  return out;
+}
+
+interface CategoryPromptSectionProps {
+  category: PetCategory;
+  list: PetAssetMeta[];
+  blobUrls: Record<string, string>;
+  drafts: Record<string, string>;
+  onChange: (assetId: string, value: string) => void;
+}
+
+function CategoryPromptSection({
+  category,
+  list,
+  blobUrls,
+  drafts,
+  onChange,
+}: CategoryPromptSectionProps): JSX.Element {
+  const usage = PROMPT_USE_BY_CATEGORY[category];
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-black/5 bg-white/40 p-2 dark:border-white/5 dark:bg-slate-800/40">
+      <div className="flex items-baseline gap-1.5 text-[11px] font-medium text-zinc-700 dark:text-zinc-200">
+        <span>{PET_CATEGORY_LABEL[category]}</span>
+        <span className="text-[10px] text-zinc-400 dark:text-zinc-500">
+          {list.length} 张
+        </span>
+        {usage ? (
+          <span className="rounded bg-sky-500/10 px-1 text-[9px] text-sky-700 dark:text-sky-300">
+            用于 {usage}
+          </span>
+        ) : (
+          <span className="rounded bg-zinc-500/10 px-1 text-[9px] text-zinc-500 dark:text-zinc-400">
+            未使用
+          </span>
+        )}
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {list.map((meta) => {
+          const url = meta.staticUrl ?? blobUrls[meta.id];
+          const draft = drafts[meta.id] ?? "";
+          return (
+            <div key={meta.id} className="flex items-start gap-2">
+              <div
+                className="h-10 w-10 shrink-0 overflow-hidden rounded border border-black/10 bg-white/50 dark:border-white/10 dark:bg-slate-900/50"
+                title={meta.fileName}
+              >
+                {url ? (
+                  <img src={url} alt="" className="h-full w-full object-cover" draggable={false} />
+                ) : null}
+              </div>
+              <textarea
+                value={draft}
+                onChange={(e) => onChange(meta.id, e.target.value)}
+                rows={2}
+                placeholder="留空则回退预设级"
+                className="min-w-0 flex-1 resize-y rounded-md border border-black/10 bg-white/70 px-2 py-1 text-[11px] text-zinc-700 outline-none transition-colors placeholder:text-zinc-400 focus:border-sky-400 dark:border-white/10 dark:bg-slate-800/60 dark:text-zinc-200"
+              />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function CategoryCard({

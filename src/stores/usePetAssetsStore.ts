@@ -97,6 +97,11 @@ export interface Preset {
   createdAt: number;
   updatedAt: number;
   categories: CategoryMap<PetAssetMeta[]>;
+  /// 预设级"人设 prompt"——作为单张图 prompt 缺失时的兜底。
+  /// 解析顺序：图 prompt > 预设 persona > Rust 端硬编码的凉宫春日。
+  /// 默认预设保持 ""（让 Rust 兜底直接生效）；mine 可编辑；community 当前从服务端
+  /// 拿不到该字段（server schema 还没扩），下载后默认 ""，等用户复制为我的后再填。
+  persona: string;
 }
 
 type CategoryMap<T> = Record<PetCategory, T>;
@@ -163,6 +168,8 @@ export const DEFAULT_PRESET: Preset = Object.freeze({
   createdAt: 0,
   updatedAt: 0,
   categories: buildDefaultCategories(),
+  /// 留空：Rust 端 compose_system_prompt(None) 会自动用 haruhi_persona_section 兜底
+  persona: "",
 }) as Preset;
 
 /// addAsset 返回值：UI 据此显示"社区同步失败但本地已存"等差异化文案。
@@ -207,6 +214,10 @@ interface PetAssetsState {
   renamePreset: (id: string, name: string) => void;
   /// 改描述；不可改 default
   updatePresetDescription: (id: string, description: string) => void;
+
+  /// 改预设级 persona prompt（参与"图 prompt > 预设 persona > 凉宫"的兜底链）。
+  /// 仅对 mine 来源生效；default / community 静默 no-op（UI 应置灰输入框）。
+  updatePresetPersona: (id: string, persona: string) => void;
 
   /// 删除预设：从 presets[] 移除 + 删它持有的所有 blob。
   /// 不能删 default；如果删的是 active，自动切回 default。
@@ -355,6 +366,8 @@ async function clonePresetDeep(
     createdAt: now,
     updatedAt: now,
     categories: newCategories,
+    // fork 时把 source 的 persona 一并带过来；default 通常是 ""，community 也 ""
+    persona: src.persona ?? "",
   };
   return { preset, blobUrls };
 }
@@ -409,6 +422,7 @@ export const usePetAssetsStore = create<PetAssetsState>()(
           createdAt: now,
           updatedAt: now,
           categories: emptyByCategory<PetAssetMeta[]>(() => []),
+          persona: "",
         };
         set((s) => ({ presets: [...s.presets, preset], activePresetId: preset.id }));
         return preset.id;
@@ -446,6 +460,18 @@ export const usePetAssetsStore = create<PetAssetsState>()(
           presets: s.presets.map((p) =>
             p.id === id ? { ...p, description, updatedAt: Date.now() } : p,
           ),
+        }));
+      },
+
+      updatePresetPersona: (id, persona) => {
+        if (id === DEFAULT_PRESET_ID) return;
+        set((s) => ({
+          presets: s.presets.map((p) => {
+            if (p.id !== id) return p;
+            // 仅 mine 来源可写——community 想改请先复制为我的
+            if (p.source !== "mine") return p;
+            return { ...p, persona, updatedAt: Date.now() };
+          }),
         }));
       },
 
@@ -530,6 +556,8 @@ export const usePetAssetsStore = create<PetAssetsState>()(
           createdAt: now,
           updatedAt: now,
           categories: newCategories,
+          // TODO: server schema 暂未带 persona 字段；下载下来留空，用户复制为我的后自配
+          persona: "",
         };
         set((s) => ({
           presets: [...s.presets, preset],
@@ -743,6 +771,8 @@ export const usePetAssetsStore = create<PetAssetsState>()(
               error: p.categories?.error ?? [],
               others: p.categories?.others ?? [],
             },
+            // v1 → v2 兼容：旧持久化没有 persona 字段，背填 ""
+            persona: typeof p.persona === "string" ? p.persona : "",
           }));
           return {
             ...currentState,
@@ -784,6 +814,7 @@ export const usePetAssetsStore = create<PetAssetsState>()(
               source: "mine",
               authorName: null,
               communityAlbumId: legacySnapshot?.albumId ?? null,
+              persona: "",
               createdAt: now,
               updatedAt: now,
               categories,
