@@ -129,6 +129,9 @@ interface SettingsState {
   translateInput: boolean;
   /// 缓存上次拉到的模型列表，避免每次 SettingsModal 打开都拉
   availableModels: string[];
+  /// 桌宠图社区后端地址（如 https://community.example.com）。空字符串 = 未启用，
+  /// "看看大家的图"按钮变灰；上传图片时跳过社区同步只落本地。
+  communityBaseUrl: string;
 
   /// 三个 backend 各自的 model / effort / proxy / binary。空字符串表示用默认。
   /// 启动时由 App.tsx 同步到 Rust 端 update_backend_preferences；保存时也同步。
@@ -146,6 +149,7 @@ interface SettingsState {
   setThinking: (thinking: boolean) => void;
   setTranslateInput: (translateInput: boolean) => void;
   setAvailableModels: (models: string[]) => void;
+  setCommunityBaseUrl: (url: string) => void;
   setBackendPref: (backend: BackendKey, field: keyof BackendPrefs, value: string) => void;
   setBackendPrefs: (backend: BackendKey, prefs: Partial<BackendPrefs>) => void;
   openSettingsModal: () => void;
@@ -163,6 +167,7 @@ export const useSettingsStore = create<SettingsState>()(
       thinking: false,
       translateInput: false,
       availableModels: [],
+      communityBaseUrl: "",
       backends: {
         "claude-code": emptyBackendPrefs(),
         codex: emptyBackendPrefs(),
@@ -178,6 +183,7 @@ export const useSettingsStore = create<SettingsState>()(
       setThinking: (thinking) => set({ thinking }),
       setTranslateInput: (translateInput) => set({ translateInput }),
       setAvailableModels: (availableModels) => set({ availableModels }),
+      setCommunityBaseUrl: (communityBaseUrl) => set({ communityBaseUrl }),
       setBackendPref: (backend, field, value) =>
         set((state) => ({
           backends: {
@@ -220,6 +226,7 @@ export const useSettingsStore = create<SettingsState>()(
         thinking: state.thinking,
         translateInput: state.translateInput,
         availableModels: state.availableModels,
+        communityBaseUrl: state.communityBaseUrl,
         backends: state.backends,
       }),
     }

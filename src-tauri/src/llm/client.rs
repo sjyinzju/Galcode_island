@@ -373,16 +373,22 @@ pub struct AgentSummaryResult {
     pub next_options: Vec<String>,
 }
 
+/// 生成凉宫春日风格（或社区图自定义人设）的任务总结。
+///
+/// `prompt_override`：可选；非空时会**整段替换凉宫春日人设**，输出契约保留。
+/// 当用户启用社区桌宠图且该图带 `prompt` 时，前端把 prompt 通过 IPC 透传到此。
 pub fn generate_agent_summary(
     cfg: &LlmConfig,
     user_zh: &str,
     agent_output_zh: &str,
+    prompt_override: Option<&str>,
 ) -> Result<AgentSummaryResult, String> {
     let user = format!(
         "【用户原始需求】\n{}\n\n【Agent 输出】\n{}",
         user_zh, agent_output_zh
     );
-    let text = chat_completion(cfg, prompt::haruhi_system_prompt(), &user, None)?;
+    let system = prompt::compose_system_prompt(prompt_override);
+    let text = chat_completion(cfg, &system, &user, None)?;
     let cleaned = text
         .trim()
         .trim_start_matches("```json")

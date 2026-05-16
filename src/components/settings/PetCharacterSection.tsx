@@ -23,6 +23,12 @@ import {
   usePetAssetsStore,
   type PetCategory,
 } from "../../stores/usePetAssetsStore";
+import { useProfileStore } from "../../stores/useProfileStore";
+import { isCommunityEnabled } from "../../lib/communityClient";
+import { hasAlbumChanges } from "../../stores/usePetAssetsStore";
+import { UploadPromptDialog } from "./UploadPromptDialog";
+import { UploadAlbumDialog } from "./UploadAlbumDialog";
+import { CommunityPickerModal } from "./CommunityPickerModal";
 
 const ACCEPTED_MIME = "image/gif,image/png,image/jpeg,image/webp,image/apng";
 
@@ -38,28 +44,56 @@ function CategoryCard({ category, error, setError }: CategoryCardProps): JSX.Ele
   const blobUrls = usePetAssetsStore((s) => s.blobUrls);
   const addAsset = usePetAssetsStore((s) => s.addAsset);
   const removeAsset = usePetAssetsStore((s) => s.removeAsset);
+  const nickname = useProfileStore((s) => s.nickname);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
+  /// 选完文件等待用户填提示词的队列；FIFO 依次走完
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  /// "看看大家的图"窗口开关
+  const [communityOpen, setCommunityOpen] = useState<boolean>(false);
 
-  const handleFiles = async (files: FileList | null): Promise<void> => {
+  const handleFiles = (files: FileList | null): void => {
     if (!files || files.length === 0) return;
+    // 直接把所有文件入队列；用户对每个都填一次 prompt（多选场景）。
+    setPendingFiles(Array.from(files));
+    // 立刻清空 input，让用户能重新选同一批文件
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  const currentPending = pendingFiles[0] ?? null;
+
+  const handleDialogConfirm = async (input: {
+    prompt: string | null;
+    shareToCommunity: boolean;
+    uploaderName: string | null;
+  }): Promise<void> => {
+    const file = pendingFiles[0];
+    if (!file) return;
     setBusy(true);
     try {
-      // 多选：依次入库；遇错把第一条错回报，剩下文件继续尝试
-      let firstErr: string | null = null;
-      for (const f of Array.from(files)) {
-        try {
-          await addAsset(category, f);
-        } catch (err) {
-          if (!firstErr) firstErr = String((err as Error).message ?? err);
-        }
+      const result = await addAsset(category, file, {
+        prompt: input.prompt,
+        shareToCommunity: input.shareToCommunity,
+        uploaderName: input.uploaderName,
+      });
+      if (result.uploadError) {
+        // 本地落盘成功 + 社区同步失败：明显但非致命提示
+        setError(`已存本地，社区同步失败：${result.uploadError.message}`);
+      } else {
+        setError("");
       }
-      if (firstErr) setError(firstErr);
-      else setError("");
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
     } finally {
       setBusy(false);
-      if (inputRef.current) inputRef.current.value = "";
+      // 出队，继续下一张（若有）
+      setPendingFiles((prev) => prev.slice(1));
     }
+  };
+
+  const handleDialogCancel = (): void => {
+    // 取消当前 + 后续整批（避免逐个点取消）
+    setPendingFiles([]);
   };
 
   return (
@@ -71,26 +105,59 @@ function CategoryCard({ category, error, setError }: CategoryCardProps): JSX.Ele
             {list.length} 张
           </span>
         </span>
-        <button
-          type="button"
-          onClick={() => inputRef.current?.click()}
-          disabled={busy}
-          className="flex items-center gap-1 rounded border border-sky-400/50 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 transition-all hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-sky-300/40 dark:text-sky-300"
-        >
-          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-2.5 w-2.5">
-            <path d="M6 2v8M2 6h8" strokeLinecap="round" />
-          </svg>
-          {busy ? "上传中…" : "添加图片"}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setCommunityOpen(true)}
+            className="flex items-center gap-1 rounded border border-fuchsia-400/50 bg-fuchsia-500/10 px-2 py-0.5 text-[11px] font-medium text-fuchsia-700 transition-all hover:bg-fuchsia-500/20 dark:border-fuchsia-300/40 dark:text-fuchsia-300"
+            title={isCommunityEnabled() ? "看看大家上传的图" : "去设置配置社区地址后可用"}
+          >
+            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-2.5 w-2.5">
+              <circle cx="7" cy="7" r="2" />
+              <path d="M1.5 7s2-4 5.5-4 5.5 4 5.5 4-2 4-5.5 4S1.5 7 1.5 7z" strokeLinecap="round" />
+            </svg>
+            看看大家的图
+          </button>
+          <button
+            type="button"
+            onClick={() => inputRef.current?.click()}
+            disabled={busy}
+            className="flex items-center gap-1 rounded border border-sky-400/50 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 transition-all hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-sky-300/40 dark:text-sky-300"
+          >
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-2.5 w-2.5">
+              <path d="M6 2v8M2 6h8" strokeLinecap="round" />
+            </svg>
+            {busy ? "上传中…" : "添加图片"}
+          </button>
+        </div>
         <input
           ref={inputRef}
           type="file"
           accept={ACCEPTED_MIME}
           multiple
           className="hidden"
-          onChange={(e) => void handleFiles(e.target.files)}
+          onChange={(e) => handleFiles(e.target.files)}
         />
       </div>
+
+      {/* 选完文件 → 弹上传向导（多文件 FIFO） */}
+      {currentPending ? (
+        <UploadPromptDialog
+          file={currentPending}
+          category={category}
+          defaultUploaderName={nickname}
+          onConfirm={(v) => void handleDialogConfirm(v)}
+          onCancel={handleDialogCancel}
+        />
+      ) : null}
+
+      {/* "看看大家的图" 窗口 */}
+      {communityOpen ? (
+        <CommunityPickerModal
+          initialCategory={category}
+          onClose={() => setCommunityOpen(false)}
+        />
+      ) : null}
 
       {list.length === 0 ? (
         <div className="rounded border border-dashed border-zinc-300/60 bg-transparent px-3 py-2 text-center text-[11px] text-zinc-400 dark:border-zinc-700/60 dark:text-zinc-500">
@@ -141,6 +208,8 @@ export function PetCharacterSection(): JSX.Element {
   const enabled = usePetAssetsStore((s) => s.enabled);
   const setEnabled = usePetAssetsStore((s) => s.setEnabled);
   const assets = usePetAssetsStore((s) => s.assets);
+  const lastAlbumSnapshot = usePetAssetsStore((s) => s.lastAlbumSnapshot);
+  const [albumDialogOpen, setAlbumDialogOpen] = useState<boolean>(false);
 
   // 每个类别一个独立的 error；用 record 而非 6 个 useState
   const [errors, setErrors] = useState<Record<PetCategory, string>>({
@@ -176,6 +245,22 @@ export function PetCharacterSection(): JSX.Element {
   }, [errors]);
 
   const allReady = PET_CATEGORIES.every((c) => (assets[c]?.length ?? 0) > 0);
+  const totalAssetCount = PET_CATEGORIES.reduce(
+    (sum, c) => sum + (assets[c]?.length ?? 0),
+    0,
+  );
+  const albumDirty = hasAlbumChanges(assets, lastAlbumSnapshot);
+  const albumButtonDisabled =
+    totalAssetCount === 0 || !albumDirty || !isCommunityEnabled();
+  const albumButtonTitle = !isCommunityEnabled()
+    ? "社区服务未就绪"
+    : totalAssetCount === 0
+      ? "至少需要 1 张图"
+      : !albumDirty
+        ? `无变动${lastAlbumSnapshot ? `（已保存为「${lastAlbumSnapshot.name}」）` : ""}`
+        : lastAlbumSnapshot
+          ? "当前自定义图与上次图集不同，可保存为新图集"
+          : "把所有自定义图打包上传为云端图集";
 
   const handleToggle = (next: boolean): void => {
     try {
@@ -226,6 +311,40 @@ export function PetCharacterSection(): JSX.Element {
         <div className="rounded-md border border-rose-300/40 bg-rose-50/70 px-3 py-1.5 text-[11px] text-rose-700 dark:border-rose-300/30 dark:bg-rose-400/10 dark:text-rose-300">
           {topError}
         </div>
+      ) : null}
+
+      {/* "保存到云端图集" 操作行：变动 → 按钮 active；无变动 → 灰显 tooltip 提示 */}
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-emerald-300/30 bg-emerald-50/40 px-3 py-2 dark:border-emerald-300/15 dark:bg-emerald-400/5">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
+            云端图集
+            {lastAlbumSnapshot ? (
+              <span className="ml-1.5 rounded bg-emerald-500/10 px-1.5 py-0.5 text-[9px] text-emerald-700 dark:text-emerald-300">
+                已保存：{lastAlbumSnapshot.name}
+              </span>
+            ) : (
+              <span className="ml-1.5 rounded bg-zinc-300/40 px-1.5 py-0.5 text-[9px] text-zinc-500 dark:bg-zinc-700/40 dark:text-zinc-400">
+                未保存
+              </span>
+            )}
+          </span>
+          <span className="text-[10px] text-zinc-500 dark:text-zinc-400">
+            把当前所有自定义图打包为图集上传，让其他用户能整套使用。
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={() => setAlbumDialogOpen(true)}
+          disabled={albumButtonDisabled}
+          title={albumButtonTitle}
+          className="shrink-0 rounded-md border border-emerald-400/60 bg-emerald-500/15 px-3 py-1 text-[11px] font-medium text-emerald-700 transition-colors hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-300/40 dark:text-emerald-300"
+        >
+          {albumDirty ? (lastAlbumSnapshot ? "保存为新图集" : "保存到云端图集") : "无变动"}
+        </button>
+      </div>
+
+      {albumDialogOpen ? (
+        <UploadAlbumDialog onClose={() => setAlbumDialogOpen(false)} />
       ) : null}
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">

@@ -73,6 +73,9 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         // 系统级通知：任务结束时弹原生通知（前端调 sendNotification）
         .plugin(tauri_plugin_notification::init())
+        // HTTP plugin：让前端 fetch 走 Rust reqwest，绕开 macOS WKWebView 对
+        // tauri:// 跨域 fetch 的"Load failed"限制。仅桌面端使用；浏览器 LAN 走 window.fetch
+        .plugin(tauri_plugin_http::init())
         .manage(Arc::new(AppState::new()))
         .manage(Arc::new(agent::runtime::RuntimeState::default()))
         .manage(Arc::new(lan::LanRuntimeState::default()))

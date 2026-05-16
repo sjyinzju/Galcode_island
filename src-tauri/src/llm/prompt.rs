@@ -6,10 +6,17 @@ pub fn translate_en_to_zh_system() -> &'static str {
     "You translate AI agent output from English to Chinese. Keep code blocks, commands, package names, and file paths unchanged. Output only the Chinese translation."
 }
 
-pub fn haruhi_system_prompt() -> &'static str {
-r#"你是凉宫春日，SOS团团长，现在化身为用户的桌面赛博宠物/智能助理，负责监控和反馈后台AI编码Agent的工作状态。你需要根据Agent的输出，以凉宫春日的口吻和性格（傲娇、自信、活力四射、有时略带不耐烦但其实很关心进度），生成符合严格JSON格式的状态数据。
+/// 凉宫春日"人设"段：默认角色与语气定义。
+/// 桌宠社区图带 prompt 时，整段被该 prompt 替换；输出契约（下面 output_contract_section）
+/// 始终保留，保证 JSON 格式不会因 prompt 改写而崩。
+pub fn haruhi_persona_section() -> &'static str {
+r#"你是凉宫春日，SOS团团长，现在化身为用户的桌面赛博宠物/智能助理，负责监控和反馈后台AI编码Agent的工作状态。你需要根据Agent的输出，以凉宫春日的口吻和性格（傲娇、自信、活力四射、有时略带不耐烦但其实很关心进度），生成符合严格JSON格式的状态数据。"#
+}
 
-【分析要求】
+/// 输出契约段：分析要求 + Mode 映射 + JSON 格式 + 字段说明 + 示例。
+/// 该段始终拼接在 persona 之后，保证下游 JSON 解析稳定。
+pub fn output_contract_section() -> &'static str {
+r#"【分析要求】
 1. 分析用户输入（可能是指令或闲聊）与Agent最终的中文输出或遇到异常。
 2. 决定当前的状态模式 `mode`。
 3. 生成带有情绪的情景化台词 `emotion_speech`。
@@ -34,11 +41,11 @@ r#"你是凉宫春日，SOS团团长，现在化身为用户的桌面赛博宠�
 
 【格式字段说明】
 - `mode`: （字符串）必须是上面定义的状态之一。
-- `emotion_speech`: （字符串）凉宫春日口吻的台词（带情绪，字数不要太多，不要超过40字）。
+- `emotion_speech`: （字符串）以你的人设口吻产出的台词（带情绪，字数不要太多，不要超过40字）。
 - `summary_translation`: （字符串）客观且经过提炼的任务摘要或对最终Agent结果的翻译（不要带角色口吻，简明扼要说明“到底发生了什么”）。
 - `next_options`: （字符串数组）基于当前状态，给用户的1-3个行动建议，简短有力，每个建议不超过10个字。如果没有任何建议可以为空数组。
 
-示例输出：
+示例输出（凉宫风）：
 {
   "mode": "complete",
   "emotion_speech": "哼，本团长稍微监督了一下，这点小BUG它立刻就修好了！快点夸我！",
@@ -46,5 +53,54 @@ r#"你是凉宫春日，SOS团团长，现在化身为用户的桌面赛博宠�
   "next_options": ["去测试看看", "继续加新功能"]
 }
 "#
+}
+
+/// 拼出最终给 LLM 的 system prompt。
+/// - custom_persona = Some(非空) → 替换凉宫人设段为该 prompt，输出契约保留
+/// - custom_persona = None / Some(空) → 用 haruhi_persona_section
+pub fn compose_system_prompt(custom_persona: Option<&str>) -> String {
+    let persona: &str = match custom_persona {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => haruhi_persona_section(),
+    };
+    format!("{}\n\n{}", persona, output_contract_section())
+}
+
+/// 兼容老调用：等价于 compose_system_prompt(None)，返回 String 而不是 &'static str。
+/// 这里改成 String 是有意——拼接逻辑统一走 compose_system_prompt。
+pub fn haruhi_system_prompt() -> String {
+    compose_system_prompt(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_persona_includes_haruhi_traits_and_contract() {
+        let s = haruhi_system_prompt();
+        assert!(s.contains("凉宫春日"));
+        assert!(s.contains("emotion_speech"));
+        assert!(s.contains("next_options"));
+    }
+
+    #[test]
+    fn custom_persona_replaces_haruhi_but_keeps_contract() {
+        let custom = "你是温柔的姐姐，说话用「呢」「哦」语气词。";
+        let s = compose_system_prompt(Some(custom));
+        assert!(s.contains("温柔的姐姐"));
+        assert!(!s.contains("凉宫春日，SOS"), "人设段应被完全替换");
+        // 但输出契约必须仍在，否则下游 JSON 解析会崩
+        assert!(s.contains("emotion_speech"));
+        assert!(s.contains("next_options"));
+        assert!(s.contains("严格的纯JSON"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_custom_persona_falls_back_to_default() {
+        assert_eq!(compose_system_prompt(Some("")), haruhi_system_prompt());
+        assert_eq!(compose_system_prompt(Some("   \n\t")), haruhi_system_prompt());
+        assert_eq!(compose_system_prompt(None), haruhi_system_prompt());
+    }
 }
 

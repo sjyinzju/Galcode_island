@@ -42,6 +42,7 @@ struct StartAgentArgs {
     run_id: Option<String>,
     session_id: Option<String>,
     permission_mode: Option<String>,
+    prompt_override: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -346,6 +347,7 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                     p.run_id,
                     p.session_id,
                     p.permission_mode,
+                    p.prompt_override,
                 )
                 .await?,
             )

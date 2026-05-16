@@ -1,0 +1,47 @@
+# Galcode 桌宠社区后端反向代理示例。
+#
+# 假设：
+#   - 已经签好 HTTPS（这里只示 80→443 重定向 + 443 服务）
+#   - 服务在本机 127.0.0.1:8787 监听
+#   - 上传图目录是 /var/lib/galcode-community/uploads，nginx 直出
+#     （比走 Node 的 express.static 快得多 + 省 Node CPU）
+#
+# 把 community.example.com 换成你自己的域名，把路径换成实际安装位置。
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name community.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name community.example.com;
+
+    # ssl_certificate     /etc/letsencrypt/live/community.example.com/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/community.example.com/privkey.pem;
+
+    # 上传体上限：略大于 server/config 里的 MAX_UPLOAD_BYTES，多 1MB 头部余量
+    client_max_body_size 10m;
+
+    # 上传图直出，绕过 Node。文件名是 sha256.<ext>，本身就是 immutable
+    location /uploads/ {
+        alias /var/lib/galcode-community/uploads/;
+        access_log off;
+        add_header Cache-Control "public, max-age=2592000, immutable";
+        try_files $uri =404;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_read_timeout 60s;
+    }
+}

@@ -1,0 +1,104 @@
+/* 复核台样式。设计目标：信息密度高、清晰、暗色优先（管理员长时间使用）。 */
+
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --bg-2: #131a2f;
+  --card: #1a2240;
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #e6ecff;
+  --muted: #8895b8;
+  --accent: #6c8cff;
+  --accent-2: #ff7a90;
+  --ok: #4ade80;
+  --warn: #f59e0b;
+  --bad: #ef4444;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; font-family: -apple-system, "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+
+#app { min-height: 100vh; }
+
+.center { display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 24px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+  width: min(420px, 92vw);
+}
+
+.card h1 { margin: 0 0 16px; font-size: 20px; }
+.muted { color: var(--muted); }
+
+label { display: block; margin: 12px 0 6px; font-size: 13px; }
+input[type=text], input[type=password] {
+  width: 100%; padding: 10px 12px; font-size: 14px;
+  background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); outline: none;
+}
+input:focus { border-color: var(--accent); }
+button {
+  cursor: pointer; padding: 8px 14px; font-size: 13px;
+  background: var(--accent); color: white; border: 0; border-radius: 8px;
+  transition: opacity 0.15s, transform 0.05s;
+}
+button:hover { opacity: 0.9; }
+button:active { transform: translateY(1px); }
+button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+button.danger { background: var(--bad); }
+button.ok { background: var(--ok); color: #062a13; font-weight: 600; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 主界面 */
+.layout { display: flex; flex-direction: column; height: 100vh; }
+header.bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 18px; border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+header.bar h1 { font-size: 16px; margin: 0; }
+header.bar .right { display: flex; gap: 8px; align-items: center; }
+
+nav.filters { display: flex; gap: 6px; padding: 10px 18px; border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02); }
+nav.filters button {
+  background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 5px 12px; font-size: 12px;
+}
+nav.filters button.active { background: var(--accent); color: white; border-color: var(--accent); }
+
+main.list { flex: 1; overflow-y: auto; padding: 16px 18px; }
+.row {
+  display: grid; grid-template-columns: 96px 1fr auto; gap: 14px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px; margin-bottom: 10px;
+}
+.thumb { width: 96px; height: 96px; border-radius: 8px; overflow: hidden; background: #000; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.meta { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.meta .title { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.meta .prompt { font-size: 11px; color: var(--muted); white-space: pre-wrap; max-height: 4.5em; overflow: hidden; }
+.meta .ids { font-size: 10px; color: var(--muted); font-family: ui-monospace, "JetBrains Mono", monospace; }
+
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 10px; font-weight: 600; }
+.badge.approved { background: rgba(74,222,128,0.15); color: var(--ok); }
+.badge.rejected { background: rgba(239,68,68,0.18); color: var(--bad); }
+.badge.hidden_by_owner { background: rgba(168,168,168,0.18); color: var(--muted); }
+.badge.hidden_by_admin { background: rgba(239,68,68,0.2); color: var(--bad); }
+.badge.pending_ai { background: rgba(245,158,11,0.18); color: var(--warn); }
+.badge.reports { background: rgba(239,68,68,0.22); color: var(--bad); margin-left: 6px; }
+
+.actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+.actions button { min-width: 88px; }
+
+.empty {
+  text-align: center; padding: 60px 16px; color: var(--muted);
+}
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: rgba(0,0,0,0.8); color: white; padding: 8px 16px; border-radius: 999px; font-size: 12px;
+  pointer-events: none;
+}
+.err { color: var(--bad); font-size: 12px; margin-top: 8px; }

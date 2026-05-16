@@ -110,6 +110,11 @@ const FIELD_LABEL: Partial<Record<keyof BackendPrefs, string>> = {
   proxy: "Proxy",
   binary: "Binary 路径",
   defaultPermissionMode: "默认 Permission Mode",
+  // 下面三个在 PrefsEditor 里不会被用到（fields 数组里没传），保留作防御：
+  // 万一未来有人改 fields 加这些字段，至少有可读 label 不是空串。
+  provider: "Provider",
+  apiKey: "API Key",
+  authMode: "Auth Mode",
 };
 
 const FIELD_PLACEHOLDER: Partial<Record<keyof BackendPrefs, string>> = {
@@ -118,6 +123,9 @@ const FIELD_PLACEHOLDER: Partial<Record<keyof BackendPrefs, string>> = {
   proxy: "http://127.0.0.1:7890 或 socks5://...",
   binary: "默认（PATH / bundled runtime）",
   defaultPermissionMode: "default | acceptEdits | plan | bypassPermissions",
+  provider: "anthropic / openai / openrouter / ...",
+  apiKey: "sk-...",
+  authMode: "oauth | key",
 };
 
 const PERMISSION_MODE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [

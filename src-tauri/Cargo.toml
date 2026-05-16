@@ -23,6 +23,10 @@ tauri-plugin-process = "2"
 # 系统级通知：长任务结束时弹原生通知（macOS Notification Center / Win Toast / Linux libnotify）。
 # Dock badge / 任务栏数字角标用 Tauri 内置 Window.setBadgeCount，不需要额外 plugin。
 tauri-plugin-notification = "2"
+# HTTP 客户端 plugin：前端的 `fetch()` 走 Rust 端 reqwest，绕开 macOS WKWebView
+# 对 tauri:// 跨域 fetch 的"Load failed"限制。前端只在 isTauri 模式下使用此 plugin，
+# LAN 浏览器端仍用 window.fetch。
+tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

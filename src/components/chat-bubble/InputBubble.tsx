@@ -11,6 +11,7 @@ import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { PetCharacter } from "../pet-character/PetCharacter";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
+import { getActivePromptOverride } from "../../lib/petPromptOverride";
 
 const GREETINGS = [
   "喂，[称呼]，发什么呆呢？今天的部团活动要开始咯，有什么有趣的企划快交上来看看。",
@@ -139,6 +140,7 @@ export function InputBubble(): JSX.Element {
         sessionId: resumeHint,
         // 仅 claude-code 后端读取；codex/opencode 在 Rust 侧忽略
         permissionMode: tab.agent === "claude-code" ? tab.permissionMode : null,
+        promptOverride: getActivePromptOverride(),
       });
       if (res?.sessionId) {
         update({ sessionId: res.sessionId });

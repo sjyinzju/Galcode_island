@@ -19,6 +19,12 @@
     "dialog:default",
     "updater:default",
     "process:default",
-    "notification:default"
+    "notification:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://gcbackend.haruyuki.cn/*" }
+      ]
+    }
   ]
 }

@@ -7,6 +7,7 @@ import { useActivityStore } from "../../stores/useActivityStore";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { motion, AnimatePresence } from "framer-motion";
 import { PetCharacter } from "../pet-character/PetCharacter";
+import { getActivePromptOverride } from "../../lib/petPromptOverride";
 import { ErrorDiagnosisCard } from "../status-monitor/ErrorDiagnosisCard";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 import { SlashCommandPanel, useSlashCommandPanel } from "./SlashCommandPanel";
@@ -96,6 +97,7 @@ export function ResultCard(): JSX.Element {
         agent: tab.agent,
         runId: activeTabId,
         sessionId: resumeHint,
+        promptOverride: getActivePromptOverride(),
       });
       if (res?.sessionId) update({ sessionId: res.sessionId });
       // 计入当天活跃 —— 跟 InputBubble 启动路径口径一致

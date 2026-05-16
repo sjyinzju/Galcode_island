@@ -1,0 +1,24 @@
+[Unit]
+Description=Galcode Island community backend (pet image sharing)
+After=network.target
+
+[Service]
+Type=simple
+User=galcode
+Group=galcode
+WorkingDirectory=/opt/galcode-community
+EnvironmentFile=/etc/galcode-community.env
+ExecStart=/usr/bin/node /opt/galcode-community/src/index.js
+Restart=on-failure
+RestartSec=3
+
+# 加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# 允许读写：data 和 uploads 目录
+ReadWritePaths=/var/lib/galcode-community
+
+[Install]
+WantedBy=multi-user.target

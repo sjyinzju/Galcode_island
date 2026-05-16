@@ -412,6 +412,10 @@ pub async fn start_agent(
     // 仅 claude-code 使用：Claude CLI 的 --permission-mode 参数值，
     // 来自 tab.permissionMode（Shift+Tab 切换 / 全局默认）。其它 backend 忽略此参数。
     permission_mode: Option<String>,
+    // 可选：当前桌宠图自带的"团长文案风格 prompt"。非空 → finalize 时整段替换
+    // 凉宫春日人设；空 → 走默认凉宫风。前端从当前 visualState 对应的 community
+    // 桌宠图元数据里取（不是社区图 / 无 prompt 则不传）。
+    prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
     let cwd = cwd.unwrap_or_else(|| ".".to_string());
     let agent_type = agent
@@ -453,6 +457,7 @@ pub async fn start_agent(
             user_input_zh,
             session_id,
             permission_mode,
+            prompt_override,
         ),
         "opencode" => manager::launch_opencode_agent(
             app,
@@ -462,6 +467,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            prompt_override,
         ),
         "codex" => manager::launch_codex_agent(
             app,
@@ -471,6 +477,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            prompt_override,
         ),
         _ => Err(format!("暂不支持的 agent 类型: {}", agent_type)),
     };
@@ -598,8 +605,14 @@ pub async fn finalize_pending(
     let handle = app.clone();
     let join = tokio::task::spawn_blocking(move || {
         let llm = crate::llm::load_llm_config();
-        let outcome =
-            crate::agent::manager::compute_finalize_outcome(&user_zh, &result_raw, llm.as_ref());
+        // finalize_pending 是"上次 turn 已经拿到 raw result 但 LLM 总结被打断"的兜底重试
+        // —— 此时 AgentSession 不一定还存在，没有 prompt_override 来源，按默认凉宫风走。
+        let outcome = crate::agent::manager::compute_finalize_outcome(
+            &user_zh,
+            &result_raw,
+            llm.as_ref(),
+            None,
+        );
 
         let _ = handle.emit(
             "agent://session-complete",

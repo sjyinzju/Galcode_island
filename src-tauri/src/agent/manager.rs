@@ -38,6 +38,10 @@ pub struct AgentSession {
     /// tab 标识：多 tab UI 下每个 tab 独占一个 run_id，所有 emit / runtime
     /// HashMap 都按它路由。前端按 IPC payload.runId 找到对应 tab slice 写入。
     pub run_id: String,
+    /// 桌宠社区图自定义"人设 prompt"。本次任务结束 finalize_session 取出，
+    /// 整段替换凉宫春日 system prompt 的角色描述部分（输出契约仍保留）。
+    /// None / 空字符串 = 用默认凉宫风格。
+    pub prompt_override: Option<String>,
 }
 
 impl AgentSession {
@@ -46,6 +50,7 @@ impl AgentSession {
         agent_type: String,
         cwd: Option<String>,
         run_id: String,
+        prompt_override: Option<String>,
     ) -> Self {
         let stream_id = format!("stream-{}", session_id);
         Self {
@@ -59,6 +64,7 @@ impl AgentSession {
             created_at: Instant::now(),
             stream_id,
             run_id,
+            prompt_override,
         }
     }
 }
@@ -177,6 +183,8 @@ pub fn launch_claude_agent(
     // Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
     // None 时由 claude.rs 内部 fallback 到 acceptEdits（保留老行为）。
     permission_mode: Option<String>,
+    // 桌宠社区图自定义"人设 prompt"；finalize_session 拿来替换凉宫人设
+    prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
     let trimmed = task_zh.trim().to_string();
     if trimmed.is_empty() {
@@ -189,6 +197,7 @@ pub fn launch_claude_agent(
         "claude-code".into(),
         Some(cwd.clone()),
         run_id.clone(),
+        prompt_override,
     );
     let stream_id = sess.stream_id.clone();
     {
@@ -338,6 +347,8 @@ pub fn launch_codex_agent(
     task_zh: String,
     // 前端持久化的 tab.sessionId（codex 这里其实是 thread_id）hint：作 resume 候选。
     resume_hint: Option<String>,
+    // 桌宠社区图自定义"人设 prompt"
+    prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
     let trimmed = task_zh.trim().to_string();
     if trimmed.is_empty() {
@@ -350,6 +361,7 @@ pub fn launch_codex_agent(
         "codex".into(),
         Some(cwd.clone()),
         run_id.clone(),
+        prompt_override,
     );
     let stream_id = sess.stream_id.clone();
     {
@@ -493,6 +505,8 @@ pub fn launch_opencode_agent(
     task_zh: String,
     // 前端持久化的 tab.sessionId（OpenCode 的 session id）hint：作 resume 候选。
     resume_hint: Option<String>,
+    // 桌宠社区图自定义"人设 prompt"
+    prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
     let trimmed = task_zh.trim().to_string();
     if trimmed.is_empty() {
@@ -505,6 +519,7 @@ pub fn launch_opencode_agent(
         "opencode".into(),
         Some(cwd.clone()),
         run_id.clone(),
+        prompt_override,
     );
     let stream_id = sess.stream_id.clone();
     {
@@ -783,6 +798,8 @@ pub(crate) fn compute_finalize_outcome(
     user_zh: &str,
     result_en: &str,
     llm: Option<&LlmConfig>,
+    // 桌宠图 prompt 替换；非空时整段替换凉宫人设，JSON 输出契约仍保留。
+    prompt_override: Option<&str>,
 ) -> FinalizeOutcome {
     // 翻译输出 + 生成 summary 并发——summary 不需要等翻译完成的中文，直接吃英文
     // 也能正确理解（DeepSeek 跨语言无压力）。串行约 5-15s 改并发后取 max(两者)。
@@ -795,9 +812,15 @@ pub(crate) fn compute_finalize_outcome(
             let cfg_summary = cfg.clone();
             let result_for_summary = result_en.to_string();
             let user_zh_owned = user_zh.to_string();
+            let prompt_override_owned = prompt_override.map(|s| s.to_string());
             let t_parallel = std::time::Instant::now();
             let h_summary = std::thread::spawn(move || {
-                generate_agent_summary(&cfg_summary, &user_zh_owned, &result_for_summary)
+                generate_agent_summary(
+                    &cfg_summary,
+                    &user_zh_owned,
+                    &result_for_summary,
+                    prompt_override_owned.as_deref(),
+                )
             });
 
             // translate_input=true 且 agent 实际输出不是中文时才翻译。
@@ -883,16 +906,22 @@ fn finalize_session(
     // —— emit 给前端持久化，重启后做 resume hint 才能真正续 conversation
     native_session_id: Option<String>,
 ) {
-    let (snapshot, run_id) = match state.manager.lock() {
+    let (snapshot, run_id, prompt_override) = match state.manager.lock() {
         Ok(mgr) => mgr
             .sessions
             .get(session_id)
-            .map(|s| (Some(Arc::clone(&s.snapshot)), Some(s.run_id.clone())))
-            .unwrap_or((None, None)),
-        Err(_) => (None, None),
+            .map(|s| {
+                (
+                    Some(Arc::clone(&s.snapshot)),
+                    Some(s.run_id.clone()),
+                    s.prompt_override.clone(),
+                )
+            })
+            .unwrap_or((None, None, None)),
+        Err(_) => (None, None, None),
     };
 
-    let outcome = compute_finalize_outcome(user_zh, &result_en, llm);
+    let outcome = compute_finalize_outcome(user_zh, &result_en, llm, prompt_override.as_deref());
     let FinalizeOutcome {
         mode,
         emotion,

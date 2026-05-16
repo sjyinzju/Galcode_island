@@ -1,0 +1,26 @@
+{
+  "name": "galcode-community-server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Galcode Island 桌宠图社区后端：上传 / 列表 / 热度 / 举报 / 自助隐藏",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^11.7.0",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2",
+    "multer": "^2.1.1"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
