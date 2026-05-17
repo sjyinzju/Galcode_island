@@ -25,7 +25,7 @@ import {
   imageToDto,
 } from "../lib/serialize.js";
 import { inferBaseUrl } from "../lib/baseUrl.js";
-import { rateLimitRead, rateLimitWrite } from "../lib/rateLimit.js";
+import { rateLimitByIp, rateLimitRead, rateLimitWrite } from "../lib/rateLimit.js";
 import {
   DAILY_LIKE_LIMIT,
   computeAlbumPopularity,
@@ -374,9 +374,14 @@ export function createAlbumsRouter() {
   // 用一次性密钥反查 album + images（同 GET /:id 形状）。
   // 设计：密钥不进 URL（避免被 referer / proxy 日志 / 浏览器历史泄露），走 POST body。
   // 401 = 没传 key；403 = key 长度 / 格式不合法；404 = key 不存在或对应 album 已被 admin 隐藏。
+  //
+  // 限速叠两层：rateLimitWrite（device 维度，绕过容易）+ rateLimitByIp（硬上限挡 deviceId 旋转）。
+  // 每 IP 每分钟 20 次查询——正常用户管自己 album 用不到这个量；恶意试探即便密钥空间
+  // 256 bit 不可枚举，也避免对数据库做慢查询 DoS。
   // -------------------------------------------------------------------------
   router.post(
     "/manage",
+    rateLimitByIp(20, "manage"),
     rateLimitWrite,
     express.json(),
     (req, res, next) => {

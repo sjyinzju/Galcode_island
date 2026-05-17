@@ -27,6 +27,7 @@ import {
   setAdminCookie,
   verifyAdminPassword,
 } from "../lib/adminAuth.js";
+import { rateLimitByIp } from "../lib/rateLimit.js";
 
 const ADMIN_PAGE_SIZE_DEFAULT = 30;
 const ADMIN_PAGE_SIZE_MAX = 100;
@@ -46,7 +47,9 @@ export function createAdminRouter() {
   // -------------------------------------------------------------------------
   // 登录 / 登出 / session 探针
   // -------------------------------------------------------------------------
-  router.post("/login", async (req, res, next) => {
+  // /login 必须按 IP 限速，否则 bcrypt 慢但仍可暴破；开源后路径已知，必须挡住。
+  // 每 IP 每分钟 10 次登录尝试——正常运维用不到这个量，遇到密码错也可以接受暂停。
+  router.post("/login", rateLimitByIp(10, "admin_login"), async (req, res, next) => {
     try {
       if (!isAdminConfigured()) {
         res.status(503).json({

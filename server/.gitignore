@@ -3,4 +3,10 @@ data/
 uploads/
 *.log
 .DS_Store
+# Secrets / runtime env —— 任何 .env 变体一律不入库；example/sample 例外放行
 .env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.*.sample

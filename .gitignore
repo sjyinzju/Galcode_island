@@ -27,3 +27,12 @@ dist-ssr
 .claude/
 docs/auto-update.md
 docs/release.md
+
+# Secrets / runtime env —— 任何 .env / .env.<anything> 一律不入库
+# *.example / *.sample 是给团队看的样板，例外放行
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.*.sample

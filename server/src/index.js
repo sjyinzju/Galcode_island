@@ -43,7 +43,10 @@ export function buildApp() {
 
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", true); // nginx 反代时拿到真实 ip
+  // 只信任 loopback（127.0.0.1 / ::1）—— nginx 在同机反代会从这里传 X-Forwarded-For，
+  // req.ip 解析得到真实客户端 IP；外部攻击者直连这个端口的话不会被信任、req.ip 就是
+  // 他们的真实 IP，无法靠伪造 X-Forwarded-For 头绕过 IP 维度限速 / 日志。
+  app.set("trust proxy", "loopback");
 
   app.use(cookieParser(config.cookieSecret));
   app.use(corsMiddleware);
@@ -104,6 +107,15 @@ export function buildApp() {
 
 const isMain = import.meta.url === `file://${process.argv[1]}`;
 if (isMain) {
+  // 启动前的 secret 检查：不阻塞启动（兼容老部署），只是给 ops 一个醒目提醒。
+  // COOKIE_SECRET 没设 → 落回 config.js 里的随机兜底值，重启即所有 admin session 失效。
+  if (!process.env.COOKIE_SECRET) {
+    console.warn(
+      "[security] COOKIE_SECRET 未配置——本进程会用随机临时值，重启后所有 admin " +
+        "session 失效。生产环境请在 systemd EnvironmentFile（/etc/galcode-community.env）" +
+        "里设置一个稳定的随机字符串（建议 32+ bytes 的随机 hex）。",
+    );
+  }
   const app = buildApp();
   app.listen(config.port, () => {
     console.log(
