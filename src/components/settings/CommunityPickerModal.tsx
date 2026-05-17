@@ -41,6 +41,7 @@ import type {
 } from "../../types/community";
 import { CommunityError } from "../../types/community";
 import { AlbumDetailView } from "./AlbumDetailView";
+import { AlbumManageDialog } from "./AlbumManageDialog";
 import { PaginationBar } from "./community/PaginationBar";
 import { LikeButton } from "./community/LikeButton";
 
@@ -73,6 +74,8 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
   const [albumPickList, setAlbumPickList] = useState<AlbumDto[] | null>(null);
   const [albumLoading, setAlbumLoading] = useState<boolean>(false);
   const [applyMenuOpen, setApplyMenuOpen] = useState<boolean>(false);
+  // "管理上传预设"弹窗——挂在 CommunityPickerModal 之上，z-index 比 picker 高一级
+  const [manageDialogOpen, setManageDialogOpen] = useState<boolean>(false);
   // 当前 pickedFor / 当前 picked album 的"我对它点赞"日剩余配额（null = 还没点过 = 未知）
   const [pickedDailyRemaining, setPickedDailyRemaining] = useState<number | null>(null);
   const enabled = isCommunityEnabled();
@@ -411,16 +414,30 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
               社区
             </span>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="关闭"
-            className="flex h-7 w-7 items-center justify-center rounded-full text-zinc-500 transition-colors hover:bg-black/5 hover:text-zinc-800 dark:hover:bg-white/10 dark:hover:text-zinc-100"
-          >
-            <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8">
-              <path d="M3 3l10 10M13 3L3 13" strokeLinecap="round" />
-            </svg>
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setManageDialogOpen(true)}
+              title="用上传时拿到的密钥管理自己发布的预设"
+              className="flex items-center gap-1 rounded-md border border-amber-400/50 bg-amber-50/70 px-2 py-1 text-[11px] font-medium text-amber-800 transition-colors hover:bg-amber-100/80 dark:border-amber-300/30 dark:bg-amber-400/10 dark:text-amber-300 dark:hover:bg-amber-400/15"
+            >
+              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-3 w-3">
+                <rect x="3" y="6" width="8" height="6" rx="1" />
+                <path d="M5 6V4a2 2 0 014 0v2" strokeLinecap="round" />
+              </svg>
+              管理上传预设
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="关闭"
+              className="flex h-7 w-7 items-center justify-center rounded-full text-zinc-500 transition-colors hover:bg-black/5 hover:text-zinc-800 dark:hover:bg-white/10 dark:hover:text-zinc-100"
+            >
+              <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <path d="M3 3l10 10M13 3L3 13" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
         </header>
 
         {/* mode + sort 切换栏：进入图集详情视图时隐藏 */}
@@ -768,6 +785,11 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
           <div className="pointer-events-none absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full bg-black/80 px-4 py-1.5 text-[11px] text-white shadow-lg backdrop-blur-sm">
             {toast}
           </div>
+        ) : null}
+
+        {/* 管理上传预设弹窗——更高的 z 层，盖在 picker 之上 */}
+        {manageDialogOpen ? (
+          <AlbumManageDialog onClose={() => setManageDialogOpen(false)} />
         ) : null}
       </div>
     </div>

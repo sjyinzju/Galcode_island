@@ -89,11 +89,18 @@ CREATE TABLE IF NOT EXISTS albums (
   status          TEXT NOT NULL,            -- active / hidden_by_owner / hidden_by_admin
   likes           INTEGER NOT NULL DEFAULT 0,
   popularity      INTEGER NOT NULL DEFAULT 0,    -- 物化 = 3*likes（album 无 use 概念）
+  -- 管理密钥：创建时生成的 32 字节 hex token，**只在 POST /api/albums 响应里返一次**。
+  -- 后续走密钥认证的端点（POST /manage / PATCH 元数据 / PATCH 可见性）都比对它。
+  -- 老库迁移时填空串 = "无密钥"，对应 album 只能用 device_id 同设备路径管理。
+  management_key  TEXT NOT NULL DEFAULT '',
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_albums_by_device ON albums(device_id, created_at DESC);
 -- 注意：idx_albums_popular 引用 popularity 列，由 migrateAddLikesPopularity 建（同上）
+-- 注意：idx_albums_management_key 引用 management_key 列。老库初次启动时该列由
+--   migrateAddLikesPopularity 通过 ALTER ADD COLUMN 加上——必须等列建好才能建索引，
+--   所以这条索引也放到 migrateAddLikesPopularity 里建，SCHEMA_SQL 不要写。
 -- 图集列表按时间倒序
 CREATE INDEX IF NOT EXISTS idx_albums_time
   ON albums(status, created_at DESC, id DESC);
@@ -352,6 +359,24 @@ function migrateAddLikesPopularity(db) {
     db.exec(t.sql);
     added += 1;
   }
+  // albums 加 management_key 列（默认空串，老 row 没密钥，仅 device_id 路径能管）
+  if (
+    db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='albums'").get()
+    && !hasCol("albums", "management_key")
+  ) {
+    db.exec("ALTER TABLE albums ADD COLUMN management_key TEXT NOT NULL DEFAULT ''");
+    added += 1;
+  }
+  // SCHEMA_SQL 已经声明唯一索引（带 WHERE length>0），这里再 IF NOT EXISTS 跑一遍幂等
+  if (
+    db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='albums'").get()
+    && hasCol("albums", "management_key")
+  ) {
+    db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_albums_management_key ON albums(management_key) WHERE length(management_key) > 0",
+    );
+  }
+
   // 物化 popularity 列：用现有 use_count + 3 * likes 回填（likes 初值都是 0）
   // 第一次运行迁移时所有 row 的 popularity = use_count + 3*0 = use_count；
   // 之后 like/use 写入会维护 popularity 一致。

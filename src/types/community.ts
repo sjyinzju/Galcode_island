@@ -65,6 +65,22 @@ export interface AlbumsByImageResponse {
 
 export interface CreateAlbumResult {
   album: AlbumDto;
+  /// 上传者一次性管理密钥——**仅在创建响应里出现**，server 之后任何 GET / 列表 / DTO
+  /// 都不会再带上它。前端要把这串字符显示给用户保存，丢了就没法重置。
+  managementKey: string;
+}
+
+/// POST /api/albums/manage 用密钥反查的响应（形状与 GET /:id 一致）
+export type ManagedAlbumResponse = AlbumDetailResponse;
+
+/// PATCH /api/albums/:id 元数据更新的响应
+export interface UpdateAlbumResult {
+  album: AlbumDto;
+}
+
+/// PATCH /api/albums/:id/visibility 的响应
+export interface AlbumVisibilityResult {
+  status: AlbumStatus;
 }
 
 export interface CreateAlbumInput {

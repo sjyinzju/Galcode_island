@@ -24,6 +24,7 @@ import {
   CommunityError,
   type AlbumDetailResponse,
   type AlbumsByImageResponse,
+  type AlbumVisibilityResult,
   type CommunityImageDto,
   type CommunityListResponse,
   type CommunityUploadResult,
@@ -31,9 +32,11 @@ import {
   type CreateAlbumInput,
   type CreateAlbumResult,
   type LikeResult,
+  type ManagedAlbumResponse,
   type PagedAlbumsResponse,
   type PagedImagesResponse,
   type SortMode,
+  type UpdateAlbumResult,
 } from "../types/community";
 import type { PetCategory } from "../stores/usePetAssetsStore";
 
@@ -410,10 +413,49 @@ export async function getAlbumsByImage(
 export async function setAlbumVisibility(
   albumId: string,
   hidden: boolean,
-): Promise<{ status: string }> {
-  return callJson<{ status: string }>(
+): Promise<AlbumVisibilityResult> {
+  return callJson<AlbumVisibilityResult>(
     `/api/albums/${encodeURIComponent(albumId)}/visibility`,
     { method: "PATCH", body: { deviceId: getDeviceId(), hidden } },
+  );
+}
+
+// -----------------------------------------------------------------------------
+// 密钥管理：上传 album 时拿到一次性 managementKey；之后凭它在任意设备上反查 /
+// 编辑 / 改可见性，覆盖"换设备后没法管理"的场景。
+// -----------------------------------------------------------------------------
+
+/// 用 key 反查 album + 全部图（同 GET /:id 形状）
+export async function manageAlbumByKey(
+  managementKey: string,
+): Promise<ManagedAlbumResponse> {
+  return callJson<ManagedAlbumResponse>("/api/albums/manage", {
+    method: "POST",
+    body: { managementKey },
+  });
+}
+
+/// 用 key 改 album 元数据（name / description / uploaderName 任意子集）
+export async function updateAlbum(
+  albumId: string,
+  managementKey: string,
+  patch: { name?: string; description?: string | null; uploaderName?: string | null },
+): Promise<UpdateAlbumResult> {
+  return callJson<UpdateAlbumResult>(
+    `/api/albums/${encodeURIComponent(albumId)}`,
+    { method: "PATCH", body: { managementKey, ...patch } },
+  );
+}
+
+/// 用 key 改 album 可见性（隐藏 / 恢复）
+export async function setAlbumVisibilityByKey(
+  albumId: string,
+  managementKey: string,
+  hidden: boolean,
+): Promise<AlbumVisibilityResult> {
+  return callJson<AlbumVisibilityResult>(
+    `/api/albums/${encodeURIComponent(albumId)}/visibility`,
+    { method: "PATCH", body: { managementKey, hidden } },
   );
 }
 

@@ -62,6 +62,12 @@ export function UploadAlbumDialog({
   const [description, setDescription] = useState<string>(preset?.description ?? "");
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [error, setError] = useState<string>("");
+  /// 上传成功后切到"密钥揭示"页：保留 albumId + 一次性 managementKey，
+  /// 用户必须主动点"我已保存"才关闭，避免误操作丢密钥
+  const [revealed, setRevealed] = useState<
+    null | { albumId: string; managementKey: string }
+  >(null);
+  const [copied, setCopied] = useState<boolean>(false);
 
   // 当外部 presetId 变化（基本不会发生）时把表单刷新一次
   useEffect(() => {
@@ -84,11 +90,12 @@ export function UploadAlbumDialog({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === "Escape" && !progress) onClose();
+      // 进度中不许 ESC；密钥揭示页也不许（强制用户主动点"我已保存"，否则一不小心丢密钥）
+      if (e.key === "Escape" && !progress && !revealed) onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, progress]);
+  }, [onClose, progress, revealed]);
 
   const nameTrim = name.trim();
   const nameValid = nameTrim.length > 0 && nameTrim.length <= MAX_NAME_LEN;
@@ -173,7 +180,20 @@ export function UploadAlbumDialog({
 
       setProgress({ label: "完成", percent: 100 });
       onSuccess?.(album.album.id);
-      onClose();
+      // 服务端没返 managementKey（多半后端尚未升级到带密钥的版本）→ 不进密钥页，
+      // 直接结束 + 告诉用户"上传成了但管理密钥没拿到，需要后端升级"。
+      const key = typeof album.managementKey === "string" ? album.managementKey.trim() : "";
+      if (!key) {
+        setError(
+          "上传成功，但服务端未返回管理密钥——多半是后端版本还没更新到支持密钥的版本。" +
+          "联系管理员升级后端后再次上传可拿到管理密钥；该 album 仍可在原设备上管理。",
+        );
+        setProgress(null);
+        return;
+      }
+      // 切到密钥揭示页，等用户保存好再关
+      setRevealed({ albumId: album.album.id, managementKey: key });
+      setProgress(null);
     } catch (err) {
       const msg =
         err instanceof CommunityError
@@ -195,6 +215,27 @@ export function UploadAlbumDialog({
           预设已不存在
         </div>
       </div>
+    );
+  }
+
+  // 密钥揭示页：上传完成后接管整个对话框；用户必须主动确认才关
+  if (revealed) {
+    return (
+      <KeyRevealView
+        albumId={revealed.albumId}
+        managementKey={revealed.managementKey}
+        copied={copied}
+        onCopy={async () => {
+          try {
+            await navigator.clipboard.writeText(revealed.managementKey);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1500);
+          } catch {
+            /* clipboard 不可用时静默，用户手选文本复制即可 */
+          }
+        }}
+        onClose={onClose}
+      />
     );
   }
 
@@ -374,6 +415,99 @@ export function UploadAlbumDialog({
             }
           >
             {progress ? "上传中…" : "上传预设"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 一次性密钥揭示页：上传成功后接管整个对话框。
+//
+// 设计要点：
+//   - 整个 modal 没有"关闭 ×"按钮，背景点击不关——强迫用户主动点"我已保存"
+//   - 密钥用 monospace 大字号、单行可滚动展示；复制按钮带反馈
+//   - 红色警告框反复强调"只显示这一次"，丢失就再也找不回来
+// ---------------------------------------------------------------------------
+
+interface KeyRevealViewProps {
+  albumId: string;
+  managementKey: string;
+  copied: boolean;
+  onCopy: () => void;
+  onClose: () => void;
+}
+
+function KeyRevealView({
+  albumId,
+  managementKey,
+  copied,
+  onCopy,
+  onClose,
+}: KeyRevealViewProps): JSX.Element {
+  return (
+    <div
+      className="fixed inset-0 z-[120] flex items-center justify-center bg-black/55 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label="预设管理密钥"
+    >
+      <div className="relative w-[min(620px,94vw)] overflow-hidden rounded-2xl border border-white/30 bg-white/90 shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-slate-900/90 flex flex-col">
+        <div className="h-1 shrink-0 bg-gradient-to-r from-emerald-400 via-amber-400 to-rose-400" />
+
+        <header className="px-5 py-4 shrink-0">
+          <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-800 dark:text-zinc-100">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-4 w-4 text-emerald-600 dark:text-emerald-400">
+              <path d="M3 8.5L6.5 12 13 4.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            上传成功
+          </h2>
+          <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+            下面是这份预设的管理密钥——之后想在别的设备上改名、隐藏、删除都靠它。
+          </p>
+        </header>
+
+        <div className="flex flex-col gap-3 px-5 pb-4">
+          <div className="rounded-md border border-rose-300/60 bg-rose-50/80 px-3 py-2 text-[11px] leading-relaxed text-rose-700 dark:border-rose-300/30 dark:bg-rose-500/10 dark:text-rose-300">
+            <strong className="font-semibold">这串密钥只显示这一次。</strong>
+            关掉这个窗口后，应用不会再保留它的任何副本。请立即复制到密码管理器 /
+            笔记里——丢了就再也找不回了。
+          </div>
+
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+              管理密钥
+            </span>
+            <div className="flex items-center gap-2 rounded-md border border-black/10 bg-zinc-50 px-2 py-2 dark:border-white/10 dark:bg-slate-800/60">
+              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-[11px] text-zinc-800 dark:text-zinc-100">
+                {managementKey}
+              </code>
+              <button
+                type="button"
+                onClick={onCopy}
+                className="shrink-0 rounded border border-sky-400/50 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-500/20 dark:border-sky-300/40 dark:text-sky-300"
+              >
+                {copied ? "已复制 ✓" : "复制"}
+              </button>
+            </div>
+          </label>
+
+          <div className="rounded-md border border-black/5 bg-white/40 px-3 py-2 text-[10px] text-zinc-500 dark:border-white/5 dark:bg-slate-800/40 dark:text-zinc-400">
+            <div>关联图集 ID（公开，无需保密）：</div>
+            <code className="font-mono text-[10px] text-zinc-700 dark:text-zinc-200">
+              {albumId}
+            </code>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-black/5 px-5 py-3 dark:border-white/5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-emerald-400/60 bg-emerald-500 px-4 py-1.5 text-[12px] font-medium text-white shadow-sm transition-colors hover:bg-emerald-600"
+          >
+            我已保存，关闭
           </button>
         </div>
       </div>

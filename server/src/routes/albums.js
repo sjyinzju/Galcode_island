@@ -8,6 +8,7 @@
 // 错误处理：路由内只抛 ValidationError 或显式 status；其它由全局 errorHandler 翻 500。
 
 import express from "express";
+import { randomBytes } from "node:crypto";
 import { STATUS } from "../config.js";
 import { getDb } from "../db.js";
 import {
@@ -196,13 +197,25 @@ export function createAlbumsRouter() {
 
         const id = newId();
         const now = Date.now();
+        // 32 字节 hex = 64 字符，足够无歧义且不太长；URL-safe（无特殊字符）
+        const managementKey = randomBytes(32).toString("hex");
         // 事务包裹：保证 album + 所有 album_images 一起成功 / 一起回滚
         const tx = db.transaction(() => {
           db.prepare(
             `INSERT INTO albums
-              (id, device_id, name, description, uploader_name, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          ).run(id, deviceId, name, description, uploaderName, ALBUM_STATUS.ACTIVE, now, now);
+              (id, device_id, name, description, uploader_name, status, management_key, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            id,
+            deviceId,
+            name,
+            description,
+            uploaderName,
+            ALBUM_STATUS.ACTIVE,
+            managementKey,
+            now,
+            now,
+          );
           const insertLink = db.prepare(
             `INSERT INTO album_images (album_id, image_id, position, added_at)
              VALUES (?, ?, ?, ?)`,
@@ -214,8 +227,10 @@ export function createAlbumsRouter() {
         tx();
 
         const row = db.prepare("SELECT * FROM albums WHERE id = ?").get(id);
+        // managementKey 只在创建响应里返一次；其它 GET / 列表 / DTO 都不包含
         res.status(201).json({
           album: albumToDto(row, { imageCount: imageIds.length }),
+          managementKey,
         });
       } catch (err) {
         next(err);
@@ -355,7 +370,134 @@ export function createAlbumsRouter() {
   );
 
   // -------------------------------------------------------------------------
+  // POST /api/albums/manage   {managementKey}
+  // 用一次性密钥反查 album + images（同 GET /:id 形状）。
+  // 设计：密钥不进 URL（避免被 referer / proxy 日志 / 浏览器历史泄露），走 POST body。
+  // 401 = 没传 key；403 = key 长度 / 格式不合法；404 = key 不存在或对应 album 已被 admin 隐藏。
+  // -------------------------------------------------------------------------
+  router.post(
+    "/manage",
+    rateLimitWrite,
+    express.json(),
+    (req, res, next) => {
+      try {
+        const key = req.body?.managementKey;
+        if (typeof key !== "string" || key.length === 0) {
+          res.status(401).json({ error: "missing_key" });
+          return;
+        }
+        if (key.length > 256 || !/^[A-Za-z0-9_-]+$/.test(key)) {
+          res.status(403).json({ error: "bad_key_format" });
+          return;
+        }
+        const db = getDb();
+        const album = db
+          .prepare("SELECT * FROM albums WHERE management_key = ?")
+          .get(key);
+        if (!album) {
+          res.status(404).json({ error: "not_found" });
+          return;
+        }
+        if (album.status === ALBUM_STATUS.HIDDEN_BY_ADMIN) {
+          res.status(403).json({ error: "locked_by_admin" });
+          return;
+        }
+        // 返回完整图列表，跟 GET /:id 一致——管理面板会展示
+        const images = db
+          .prepare(
+            `SELECT i.*
+             FROM album_images ai
+             INNER JOIN images i ON i.id = ai.image_id
+             WHERE ai.album_id = ?
+             ORDER BY ai.position ASC, ai.added_at ASC`,
+          )
+          .all(album.id);
+        const baseUrl = inferBaseUrl(req);
+        const albumIdsMap = fetchAlbumIdsForImages(db, images.map((r) => r.id));
+        res.json({
+          album: albumToDto(album, { imageCount: images.length }),
+          images: images.map((r) =>
+            imageToDto(r, { baseUrl, albumIds: albumIdsMap.get(r.id) ?? [] }),
+          ),
+        });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // PATCH /api/albums/:id   {managementKey, name?, description?}
+  // 用密钥修改 album 元数据（不改 image 关联）。任何字段未提供则保持原值。
+  // -------------------------------------------------------------------------
+  router.patch(
+    "/:id",
+    rateLimitWrite,
+    express.json(),
+    (req, res, next) => {
+      try {
+        const key = req.body?.managementKey;
+        if (typeof key !== "string" || key.length === 0) {
+          res.status(401).json({ error: "missing_key" });
+          return;
+        }
+        const { id } = req.params;
+        const db = getDb();
+        const row = db.prepare("SELECT * FROM albums WHERE id = ?").get(id);
+        if (!row || row.management_key !== key) {
+          // 既保护 id 存在性也保护"该 key 是不是本 album 的"——一律 404
+          res.status(404).json({ error: "not_found" });
+          return;
+        }
+        if (row.status === ALBUM_STATUS.HIDDEN_BY_ADMIN) {
+          res.status(403).json({ error: "locked_by_admin" });
+          return;
+        }
+
+        let nextName = row.name;
+        let nextDesc = row.description;
+        let nextUploaderName = row.uploader_name;
+        let touched = false;
+        if (req.body?.name !== undefined) {
+          nextName = validateAlbumName(req.body.name);
+          touched = true;
+        }
+        if (req.body?.description !== undefined) {
+          nextDesc = validateDescription(req.body.description);
+          touched = true;
+        }
+        if (req.body?.uploaderName !== undefined) {
+          nextUploaderName = validateUploaderNameOptional(req.body.uploaderName);
+          touched = true;
+        }
+        if (!touched) {
+          // 没东西改，直接返当前状态（幂等）
+          const imageCount = db
+            .prepare("SELECT COUNT(*) AS c FROM album_images WHERE album_id = ?")
+            .get(id).c;
+          res.json({ album: albumToDto(row, { imageCount }) });
+          return;
+        }
+        db.prepare(
+          `UPDATE albums
+             SET name = ?, description = ?, uploader_name = ?, updated_at = ?
+             WHERE id = ?`,
+        ).run(nextName, nextDesc, nextUploaderName, Date.now(), id);
+        const updated = db.prepare("SELECT * FROM albums WHERE id = ?").get(id);
+        const imageCount = db
+          .prepare("SELECT COUNT(*) AS c FROM album_images WHERE album_id = ?")
+          .get(id).c;
+        res.json({ album: albumToDto(updated, { imageCount }) });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
   // PATCH /api/albums/:id/visibility  上传者自助隐藏 / 恢复
+  // 支持两种身份：(a) body.managementKey 匹配 album.management_key
+  //               (b) body.deviceId 匹配 album.device_id（向后兼容）
   // -------------------------------------------------------------------------
   router.patch(
     "/:id/visibility",
@@ -367,7 +509,6 @@ export function createAlbumsRouter() {
     express.json(),
     (req, res, next) => {
       try {
-        const deviceId = validateDeviceId(req.body?.deviceId);
         const hidden = req.body?.hidden;
         if (typeof hidden !== "boolean") {
           throw new ValidationError("hidden must be boolean", "hidden");
@@ -375,13 +516,27 @@ export function createAlbumsRouter() {
         const { id } = req.params;
         const db = getDb();
         const row = db
-          .prepare("SELECT id, device_id, status FROM albums WHERE id = ?")
+          .prepare("SELECT id, device_id, status, management_key FROM albums WHERE id = ?")
           .get(id);
         if (!row) {
           res.status(404).json({ error: "not_found" });
           return;
         }
-        if (row.device_id !== deviceId) {
+        // 任一身份成立即可：先查 key，再 fallback device_id
+        const providedKey = req.body?.managementKey;
+        const keyOk =
+          typeof providedKey === "string" &&
+          providedKey.length > 0 &&
+          row.management_key === providedKey;
+        let deviceOk = false;
+        if (!keyOk) {
+          const providedDevice = req.body?.deviceId;
+          if (typeof providedDevice === "string" && providedDevice.length > 0) {
+            const deviceId = validateDeviceId(providedDevice);
+            deviceOk = row.device_id === deviceId;
+          }
+        }
+        if (!keyOk && !deviceOk) {
           res.status(403).json({ error: "forbidden" });
           return;
         }
