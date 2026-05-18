@@ -300,7 +300,11 @@ function compileShader(
 
 function initGLContext(canvas: HTMLCanvasElement): GLContext | null {
   const gl = canvas.getContext("webgl", {
-    premultipliedAlpha: false,
+    // 与下面的 UNPACK_PREMULTIPLY_ALPHA_WEBGL=true + blendFunc(ONE,
+    // ONE_MINUS_SRC_ALPHA) 保持一致：整条管线都走预乘 alpha。设成 false 时浏览器
+    // 合成阶段会再乘一次 alpha → 颜色偏暗、半透明边缘 alpha 失真 → CSS
+    // filter:drop-shadow 拿不到正确 alpha 形状 → 外发光投影消失。
+    premultipliedAlpha: true,
     alpha: true,
     antialias: false,
     preserveDrawingBuffer: false,
@@ -404,9 +408,16 @@ function disposeContext(ctx: GLContext): void {
   gl.deleteBuffer(posBuf);
   gl.deleteBuffer(uvBuf);
   gl.deleteProgram(program);
-  // 主动释放 GL context，让浏览器尽快回收 GPU 资源（macOS WKWebView 在大量
-  // 短命 context 时容易内存涨）。
-  gl.getExtension("WEBGL_lose_context")?.loseContext();
+  // 注意：故意不调用 WEBGL_lose_context.loseContext()。
+  //
+  // 在 React 18 dev + StrictMode 下，effect 会 mount → cleanup → re-mount 连跑两轮。
+  // 如果 cleanup 里把 context 弄丢（loseContext），re-mount 阶段 canvas.getContext
+  // 在 WKWebView 上往往返回的还是同一个已 lost 的 context（要等异步的 contextrestored
+  // 事件才能新建），导致 effect 看见 ctx 不为 null 但 useProgram/draw 都 no-op，
+  // 表现就是"刷新页面有概率桌宠那块白屏"。
+  //
+  // 只删除我们自己持有的 program / buffer / texture 引用即可；剩下的 GL 资源等
+  // canvas 节点被 GC 时浏览器会自动回收，对单个长期常驻的桌宠来说零成本。
 }
 
 function uploadFrames(ctx: GLContext, decoded: DecodedGif): void {
