@@ -178,8 +178,9 @@ async function decodeAsGif(buf: ArrayBuffer): Promise<DecodedGif> {
     const full = ctx.getImageData(0, 0, width, height);
     composed.push({
       pixels: new Uint8ClampedArray(full.data),
-      // GIF delay 单位 1/100 秒；某些写制工具会写 0 或极小值 → 钳到 20ms 防 RAF 空转。
-      delayMs: Math.max(20, (delay || 10) * 10),
+      // ParsedFrame.delay 已经是毫秒（gifuct-js 内部按 raw * 10 转换过）；某些
+      // 写制工具会写 0 或极小值 → 钳到 20ms 防 RAF 空转烧 GPU。
+      delayMs: Math.max(20, delay || 100),
     });
     if (disposalType === 2) {
       ctx.clearRect(dims.left, dims.top, dims.width, dims.height);
