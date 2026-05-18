@@ -12,6 +12,12 @@ import {
 } from "../../stores/usePetAssetsStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { usePetInteractionStore } from "../../stores/usePetInteractionStore";
+import { GifPlayer } from "../gif-player/GifPlayer";
+
+/// 桌宠 GIF 走 WebGL 路径（gifuct-js 解码 + GPU 纹理缓存），相比 <img> 在频繁
+/// 切图时不再依赖 WKWebView 内置解码器；framer-motion 包一层让 motion 动画 props
+/// 仍然生效（保持与原 motion.img 一致的 fade-in / scale）。
+const MotionGifPlayer = motion.create(GifPlayer);
 
 const DEFAULT_OTHERS_GIFS: string[] = [
   "/pet/others/对手指.gif",
@@ -242,11 +248,11 @@ function PetCharacterImpl({ size = "default" }: PetCharacterProps): JSX.Element 
       role="img"
       aria-label="桌宠角色"
     >
-      {/* ② 不带 key —— src 变化时 React 复用同一个 <img> DOM 节点（仅更新 src
-          属性），WKWebView 内部复用图像解码器；带 key 会 unmount 旧 + mount
-          新 → 旧解码器异步释放跟不上 → 越用越卡。
+      {/* ② 不带 key —— src 变化时 React 复用同一个 GifPlayer 组件（仅换内部
+          WebGL 纹理），避免重建 GL context；旧 motion.img 时代的"WKWebView 解码器
+          释放跟不上"问题已由 WebGL 路径根本性消除。
           代价：跨 GIF 切换时不再有 motion 的 fade-in（仅组件首次挂载触发一次）。 */}
-      <motion.img
+      <MotionGifPlayer
         src={displayGif}
         alt="桌宠"
         initial={{ opacity: 0, scale: 0.85 }}
