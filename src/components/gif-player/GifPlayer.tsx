@@ -456,21 +456,24 @@ function startPlayback(ctx: GLContext): void {
   if (ctx.frames.length === 0) return;
   stopPlayback(ctx);
 
+  // 每个 RAF tick 都重绘当前帧（即便帧没变）。原因：
+  //   WebGL 默认 preserveDrawingBuffer=false —— 浏览器在每次合成后会清空 drawing
+  //   buffer。如果只在帧切换时画一次，下一次合成之前不重画，canvas 就会变透明。
+  //   贴一个 fullscreen 三角形 quad 的成本对 GPU 微不足道（亚毫秒级），所以"每
+  //   tick 都画"反而是最干净的策略。
   const tick = (nowMs: number): void => {
     ctx.rafId = requestAnimationFrame(tick);
     if (ctx.lastSwitchMs === 0) {
       ctx.lastSwitchMs = nowMs;
-      drawCurrentFrame(ctx);
-      return;
+    } else if (ctx.frames.length > 1) {
+      const elapsed = nowMs - ctx.lastSwitchMs;
+      const delay = ctx.frames[ctx.currentFrame]!.delayMs;
+      if (elapsed >= delay) {
+        ctx.currentFrame = (ctx.currentFrame + 1) % ctx.frames.length;
+        ctx.lastSwitchMs = nowMs;
+      }
     }
-    if (ctx.frames.length <= 1) return; // 静态/单帧 GIF：画一次就够
-    const elapsed = nowMs - ctx.lastSwitchMs;
-    const delay = ctx.frames[ctx.currentFrame]!.delayMs;
-    if (elapsed >= delay) {
-      ctx.currentFrame = (ctx.currentFrame + 1) % ctx.frames.length;
-      ctx.lastSwitchMs = nowMs;
-      drawCurrentFrame(ctx);
-    }
+    drawCurrentFrame(ctx);
   };
   ctx.rafId = requestAnimationFrame(tick);
 }
