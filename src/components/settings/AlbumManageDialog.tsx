@@ -29,6 +29,7 @@ import {
 
 const MAX_NAME_LEN = 80;
 const MAX_DESC_LEN = 500;
+const MAX_PERSONA_LEN = 2000;
 
 export interface AlbumManageDialogProps {
   onClose: () => void;
@@ -229,30 +230,35 @@ function ManageForm({
   const [name, setName] = useState<string>(album.name);
   const [description, setDescription] = useState<string>(album.description ?? "");
   const [uploaderName, setUploaderName] = useState<string>(album.uploaderName ?? "");
+  const [persona, setPersona] = useState<string>(album.persona ?? "");
 
   // 切换 album（理论上同一会话内不会变，但 hook 写法保险）时同步草稿
   useEffect(() => {
     setName(album.name);
     setDescription(album.description ?? "");
     setUploaderName(album.uploaderName ?? "");
+    setPersona(album.persona ?? "");
   }, [album.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const trimmedName = name.trim();
   const nameValid = trimmedName.length > 0 && trimmedName.length <= MAX_NAME_LEN;
   const descValid = description.length <= MAX_DESC_LEN;
+  const personaValid = persona.length <= MAX_PERSONA_LEN;
   const dirty =
     trimmedName !== album.name.trim() ||
     description.trim() !== (album.description ?? "").trim() ||
-    uploaderName.trim() !== (album.uploaderName ?? "").trim();
+    uploaderName.trim() !== (album.uploaderName ?? "").trim() ||
+    persona !== (album.persona ?? "");
 
   const handleSave = async (): Promise<void> => {
-    if (!nameValid || !descValid || !dirty) return;
+    if (!nameValid || !descValid || !personaValid || !dirty) return;
     setBusy(true);
     try {
       const res = await updateAlbum(album.id, managementKey, {
         name: trimmedName,
         description: description.trim() || null,
         uploaderName: uploaderName.trim() || null,
+        persona,
       });
       onUpdate(res.album);
       setToast("已保存");
@@ -350,6 +356,26 @@ function ManageForm({
         />
       </label>
 
+      <label className="flex flex-col gap-1">
+        <span className="flex items-center justify-between text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
+          预设级人设 prompt
+          <span className={`text-[10px] ${persona.length > MAX_PERSONA_LEN ? "text-rose-600" : "text-zinc-400 dark:text-zinc-500"}`}>
+            {persona.length} / {MAX_PERSONA_LEN}
+          </span>
+        </span>
+        <textarea
+          value={persona}
+          onChange={(e) => setPersona(e.target.value)}
+          rows={5}
+          disabled={busy || lockedByAdmin}
+          placeholder="可选——别人下载这份预设时会跟着拿到。空着也行，由下载方自己配。"
+          className="w-full resize-y rounded-md border border-black/10 bg-white/80 px-2.5 py-2 text-[12px] text-zinc-800 outline-none transition-colors focus:border-amber-400 disabled:opacity-60 dark:border-white/10 dark:bg-slate-800/60 dark:text-zinc-100"
+        />
+        <span className="text-[10px] text-zinc-500 dark:text-zinc-400">
+          这段会在下载方安装预设时自动写入他们的「预设级 prompt」，免去他们再手贴一次。
+        </span>
+      </label>
+
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-black/5 bg-white/40 px-3 py-2 dark:border-white/5 dark:bg-slate-800/40">
         <div className="flex flex-col">
           <span className="text-[12px] font-medium text-zinc-700 dark:text-zinc-200">
@@ -379,7 +405,7 @@ function ManageForm({
         <button
           type="button"
           onClick={() => void handleSave()}
-          disabled={busy || !dirty || !nameValid || !descValid || lockedByAdmin}
+          disabled={busy || !dirty || !nameValid || !descValid || !personaValid || lockedByAdmin}
           className="rounded-md border border-amber-400/60 bg-amber-500 px-4 py-1.5 text-[12px] font-medium text-white shadow-sm transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busy ? "保存中…" : dirty ? "保存修改" : "无变动"}

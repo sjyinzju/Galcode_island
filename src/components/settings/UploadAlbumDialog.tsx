@@ -164,6 +164,9 @@ export function UploadAlbumDialog({
       const album = await createAlbum({
         name: nameTrim,
         description: description.trim() || null,
+        // 把预设级 persona 跟着 album 上传——server 会存在 albums.persona 列，
+        // 别人下载这份预设时也能直接拿到，不用每个人单独再配人设
+        persona: preset.persona ?? "",
         imageIds: collectedIds,
         uploaderName: nickname?.trim() || null,
       });

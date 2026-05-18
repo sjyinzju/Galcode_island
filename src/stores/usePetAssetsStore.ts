@@ -556,8 +556,9 @@ export const usePetAssetsStore = create<PetAssetsState>()(
           createdAt: now,
           updatedAt: now,
           categories: newCategories,
-          // TODO: server schema 暂未带 persona 字段；下载下来留空，用户复制为我的后自配
-          persona: "",
+          // 服务端 album.persona 现在会跟着 album 走；下载下来直接用，省去用户复制副本再配的步骤。
+          // album 老数据（迁移前没设过）默认是空串，跟未配置等价。
+          persona: typeof album.persona === "string" ? album.persona : "",
         };
         set((s) => ({
           presets: [...s.presets, preset],

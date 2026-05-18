@@ -56,6 +56,9 @@ export function albumToDto(row, { imageCount, coverUrl = null }) {
     deviceId: row.device_id,
     name: row.name,
     description: row.description ?? null,
+    /// 预设级人设 prompt：上传时客户端提供、下载时回填给本地 Preset.persona。
+    /// 空串 = 未配置（DB 默认 ''）；老 album 没这字段，列里 default '' 自然兼容。
+    persona: row.persona ?? "",
     uploaderName: row.uploader_name ?? null,
     status: row.status,
     imageCount,

@@ -41,6 +41,7 @@ const ALBUM_STATUS = {
 
 const MAX_NAME_LEN = 80;
 const MAX_DESC_LEN = 500;
+const MAX_PERSONA_LEN = 2000; // 与客户端 PetCharacterSection 里 MAX_PROMPT_LEN 对齐
 const MAX_IMAGES_PER_ALBUM = 60; // 防止滥用上传 N 千张
 
 function validateAlbumName(raw) {
@@ -74,6 +75,22 @@ function validateDescription(raw) {
     );
   }
   return trimmed;
+}
+
+/// 预设级人设 prompt 校验：与 description 同形（trim、长度上限），但语义跟客户端
+/// Preset.persona 对齐——空 / null / 全空格都归一为 "" 而不是 null（DB 列 NOT NULL）。
+function validatePersonaOptional(raw) {
+  if (raw === undefined || raw === null) return "";
+  if (typeof raw !== "string") {
+    throw new ValidationError("persona must be a string", "persona");
+  }
+  if (raw.length > MAX_PERSONA_LEN) {
+    throw new ValidationError(
+      `persona too long (max ${MAX_PERSONA_LEN} chars)`,
+      "persona",
+    );
+  }
+  return raw;
 }
 
 function validateImageIds(raw) {
@@ -166,6 +183,7 @@ export function createAlbumsRouter() {
         );
         const name = validateAlbumName(req.body?.name);
         const description = validateDescription(req.body?.description);
+        const persona = validatePersonaOptional(req.body?.persona);
         const uploaderName = validateUploaderNameOptional(req.body?.uploaderName);
         const imageIds = validateImageIds(req.body?.imageIds);
 
@@ -203,8 +221,8 @@ export function createAlbumsRouter() {
         const tx = db.transaction(() => {
           db.prepare(
             `INSERT INTO albums
-              (id, device_id, name, description, uploader_name, status, management_key, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              (id, device_id, name, description, uploader_name, status, management_key, persona, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).run(
             id,
             deviceId,
@@ -213,6 +231,7 @@ export function createAlbumsRouter() {
             uploaderName,
             ALBUM_STATUS.ACTIVE,
             managementKey,
+            persona,
             now,
             now,
           );
@@ -462,6 +481,7 @@ export function createAlbumsRouter() {
         let nextName = row.name;
         let nextDesc = row.description;
         let nextUploaderName = row.uploader_name;
+        let nextPersona = row.persona ?? "";
         let touched = false;
         if (req.body?.name !== undefined) {
           nextName = validateAlbumName(req.body.name);
@@ -475,6 +495,10 @@ export function createAlbumsRouter() {
           nextUploaderName = validateUploaderNameOptional(req.body.uploaderName);
           touched = true;
         }
+        if (req.body?.persona !== undefined) {
+          nextPersona = validatePersonaOptional(req.body.persona);
+          touched = true;
+        }
         if (!touched) {
           // 没东西改，直接返当前状态（幂等）
           const imageCount = db
@@ -485,9 +509,9 @@ export function createAlbumsRouter() {
         }
         db.prepare(
           `UPDATE albums
-             SET name = ?, description = ?, uploader_name = ?, updated_at = ?
+             SET name = ?, description = ?, uploader_name = ?, persona = ?, updated_at = ?
              WHERE id = ?`,
-        ).run(nextName, nextDesc, nextUploaderName, Date.now(), id);
+        ).run(nextName, nextDesc, nextUploaderName, nextPersona, Date.now(), id);
         const updated = db.prepare("SELECT * FROM albums WHERE id = ?").get(id);
         const imageCount = db
           .prepare("SELECT COUNT(*) AS c FROM album_images WHERE album_id = ?")

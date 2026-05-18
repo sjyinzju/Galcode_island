@@ -316,6 +316,7 @@ describe("图集 API", () => {
       deviceId,
       name: "套1",
       description: "desc",
+      persona: "",
       imageIds: ["i1", "i2"],
       uploaderName: null,
     });

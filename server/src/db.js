@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS albums (
   -- 后续走密钥认证的端点（POST /manage / PATCH 元数据 / PATCH 可见性）都比对它。
   -- 老库迁移时填空串 = "无密钥"，对应 album 只能用 device_id 同设备路径管理。
   management_key  TEXT NOT NULL DEFAULT '',
+  -- 预设级人设 prompt：客户端 Preset.persona 通过社区往返时存这里。
+  -- 空串 = 未配置（与客户端本地的 "" 语义一致）。最大 2000 字符。
+  persona         TEXT NOT NULL DEFAULT '',
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
@@ -365,6 +368,14 @@ function migrateAddLikesPopularity(db) {
     && !hasCol("albums", "management_key")
   ) {
     db.exec("ALTER TABLE albums ADD COLUMN management_key TEXT NOT NULL DEFAULT ''");
+    added += 1;
+  }
+  // albums 加 persona 列（默认空串，老 row 没人设；上传时由客户端提供）
+  if (
+    db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='albums'").get()
+    && !hasCol("albums", "persona")
+  ) {
+    db.exec("ALTER TABLE albums ADD COLUMN persona TEXT NOT NULL DEFAULT ''");
     added += 1;
   }
   // SCHEMA_SQL 已经声明唯一索引（带 WHERE length>0），这里再 IF NOT EXISTS 跑一遍幂等

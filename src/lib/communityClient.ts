@@ -388,6 +388,7 @@ export async function createAlbum(
       deviceId: getDeviceId(),
       name: input.name,
       description: input.description ?? null,
+      persona: input.persona ?? "",
       imageIds: input.imageIds,
       uploaderName: input.uploaderName ?? null,
     },
@@ -435,11 +436,16 @@ export async function manageAlbumByKey(
   });
 }
 
-/// 用 key 改 album 元数据（name / description / uploaderName 任意子集）
+/// 用 key 改 album 元数据（name / description / uploaderName / persona 任意子集）
 export async function updateAlbum(
   albumId: string,
   managementKey: string,
-  patch: { name?: string; description?: string | null; uploaderName?: string | null },
+  patch: {
+    name?: string;
+    description?: string | null;
+    uploaderName?: string | null;
+    persona?: string;
+  },
 ): Promise<UpdateAlbumResult> {
   return callJson<UpdateAlbumResult>(
     `/api/albums/${encodeURIComponent(albumId)}`,

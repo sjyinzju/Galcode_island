@@ -42,6 +42,9 @@ export interface AlbumDto {
   deviceId: string;
   name: string;
   description: string | null;
+  /// 预设级人设 prompt：客户端 Preset.persona 通过社区往返时存在 album 行上。
+  /// 空串 = 未配置；老 album 在迁移后默认 ""。
+  persona: string;
   uploaderName: string | null;
   status: AlbumStatus;
   imageCount: number;
@@ -86,6 +89,8 @@ export interface AlbumVisibilityResult {
 export interface CreateAlbumInput {
   name: string;
   description?: string | null;
+  /// 预设级人设 prompt。空串 / 未传 → server 落 ""。
+  persona?: string;
   imageIds: string[];
   uploaderName?: string | null;
 }
