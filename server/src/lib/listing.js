@@ -7,13 +7,34 @@
 //
 // listAlbumsPaged 同形 —— 给图集维度列表用。
 //
-// status='approved'（image） / 'active'（album） 严格过滤；hidden / rejected / pending_ai 都不出现。
-// 排序稳定：人气并列 → created_at DESC 兜底；时间并列 → id DESC 兜底。
+// 公开可见性规则（所有 image 公开列表都走它）：
+//   image.status = 'approved'
+//   AND (
+//     该图不在任何图集里     — 独立上传的图
+//     OR 它的至少一个父图集是 active — 任一可见图集"撑住"它
+//   )
+//
+// 设计动机：admin / owner 下架图集（status != active）后，该图集里的图自动从公开
+// 列表消失；图同时挂多个图集时，只要还有一个 active 就继续可见。不级联改 image
+// 自己的 status —— 那个语义是"图本身有没有被针对性下架"。
 
 import { STATUS, config } from "../config.js";
 import { decodeCursor, encodeCursor } from "./cursor.js";
 
 const ALBUM_ACTIVE = "active";
+
+/// 公开图片可见性的 WHERE 谓词片段（要拼到具体 SQL 里，调用方负责加 status= 占位符）。
+/// 给定 alias = 表别名（默认 images），返回需要 AND 进去的字符串。
+function visibleImageWherePredicate(alias = "images") {
+  return ` AND (
+    NOT EXISTS (SELECT 1 FROM album_images WHERE image_id = ${alias}.id)
+    OR EXISTS (
+      SELECT 1 FROM album_images ai_vis
+      INNER JOIN albums a_vis ON a_vis.id = ai_vis.album_id
+      WHERE ai_vis.image_id = ${alias}.id AND a_vis.status = '${ALBUM_ACTIVE}'
+    )
+  )`;
+}
 
 const IMAGE_SORTS = {
   popular: "popularity DESC, created_at DESC, id DESC",
@@ -49,7 +70,8 @@ export function listImagesPaged(
   // total
   const total = db
     .prepare(
-      "SELECT COUNT(*) AS c FROM images WHERE category = ? AND status = ?",
+      `SELECT COUNT(*) AS c FROM images
+       WHERE category = ? AND status = ?${visibleImageWherePredicate("images")}`,
     )
     .get(category, STATUS.APPROVED).c;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -59,7 +81,7 @@ export function listImagesPaged(
               width, height, prompt, uploader_name, status, use_count, likes, popularity,
               created_at, updated_at
        FROM images
-       WHERE category = ? AND status = ?
+       WHERE category = ? AND status = ?${visibleImageWherePredicate("images")}
        ORDER BY ${orderBy}
        LIMIT ? OFFSET ?`,
     )
@@ -108,7 +130,7 @@ export function fetchTopHot(db, category) {
            width, height, prompt, uploader_name, status, use_count,
            created_at, updated_at
     FROM images
-    WHERE category = ? AND status = ?
+    WHERE category = ? AND status = ?${visibleImageWherePredicate("images")}
     ORDER BY use_count DESC, created_at DESC, id DESC
     LIMIT ?
   `);
@@ -139,7 +161,7 @@ export function fetchTimeline(db, { category, cursor, pageSize, excludeIds }) {
            width, height, prompt, uploader_name, status, use_count,
            created_at, updated_at
     FROM images
-    WHERE category = ? AND status = ?${whereExtra}
+    WHERE category = ? AND status = ?${visibleImageWherePredicate("images")}${whereExtra}
     ORDER BY created_at DESC, id DESC
     LIMIT ?
   `;

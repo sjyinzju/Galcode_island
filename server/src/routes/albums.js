@@ -274,16 +274,17 @@ export function createAlbumsRouter() {
         res.status(404).json({ error: "not_found" });
         return;
       }
-      // 顺序按 position 升序，与 创建时的 imageIds 顺序一致
+      // 顺序按 position 升序，与 创建时的 imageIds 顺序一致；
+      // 公开路径只返回 approved 的图——管理员针对性下架的单图哪怕在 active 图集里也不可见
       const images = db
         .prepare(
           `SELECT i.*
            FROM album_images ai
            INNER JOIN images i ON i.id = ai.image_id
-           WHERE ai.album_id = ?
+           WHERE ai.album_id = ? AND i.status = ?
            ORDER BY ai.position ASC, ai.added_at ASC`,
         )
-        .all(id);
+        .all(id, STATUS.APPROVED);
       const baseUrl = inferBaseUrl(req);
       // 也填 albumIds（这些图本身可能属于多个图集）
       const albumIdsMap = fetchAlbumIdsForImages(db, images.map((r) => r.id));
