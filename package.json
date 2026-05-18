@@ -36,6 +36,7 @@
     "@tauri-apps/plugin-process": "^2",
     "@tauri-apps/plugin-updater": "^2",
     "framer-motion": "^12.38.0",
+    "gifuct-js": "^2.1.2",
     "pixi-live2d-display": "^0.5.0-beta",
     "pixi.js": "^7.4.2",
     "react": "^19.1.0",
