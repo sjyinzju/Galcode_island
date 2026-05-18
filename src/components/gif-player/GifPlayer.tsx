@@ -36,73 +36,151 @@ interface DecodedGif {
   }>;
 }
 
-/// CPU 端解码缓存：同一 src 复用解码结果。
+/// CPU 端解码缓存：同一 src 复用解码结果（GIF / 静态图都进同一个池）。
 ///
-/// 容量：LRU 上限 24 张 GIF —— 桌宠场景常见 6 类 × 多张，再算上戳戳互动池，24
+/// 容量：LRU 上限 24 张 —— 桌宠场景常见 6 类 × 多张，再算上戳戳互动池，24
 /// 足够覆盖一次会话内反复切换。超过后按访问顺序淘汰最旧。
 ///
 /// 失败不缓存（catch 里 delete 掉 promise），避免一次网络抖动卡死后续重试。
-const GIF_CACHE_MAX = 24;
-const gifCache = new Map<string, Promise<DecodedGif>>();
+const DECODE_CACHE_MAX = 24;
+const decodeCache = new Map<string, Promise<DecodedGif>>();
 
 function touchCache(key: string, value: Promise<DecodedGif>): void {
-  if (gifCache.has(key)) gifCache.delete(key);
-  gifCache.set(key, value);
-  if (gifCache.size > GIF_CACHE_MAX) {
-    const oldest = gifCache.keys().next().value;
-    if (oldest !== undefined) gifCache.delete(oldest);
+  if (decodeCache.has(key)) decodeCache.delete(key);
+  decodeCache.set(key, value);
+  if (decodeCache.size > DECODE_CACHE_MAX) {
+    const oldest = decodeCache.keys().next().value;
+    if (oldest !== undefined) decodeCache.delete(oldest);
   }
 }
 
-async function decodeGifOnce(src: string): Promise<DecodedGif> {
-  const res = await fetch(src);
-  if (!res.ok) throw new Error(`gif fetch failed: ${res.status} ${src}`);
-  const buf = await res.arrayBuffer();
+/// 解码失败时抛 sentinel error，让组件区分"真错误"（应当 onError 报给业务层）
+/// 和"已知不走 WebGL 路径"（如 APNG / 动态 WebP，应当静默 fallback 到 <img>，
+/// 由浏览器原生解码器播放动画）。
+class UnsupportedAnimatedFormatError extends Error {
+  constructor(kind: string) {
+    super(`unsupported animated format for WebGL path: ${kind}`);
+    this.name = "UnsupportedAnimatedFormatError";
+  }
+}
+
+type ImageKind = "gif" | "apng" | "webp-animated" | "static";
+
+/// 按魔数嗅探，不信任 caller 提供的 mime —— blob URL 上的 mime 经常不准。
+function sniffImageKind(buf: ArrayBuffer): ImageKind {
+  const u8 = new Uint8Array(buf);
+  // GIF: "GIF87a" / "GIF89a"
+  if (
+    u8.length >= 6 &&
+    u8[0] === 0x47 &&
+    u8[1] === 0x49 &&
+    u8[2] === 0x46 &&
+    u8[3] === 0x38 &&
+    (u8[4] === 0x37 || u8[4] === 0x39) &&
+    u8[5] === 0x61
+  ) {
+    return "gif";
+  }
+  // PNG: 89 50 4E 47 0D 0A 1A 0A；APNG 在 IDAT 之前有 acTL chunk
+  if (
+    u8.length >= 8 &&
+    u8[0] === 0x89 &&
+    u8[1] === 0x50 &&
+    u8[2] === 0x4e &&
+    u8[3] === 0x47 &&
+    u8[4] === 0x0d &&
+    u8[5] === 0x0a &&
+    u8[6] === 0x1a &&
+    u8[7] === 0x0a
+  ) {
+    return pngHasActlBeforeIdat(u8) ? "apng" : "static";
+  }
+  // WebP: "RIFF" ???? "WEBP"；动态 WebP 在 VP8X 之后有 ANIM chunk
+  if (
+    u8.length >= 12 &&
+    u8[0] === 0x52 &&
+    u8[1] === 0x49 &&
+    u8[2] === 0x46 &&
+    u8[3] === 0x46 &&
+    u8[8] === 0x57 &&
+    u8[9] === 0x45 &&
+    u8[10] === 0x42 &&
+    u8[11] === 0x50
+  ) {
+    return webpHasAnimChunk(u8) ? "webp-animated" : "static";
+  }
+  // JPEG / 其它已知静态 → 让 createImageBitmap 试
+  return "static";
+}
+
+/// 按 PNG chunk 结构扫描：8 字节签名后，每个 chunk = 4B length + 4B type + data + 4B CRC。
+/// 在 IDAT 出现前发现 acTL → APNG。
+function pngHasActlBeforeIdat(u8: Uint8Array): boolean {
+  let off = 8;
+  const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  while (off + 8 <= u8.length) {
+    const len = view.getUint32(off, false);
+    const type = String.fromCharCode(u8[off + 4]!, u8[off + 5]!, u8[off + 6]!, u8[off + 7]!);
+    if (type === "acTL") return true;
+    if (type === "IDAT") return false;
+    off += 8 + len + 4;
+    if (!Number.isFinite(len) || len < 0) return false;
+  }
+  return false;
+}
+
+/// RIFF 容器：8 字节头（"RIFF" + size）后跟 4 字节 form type（"WEBP"），之后
+/// 每个 chunk = 4B FourCC + 4B size + payload（按 2 对齐）。
+function webpHasAnimChunk(u8: Uint8Array): boolean {
+  let off = 12;
+  const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  while (off + 8 <= u8.length) {
+    const cc = String.fromCharCode(u8[off]!, u8[off + 1]!, u8[off + 2]!, u8[off + 3]!);
+    const size = view.getUint32(off + 4, true);
+    if (cc === "ANIM" || cc === "ANMF") return true;
+    off += 8 + size + (size & 1);
+  }
+  return false;
+}
+
+function makeOffscreen(
+  width: number,
+  height: number,
+): { canvas: OffscreenCanvas | HTMLCanvasElement; ctx: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D } {
+  const canvas =
+    typeof OffscreenCanvas !== "undefined"
+      ? new OffscreenCanvas(width, height)
+      : Object.assign(document.createElement("canvas"), { width, height });
+  const ctx = (canvas as OffscreenCanvas).getContext("2d") as
+    | OffscreenCanvasRenderingContext2D
+    | CanvasRenderingContext2D
+    | null;
+  if (!ctx) throw new Error("offscreen 2d context unavailable");
+  return { canvas, ctx };
+}
+
+async function decodeAsGif(buf: ArrayBuffer): Promise<DecodedGif> {
   const gif = parseGIF(buf);
   const rawFrames: ParsedFrame[] = decompressFrames(gif, true);
   const { width, height } = gif.lsd;
+  const { ctx } = makeOffscreen(width, height);
 
-  // 用 OffscreenCanvas（浏览器都已支持）按 disposalType 把 patch 合成成全画布。
-  // 浏览器 GIF 帧通常是相对前一帧的 patch + dispose 规则；直接上 GPU 时一帧一
-  // 张 full-frame 纹理最省事——decode 期一次性 CPU 算完，运行时零分支。
-  const offscreen =
-    typeof OffscreenCanvas !== "undefined"
-      ? new OffscreenCanvas(width, height)
-      : (() => {
-          const c = document.createElement("canvas");
-          c.width = width;
-          c.height = height;
-          return c;
-        })();
-  const ctx = (offscreen as OffscreenCanvas).getContext(
-    "2d",
-  ) as OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null;
-  if (!ctx) throw new Error("offscreen 2d context unavailable");
-
+  // 按 disposalType 把 patch 合成成全画布 —— decode 期一次性算完，运行时零分支。
   const composed: DecodedGif["frames"] = [];
   let prevSnapshot: ImageData | null = null;
-
   for (const frame of rawFrames) {
     const { dims, patch, delay, disposalType } = frame;
-    // disposal=3：本帧绘制前先快照，绘制完后还原 —— 让"下一帧基于上上一帧"成立。
     if (disposalType === 3) {
       prevSnapshot = ctx.getImageData(0, 0, width, height);
     }
-    const patchImage = new ImageData(
-      new Uint8ClampedArray(patch),
-      dims.width,
-      dims.height,
-    );
+    const patchImage = new ImageData(new Uint8ClampedArray(patch), dims.width, dims.height);
     ctx.putImageData(patchImage, dims.left, dims.top);
-
     const full = ctx.getImageData(0, 0, width, height);
     composed.push({
       pixels: new Uint8ClampedArray(full.data),
-      // GIF 里 delay 单位是 1/100 秒；某些写制工具会写 0 或极小值 —— 钳到 20ms
-      // 防止 RAF 空转造成跑分上 100% GPU。
+      // GIF delay 单位 1/100 秒；某些写制工具会写 0 或极小值 → 钳到 20ms 防 RAF 空转。
       delayMs: Math.max(20, (delay || 10) * 10),
     });
-
     if (disposalType === 2) {
       ctx.clearRect(dims.left, dims.top, dims.width, dims.height);
     } else if (disposalType === 3 && prevSnapshot) {
@@ -110,22 +188,55 @@ async function decodeGifOnce(src: string): Promise<DecodedGif> {
       prevSnapshot = null;
     }
   }
-
   return { width, height, frames: composed };
 }
 
+/// 静态图（PNG / JPEG / 静态 WebP / BMP / etc.）→ 一帧 DecodedGif：
+/// 走 createImageBitmap → 画到 offscreen → 拿 ImageData → 上 GPU。
+/// 这样静态图也能享受 WebGL 路径（与 GIF 走同一渲染管线），DOM 里看到的也是 <canvas>。
+async function decodeAsStatic(buf: ArrayBuffer): Promise<DecodedGif> {
+  if (typeof createImageBitmap !== "function") {
+    throw new Error("createImageBitmap unavailable");
+  }
+  const blob = new Blob([buf]);
+  const bitmap = await createImageBitmap(blob);
+  const { width, height } = bitmap;
+  const { ctx } = makeOffscreen(width, height);
+  ctx.drawImage(bitmap as CanvasImageSource, 0, 0);
+  const data = ctx.getImageData(0, 0, width, height);
+  bitmap.close();
+  return {
+    width,
+    height,
+    // 单帧 + 任意 delay（>1 帧才会走切换逻辑，所以 delay 不影响行为）
+    frames: [{ pixels: new Uint8ClampedArray(data.data), delayMs: 1_000 }],
+  };
+}
+
+async function decodeOnce(src: string): Promise<DecodedGif> {
+  const res = await fetch(src);
+  if (!res.ok) throw new Error(`fetch failed: ${res.status} ${src}`);
+  const buf = await res.arrayBuffer();
+  const kind = sniffImageKind(buf);
+  if (kind === "gif") return decodeAsGif(buf);
+  if (kind === "static") return decodeAsStatic(buf);
+  // APNG / 动态 WebP：浏览器 <img> 才会原生播放动画；我们的 WebGL 静态路径会
+  // 只展示首帧 → 动画丢失。明确退回 <img>，由 GifPlayer 接住 sentinel 不报错。
+  throw new UnsupportedAnimatedFormatError(kind);
+}
+
 function getDecoded(src: string): Promise<DecodedGif> {
-  const existing = gifCache.get(src);
+  const existing = decodeCache.get(src);
   if (existing) {
     // 访问刷新 LRU 顺序
-    gifCache.delete(src);
-    gifCache.set(src, existing);
+    decodeCache.delete(src);
+    decodeCache.set(src, existing);
     return existing;
   }
-  const p = decodeGifOnce(src);
+  const p = decodeOnce(src);
   touchCache(src, p);
   p.catch(() => {
-    if (gifCache.get(src) === p) gifCache.delete(src);
+    if (decodeCache.get(src) === p) decodeCache.delete(src);
   });
   return p;
 }
@@ -395,7 +506,20 @@ export const GifPlayer = forwardRef<HTMLElement, GifPlayerProps>(
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const imgRef = useRef<HTMLImageElement | null>(null);
     const glCtxRef = useRef<GLContext | null>(null);
-    const [fallback, setFallback] = useState(false);
+    // 用"已知不能走 WebGL 的 src"集合而非单一布尔 —— 避免一旦遇到一张 APNG /
+    // 动态 WebP，后续切回 GIF 也卡在 <img> 路径。
+    const [unsupportedSrcs, setUnsupportedSrcs] = useState<ReadonlySet<string>>(
+      () => new Set(),
+    );
+    const fallback = unsupportedSrcs.has(src);
+    const markFallback = (badSrc: string): void => {
+      setUnsupportedSrcs((prev) => {
+        if (prev.has(badSrc)) return prev;
+        const next = new Set(prev);
+        next.add(badSrc);
+        return next;
+      });
+    };
 
     // forwardedRef → 当前激活的 element（fallback 切换后也保持有效）。
     // 不用 useImperativeHandle 的话，框架（如 framer-motion）拿到的 ref 会在 fallback
@@ -417,12 +541,12 @@ export const GifPlayer = forwardRef<HTMLElement, GifPlayerProps>(
         ctx = initGLContext(canvas);
       } catch (err) {
         onError?.(err as Error);
-        setFallback(true);
+        markFallback(src);
         return;
       }
       if (!ctx) {
         onError?.(new Error("webgl unavailable"));
-        setFallback(true);
+        markFallback(src);
         return;
       }
       glCtxRef.current = ctx;
@@ -454,8 +578,25 @@ export const GifPlayer = forwardRef<HTMLElement, GifPlayerProps>(
         })
         .catch((err: Error) => {
           if (abort.signal.aborted) return;
-          onError?.(err);
-          setFallback(true);
+          // sentinel：APNG / 动态 WebP —— WebGL 静态路径只能显首帧丢动画，明确
+          // 退回 <img> 让浏览器原生解码器接管，不算"错误"，不上报 onError。
+          if (err?.name === "UnsupportedAnimatedFormatError") {
+            if (import.meta.env.DEV) {
+              // eslint-disable-next-line no-console
+              console.info(
+                "[GifPlayer] WebGL 路径不支持的动图格式，退回 <img>：",
+                src,
+                err.message,
+              );
+            }
+          } else {
+            if (import.meta.env.DEV) {
+              // eslint-disable-next-line no-console
+              console.warn("[GifPlayer] 解码失败，退回 <img>：", src, err);
+            }
+            onError?.(err);
+          }
+          markFallback(src);
         });
       return () => {
         abort.abort();
