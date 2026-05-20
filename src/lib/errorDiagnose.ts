@@ -258,7 +258,7 @@ function buildGenericDiagnosis(_msg: string, _agent: AgentType): ErrorDiagnosis 
     title: "Agent 出错了",
     detail:
       "没识别出常见错误模式。下面是原始错误文本，可以点详情展开。如果反复出现，" +
-      "建议复制错误 + 上下文反馈给团长。",
+      "建议复制错误 + 上下文反馈给作者。",
     actions: [
       { label: "重新发送", kind: "resend-prompt", primary: true },
       { label: "重置本 tab", kind: "reset-tab" },

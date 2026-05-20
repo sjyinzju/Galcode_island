@@ -141,7 +141,7 @@ export function ProfileModal(): JSX.Element {
               <div className="flex flex-col gap-5 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
                 <div className="flex flex-col gap-1.5">
                   <label className="text-sm font-medium text-zinc-600 dark:text-zinc-400">
-                    希望团长怎样称呼你？
+                    希望桌宠怎样称呼你？
                   </label>
                   <input
                     type="text"
@@ -207,7 +207,7 @@ export function ProfileModal(): JSX.Element {
                   <textarea
                     value={localBio}
                     onChange={(e) => setLocalBio(e.target.value)}
-                    placeholder="兴趣 / 职业 / 习惯，想让团长知道的都可以填……"
+                    placeholder="兴趣 / 职业 / 习惯，想让桌宠知道的都可以填……"
                     className={`${inputCls} h-28 resize-y`}
                   />
                 </div>

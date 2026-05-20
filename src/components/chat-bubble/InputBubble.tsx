@@ -296,7 +296,7 @@ export function InputBubble(): JSX.Element {
               ref={textareaRef}
               value={task}
               onChange={(e) => update({ task: e.target.value })}
-              placeholder="和团长对话……  (Enter 发送，Shift+Enter 换行，/ 查看命令)"
+              placeholder="和桌宠对话……  (Enter 发送，Shift+Enter 换行，/ 查看命令)"
               // 移动端 min-h 100px 给足输入区；桌面端 min-h-[100px]
               className="min-h-[100px] max-h-[40vh] w-full resize-none rounded-xl border border-black/5 bg-white/50 p-3 text-base text-zinc-800 outline-none transition-all placeholder:text-zinc-400 focus:border-sky-400/50 focus:bg-white/80 focus:ring-2 focus:ring-sky-400/15 sm:max-h-none sm:p-3.5 sm:text-sm dark:border-white/5 dark:bg-slate-900/40 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-sky-400/40 dark:focus:bg-slate-900/60 dark:focus:ring-sky-400/10"
               onCompositionStart={() => {

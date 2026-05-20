@@ -515,7 +515,7 @@ export function ProjectOverview(): JSX.Element {
             该目录还没有历史会话
           </div>
           <p className="mt-1 text-[12px] leading-relaxed text-zinc-500 dark:text-zinc-400">
-            和团长说点什么，开始第一轮工作吧。
+            和桌宠说点什么，开始第一轮工作吧。
           </p>
         </div>
       ) : null}
