@@ -55,7 +55,9 @@ export const CommunityPickerModal = memo(function CommunityPickerModal({
   onClose,
 }: CommunityPickerModalProps): JSX.Element {
   // ----- 查询参数 -----
-  const [mode, setMode] = useState<ViewDimension>("images");
+  // 入口名字叫"看看大家的预设"，整套图集是用户更关心的对象；默认从图集维度开门见山，
+  // 单图浏览是次要场景，需要时再切过去。
+  const [mode, setMode] = useState<ViewDimension>("albums");
   const [sort, setSort] = useState<SortMode>("popular");
   const [active, setActive] = useState<PetCategory>(initialCategory);
   const [page, setPage] = useState<number>(1);
