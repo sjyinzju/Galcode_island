@@ -284,8 +284,8 @@ export function GlobalOverview(): JSX.Element {
       </div>
 
       {/* 最近项目 + 桌宠 */}
-      <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_180px]">
-        <div className="rounded-2xl border border-white/60 bg-white/55 p-4 backdrop-blur-md dark:border-white/10 dark:bg-slate-800/45">
+      <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px] flex-1">
+        <div className="min-w-0 rounded-2xl border border-white/60 bg-white/55 p-4 backdrop-blur-md dark:border-white/10 dark:bg-slate-800/45">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400 dark:text-zinc-500">
               最近项目
