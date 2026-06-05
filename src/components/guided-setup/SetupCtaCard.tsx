@@ -28,14 +28,6 @@ export function SetupCtaCard({ className = "" }: { className?: string }): JSX.El
   const showSetupCta = noLlmKey || agentReady === false;
   if (!showSetupCta) return null;
 
-  // 提示文案按缺失项细化
-  const detail =
-    agentReady === false && noLlmKey
-      ? "还没有可用的 Agent，也没配角色扮演用的 LLM key。"
-      : agentReady === false
-        ? "还没有可用的 Agent（需要安装并登录 Claude Code / Codex / OpenCode 之一）。"
-        : "还没配角色扮演 / 总结用的 LLM key。";
-
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -49,7 +41,7 @@ export function SetupCtaCard({ className = "" }: { className?: string }): JSX.El
             必要引导项未配置
           </div>
           <p className="mt-0.5 text-[12px] leading-relaxed text-amber-700/80 dark:text-amber-200/70">
-            {detail}点下面的按钮跟着引导一步步配好代理、Agent 登录和 LLM key。
+            请配置编程所需的 Agent 以及角色扮演所需的 API key，从而体验完整功能。
           </p>
         </div>
         <button

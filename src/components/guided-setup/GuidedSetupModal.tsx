@@ -846,8 +846,7 @@ function GuidedSetupContent(): JSX.Element {
           <div className="flex flex-col gap-4">
             <div className={sectionLabelCls}>第 4 步 · 角色扮演 / 总结用的 LLM</div>
             <p className="text-[13px] leading-relaxed text-zinc-600 dark:text-zinc-400">
-              这一项配的是你自己的 OpenAI 兼容大模型 key，用来驱动凉宫春日风格的总结、反馈和可选的中英翻译。
-              和上面的 Agent 登录完全独立。不填也能用（会退回内置 persona），但建议填上体验更完整。
+              这一项配的是你自己的 OpenAI 兼容大模型 key，用来驱动角色扮演相关功能和可选的中英翻译。
             </p>
 
             <div className="flex flex-col gap-1.5">
