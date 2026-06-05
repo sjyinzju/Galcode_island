@@ -4,7 +4,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import bcrypt from "bcryptjs";
 
-let serverInstance, baseUrl, db, STATUS, encodeCursor;
+let serverInstance, baseUrl, db, STATUS, encodeCursor, resetRateLimitForTests;
 
 beforeAll(async () => {
   // 先设置 env，再 import config / db / app —— config 在 import 时读 env
@@ -19,8 +19,10 @@ beforeAll(async () => {
   const dbMod = await import("../src/db.js");
   const cfgMod = await import("../src/config.js");
   const cursorMod = await import("../src/lib/cursor.js");
+  const rateLimitMod = await import("../src/lib/rateLimit.js");
   STATUS = cfgMod.STATUS;
   encodeCursor = cursorMod.encodeCursor;
+  resetRateLimitForTests = rateLimitMod._resetRateLimitForTests;
   db = dbMod.getDb();
 
   const app = buildApp();
@@ -38,6 +40,7 @@ afterAll(async () => {
 });
 
 beforeEach(() => {
+  resetRateLimitForTests();
   db.exec("DELETE FROM reports; DELETE FROM use_events; DELETE FROM images;");
 });
 
