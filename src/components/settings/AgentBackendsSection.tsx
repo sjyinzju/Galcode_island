@@ -5,6 +5,7 @@
 // verify/login/start 之类操作完成后内联显示 toast（成功提示 / 错误信息）。
 
 import { invoke } from "../../lib/bridge";
+import { syncBackendPrefsToRust } from "../../lib/backendPrefs";
 import { Component, useCallback, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
 import { useBackendStatus } from "../../hooks/useBackendStatus";
 import {
@@ -142,20 +143,7 @@ function PrefsEditor({ backend, fields }: PrefsEditorProps): JSX.Element {
   const setBackendPref = useSettingsStore((s) => s.setBackendPref);
 
   /// onBlur 时一次性同步整个 backend 的偏好给 Rust 端，避免每个字符都 invoke。
-  const sync = useCallback(() => {
-    const current = useSettingsStore.getState().backends[backend];
-    invoke("update_backend_preferences", {
-      backend,
-      model: current.model || null,
-      effort: current.effort || null,
-      proxy: current.proxy || null,
-      binary: current.binary || null,
-      provider: current.provider || null,
-      apiKey: current.apiKey || null,
-      authMode: current.authMode || null,
-      defaultPermissionMode: current.defaultPermissionMode || null,
-    }).catch(console.error);
-  }, [backend]);
+  const sync = useCallback(() => syncBackendPrefsToRust(backend), [backend]);
 
   return (
     <div className="mt-3 grid grid-cols-2 gap-2">
@@ -265,20 +253,7 @@ function OpencodeAuthEditor({
   const [keySaveError, setKeySaveError] = useState<string | null>(null);
 
   /// 把 prefs 同步到 Rust 内存（Rust 在每次 turn 启动时读这份偏好）。
-  const syncPrefs = useCallback(() => {
-    const current = useSettingsStore.getState().backends.opencode;
-    void invoke("update_backend_preferences", {
-      backend: "opencode",
-      model: current?.model || null,
-      effort: current?.effort || null,
-      proxy: current?.proxy || null,
-      binary: current?.binary || null,
-      provider: current?.provider || null,
-      apiKey: current?.apiKey || null,
-      authMode: current?.authMode || null,
-      defaultPermissionMode: current?.defaultPermissionMode || null,
-    });
-  }, []);
+  const syncPrefs = useCallback(() => syncBackendPrefsToRust("opencode"), []);
 
   const refreshProviders = useCallback(async () => {
     setLoadingProviders(true);

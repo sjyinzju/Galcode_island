@@ -19,6 +19,7 @@ import { PetCharacter } from "../pet-character/PetCharacter";
 import type { AgentType } from "../../types/agent";
 import { AGENT_LABEL, basename, relativeTime } from "./overviewUtils";
 import { ActivityHeatmap } from "./ActivityHeatmap";
+import { SetupCtaCard } from "../guided-setup/SetupCtaCard";
 
 const agentOptions: { value: AgentType; label: string }[] = [
   { value: "claude-code", label: "Claude Code" },
@@ -266,6 +267,9 @@ export function GlobalOverview(): JSX.Element {
           ) : null}
         </AnimatePresence>
       </div>
+
+      {/* 必要引导项未配置：放在启动行之后、统计之前，最显眼。无 z 提升避免盖住上面启动行的 agent 下拉 */}
+      <SetupCtaCard className="mt-3" />
 
       {/* 概览统计 */}
       <div className="mt-3 grid grid-cols-3 gap-2">

@@ -13,6 +13,7 @@
 import { motion } from "framer-motion";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke, pickFolder } from "../../lib/bridge";
+import { syncBackendPrefsToRust } from "../../lib/backendPrefs";
 import { useNow } from "../../hooks/useNow";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { useTabsStore } from "../../stores/useTabsStore";
@@ -25,6 +26,7 @@ import type {
 } from "../../types/backend";
 import { AGENT_LABEL, basename, relativeTime } from "./overviewUtils";
 import { ActivityHeatmap } from "./ActivityHeatmap";
+import { SetupCtaCard } from "../guided-setup/SetupCtaCard";
 
 // 可在 overview 页快速切换的 agent CLI —— 跟 settings.backends 一一对应。
 // AgentType 还有 gemini/cursor，但目前没有完整的 backend prefs/启动链路，
@@ -242,21 +244,8 @@ export function ProjectOverview(): JSX.Element {
   }, [supportedBackend, catalog.data, catalog.loading, currentModelEntry, backendPrefs?.effort]);
 
   // model / effort 改完同步给 Rust，让下次 launch 立刻读到最新偏好；
-  // 跟 AgentBackendsSection.PrefsEditor 用同一组参数，避免 Rust 端只能从一处更新。
-  const syncBackend = useCallback((backend: BackendKey) => {
-    const current = useSettingsStore.getState().backends[backend];
-    invoke("update_backend_preferences", {
-      backend,
-      model: current.model || null,
-      effort: current.effort || null,
-      proxy: current.proxy || null,
-      binary: current.binary || null,
-      provider: current.provider || null,
-      apiKey: current.apiKey || null,
-      authMode: current.authMode || null,
-      defaultPermissionMode: current.defaultPermissionMode || null,
-    }).catch(console.error);
-  }, []);
+  // 跟设置页 / 引导向导共用 syncBackendPrefsToRust，避免 Rust 端从不同入口更新时漏字段。
+  const syncBackend = useCallback((backend: BackendKey) => syncBackendPrefsToRust(backend), []);
 
   const handleAgentChange = (value: string): void => {
     if (!activeTabId) return;
@@ -437,6 +426,9 @@ export function ProjectOverview(): JSX.Element {
           )}
         </div>
       </div>
+
+      {/* 必要引导项未配置：已建 tab 但还没配 agent / LLM 的用户也能看到入口 */}
+      <SetupCtaCard className="mt-3" />
 
       {/* 上次结果摘要 + 快速继续按钮 */}
       {(summary || lastUserPrompt || suggestionOptions.length > 0) && (

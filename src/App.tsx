@@ -6,6 +6,7 @@ import { MobileTopBar } from "./components/MobileTopBar";
 import { SettingsModal } from "./components/settings/SettingsModal";
 import { PersonalizationModal } from "./components/personalization/PersonalizationModal";
 import { ProfileModal } from "./components/profile/ProfileModal";
+import { GuidedSetupModal } from "./components/guided-setup/GuidedSetupModal";
 import { SidebarLeft } from "./components/sidebar/SidebarLeft";
 import { SidebarRight } from "./components/sidebar/SidebarRight";
 import { InPageSearch } from "./components/InPageSearch";
@@ -23,6 +24,7 @@ import { usePermissionRequests } from "./hooks/usePermissionRequests";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useProfileStore } from "./stores/useProfileStore";
+import { syncAllBackendPrefsToRust } from "./lib/backendPrefs";
 
 // 自画顶栏的存在条件：Tauri 桌面端非 mac（mac 走 lib.rs 的 set_decorations(true)
 // + titleBarStyle Overlay 的原生红绿灯）。motion.div 在该条件下 pt-7 让位 28px。
@@ -67,22 +69,8 @@ function App(): JSX.Element {
       translateInput: state.translateInput,
     }).catch(console.error);
 
-    for (const backend of ["claude-code", "codex", "opencode"] as const) {
-      const prefs = state.backends[backend];
-      invoke("update_backend_preferences", {
-        backend,
-        model: prefs.model || null,
-        effort: prefs.effort || null,
-        proxy: prefs.proxy || null,
-        binary: prefs.binary || null,
-        // 仅 OpenCode 使用，其它 backend 永远是空字符串 → null
-        provider: prefs.provider || null,
-        apiKey: prefs.apiKey || null,
-        authMode: prefs.authMode || null,
-        // 仅 Claude Code 使用：新开 tab 的默认 permission mode
-        defaultPermissionMode: prefs.defaultPermissionMode || null,
-      }).catch(console.error);
-    }
+    // 三个 backend 的偏好回灌给 Rust（与设置页 / 引导向导用同一个 syncBackendPrefsToRust）
+    syncAllBackendPrefsToRust();
   }, []);
 
   // 桌面端三栏；移动端 (<lg) 单栏 + 抽屉：
@@ -183,6 +171,7 @@ function App(): JSX.Element {
         <SettingsModal />
         <PersonalizationModal />
         <ProfileModal />
+        <GuidedSetupModal />
       </div>
       {/* Windows / Linux 自画顶栏。组件内部用 createPortal 挂到 document.body
           脱离 React DOM 祖先链，stacking ancestor 直接是文档根，绕开 webview 上
