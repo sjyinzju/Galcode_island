@@ -43,17 +43,17 @@ function HistoryRow({ item, now, onRestore, onDelete }: HistoryRowProps): JSX.El
           onDelete();
         }
       }}
-      className="group relative cursor-pointer rounded-lg border border-white/40 bg-white/40 px-3 py-2.5 text-[13px] text-zinc-700 transition-all hover:bg-white/70 sm:px-2.5 sm:py-2 sm:text-[11px] dark:border-white/10 dark:bg-zinc-800/40 dark:text-zinc-300 dark:hover:bg-zinc-800/65"
+      className="group relative cursor-pointer rounded-lg border border-white/40 bg-white/40 px-3 py-3 text-[14px] text-zinc-700 transition-all hover:bg-white/70 dark:border-white/10 dark:bg-zinc-800/40 dark:text-zinc-300 dark:hover:bg-zinc-800/65"
       role="button"
       title="点击恢复该会话到新 tab"
     >
-      <div className="flex items-start gap-2 sm:gap-1.5">
-        <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-zinc-300 sm:mt-1 sm:h-1.5 sm:w-1.5 dark:bg-zinc-600" />
-        <div className="min-w-0 flex-1 pr-7 sm:pr-0">
+      <div className="flex items-start gap-2.5">
+        <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-zinc-300 dark:bg-zinc-600" />
+        <div className="min-w-0 flex-1 pr-7">
           <div className="truncate font-medium leading-tight" title={item.summary}>
             {item.summary}
           </div>
-          <div className="mt-0.5 truncate text-[11px] tracking-wide text-zinc-400 sm:text-[10px] dark:text-zinc-500">
+          <div className="mt-1 truncate text-[12px] tracking-wide text-zinc-400 dark:text-zinc-500">
             {basename(item.projectPath)} · {item.agent} · {relativeTime(item.closedAt, now)}
           </div>
         </div>
@@ -65,7 +65,7 @@ function HistoryRow({ item, now, onRestore, onDelete }: HistoryRowProps): JSX.El
           onDelete();
         }}
         aria-label="从历史中删除"
-        className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded text-zinc-400 opacity-100 transition-opacity hover:bg-rose-400/20 hover:text-rose-500 sm:h-4 sm:w-4 sm:opacity-0 sm:group-hover:opacity-100 dark:text-zinc-500 dark:hover:text-rose-400"
+        className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded text-zinc-400 opacity-100 transition-opacity hover:bg-rose-400/20 hover:text-rose-500 sm:opacity-0 sm:group-hover:opacity-100 dark:text-zinc-500 dark:hover:text-rose-400"
       >
         <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-2.5 w-2.5">
           <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" strokeLinecap="round" />
@@ -104,16 +104,16 @@ export function HistoryList(): JSX.Element {
 
   if (sorted.length === 0) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center px-4 text-center text-[11px] text-zinc-400 dark:text-zinc-500">
+      <div className="flex min-h-0 flex-1 items-center justify-center px-4 text-center text-[13px] text-zinc-400 dark:text-zinc-500">
         还没有已关闭的会话
       </div>
     );
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 py-2">
-      <div className="mb-1.5 flex items-center justify-between px-1">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500">
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-3">
+      <div className="mb-2 flex items-center justify-between px-1">
+        <span className="text-[12px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500">
           已关闭 {sorted.length}
         </span>
         <button
@@ -121,7 +121,7 @@ export function HistoryList(): JSX.Element {
           onClick={() => {
             if (window.confirm("清空整个历史？此操作不可撤销。")) clearHistory();
           }}
-          className="text-[10px] text-zinc-400 transition-colors hover:text-rose-500 dark:text-zinc-500 dark:hover:text-rose-400"
+          className="text-[12px] text-zinc-400 transition-colors hover:text-rose-500 dark:text-zinc-500 dark:hover:text-rose-400"
         >
           清空
         </button>

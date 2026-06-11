@@ -97,7 +97,7 @@ function ProjectCard({ tab, isActive, now, onSelect, onClose }: ProjectCardProps
           onClose();
         }
       }}
-      className={`group relative cursor-pointer rounded-lg border px-3 py-2.5 text-[13px] transition-all sm:px-2.5 sm:py-2 sm:text-[11px] ${
+      className={`group relative cursor-pointer rounded-lg border px-3 py-3 text-[14px] transition-all ${
         isActive
           ? "border-sky-400/45 bg-sky-400/15 text-zinc-800 shadow-sm dark:border-sky-300/40 dark:bg-sky-400/15 dark:text-zinc-100"
           : "border-white/40 bg-white/45 text-zinc-700 hover:bg-white/70 dark:border-white/10 dark:bg-zinc-800/45 dark:text-zinc-300 dark:hover:bg-zinc-800/65"
@@ -106,19 +106,19 @@ function ProjectCard({ tab, isActive, now, onSelect, onClose }: ProjectCardProps
       aria-current={isActive}
     >
       {/* 状态点 */}
-      <div className="flex items-start gap-2 sm:gap-1.5">
+      <div className="flex items-start gap-2.5">
         {running ? (
-          <span className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-sky-400 shadow-[0_0_4px_rgba(56,189,248,0.6)] sm:mt-1 sm:h-1.5 sm:w-1.5" />
+          <span className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-sky-400 shadow-[0_0_4px_rgba(56,189,248,0.6)]" />
         ) : tab.hasUnread ? (
-          <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-rose-400 shadow-[0_0_4px_rgba(251,113,133,0.6)] sm:mt-1 sm:h-1.5 sm:w-1.5" />
+          <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-rose-400 shadow-[0_0_4px_rgba(251,113,133,0.6)]" />
         ) : (
-          <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-zinc-300 sm:mt-1 sm:h-1.5 sm:w-1.5 dark:bg-zinc-600" />
+          <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-zinc-300 dark:bg-zinc-600" />
         )}
-        <div className="min-w-0 flex-1 pr-7 sm:pr-0">
+        <div className="min-w-0 flex-1 pr-7">
           <div className="truncate font-medium leading-tight" title={summary}>
             {summary}
           </div>
-          <div className="mt-0.5 text-[11px] tracking-wide text-zinc-400 sm:text-[10px] dark:text-zinc-500">
+          <div className="mt-1 text-[12px] tracking-wide text-zinc-400 dark:text-zinc-500">
             {tab.agent} · {relativeTime(tab.lastActiveAt || tab.createdAt, now)}
           </div>
         </div>
@@ -132,7 +132,7 @@ function ProjectCard({ tab, isActive, now, onSelect, onClose }: ProjectCardProps
           onClose();
         }}
         aria-label="关闭项目"
-        className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded text-zinc-400 opacity-100 transition-opacity hover:bg-rose-400/20 hover:text-rose-500 sm:h-4 sm:w-4 sm:opacity-0 sm:group-hover:opacity-100 dark:text-zinc-500 dark:hover:text-rose-400"
+        className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded text-zinc-400 opacity-100 transition-opacity hover:bg-rose-400/20 hover:text-rose-500 sm:opacity-0 sm:group-hover:opacity-100 dark:text-zinc-500 dark:hover:text-rose-400"
       >
         <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-2.5 w-2.5">
           <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" strokeLinecap="round" />
@@ -207,12 +207,12 @@ export function ProjectTree(): JSX.Element {
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 py-2">
+    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
       {groups.map((group) => (
         <div key={group.key} className="flex flex-col gap-1">
           <div className="flex items-center justify-between px-1">
             <span
-              className="truncate text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500"
+              className="truncate text-[12px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500"
               title={group.key === NO_DIR_KEY ? "未选择目录" : group.key}
             >
               {group.label}
@@ -223,9 +223,9 @@ export function ProjectTree(): JSX.Element {
                 onClick={() => createInDirectory(group.key)}
                 aria-label="在该目录下新建项目"
                 title="在该目录下新建项目"
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-black/5 hover:text-zinc-700 sm:h-4 sm:w-4 dark:text-zinc-500 dark:hover:bg-white/5 dark:hover:text-zinc-200"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-black/5 hover:text-zinc-700 dark:text-zinc-500 dark:hover:bg-white/5 dark:hover:text-zinc-200"
               >
-                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3.5 w-3.5 sm:h-2.5 sm:w-2.5">
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-4 w-4">
                   <path d="M6 2v8M2 6h8" strokeLinecap="round" />
                 </svg>
               </button>
@@ -249,9 +249,9 @@ export function ProjectTree(): JSX.Element {
       <button
         type="button"
         onClick={() => void pickAndCreate()}
-        className="mt-2 flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-300/70 bg-transparent px-3 py-3 text-[13px] font-medium text-zinc-500 transition-all hover:border-sky-400/50 hover:bg-sky-400/5 hover:text-sky-600 sm:min-h-0 sm:gap-1.5 sm:py-2 sm:text-[11px] dark:border-zinc-700/70 dark:text-zinc-400 dark:hover:border-sky-300/40 dark:hover:bg-sky-300/5 dark:hover:text-sky-300"
+        className="mt-3 flex min-h-[50px] items-center justify-center gap-2.5 rounded-lg border border-dashed border-zinc-300/70 bg-transparent px-3 py-3 text-[14px] font-semibold text-zinc-500 transition-all hover:border-sky-400/50 hover:bg-sky-400/5 hover:text-sky-600 dark:border-zinc-700/70 dark:text-zinc-400 dark:hover:border-sky-300/40 dark:hover:bg-sky-300/5 dark:hover:text-sky-300"
       >
-        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3 w-3">
+        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-4 w-4">
           <path d="M6 2v8M2 6h8" strokeLinecap="round" />
         </svg>
         在新目录中开始
