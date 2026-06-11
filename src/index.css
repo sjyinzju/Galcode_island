@@ -44,6 +44,14 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+.conversation-font-scope {
+  --conversation-font-size: 14px;
+}
+
+.conversation-font-scope :where(p, span, div, pre, code, textarea, button, li, td, th, h1, h2, h3, h4, strong, em, a) {
+  font-size: var(--conversation-font-size);
+}
+
 /* ----- Glass shared components ----- */
 .progress-wrap {
   display: flex;

@@ -10,6 +10,7 @@
 // 下半部分：InputBubble / RunningBubble / ResultCard 跟过去一致。
 
 import { AnimatePresence, motion } from "framer-motion";
+import type { CSSProperties } from "react";
 import { useActiveTab, useActiveTabId } from "../hooks/useActiveTab";
 import { PetCharacter } from "./pet-character/PetCharacter";
 
@@ -19,10 +20,12 @@ import { RunningBubble } from "./chat-bubble/RunningBubble";
 import { StatusMonitor } from "./status-monitor/StatusMonitor";
 import { GlobalOverview } from "./overview/GlobalOverview";
 import { ProjectOverview } from "./overview/ProjectOverview";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 export function MainView(): JSX.Element {
   const tab = useActiveTab();
   const activeTabId = useActiveTabId();
+  const conversationFontSize = useSettingsStore((s) => s.conversationFontSize);
   const uiState = tab.uiState;
   const mode = tab.mode;
   const cliBlockCount = tab.cliBlocks.length;
@@ -38,6 +41,9 @@ export function MainView(): JSX.Element {
   const showGlobalOverview = !activeTabId;
   // 有 tab 但还没跑过任何 turn → 显示项目概览，让中栏不再空荡
   const showProjectOverview = !showGlobalOverview && !showStatus;
+  const conversationFontStyle = {
+    "--conversation-font-size": conversationFontSize,
+  } as CSSProperties;
 
   return (
     <motion.section
@@ -84,7 +90,8 @@ export function MainView(): JSX.Element {
             animate={{ opacity: 1, height: "auto", scale: 1 }}
             exit={{ opacity: 0, height: 0, scale: 0.98 }}
             transition={{ duration: 0.3 }}
-            className="flex min-h-0 flex-1 flex-col overflow-hidden"
+            className="conversation-font-scope flex min-h-0 flex-1 flex-col overflow-hidden"
+            style={conversationFontStyle}
           >
             <StatusMonitor />
           </motion.div>
@@ -106,7 +113,10 @@ export function MainView(): JSX.Element {
             <PetCharacter />
           </div>
 
-          <div className="flex w-full flex-col sm:flex-1 sm:translate-y-3">
+          <div
+            className="conversation-font-scope flex w-full flex-col sm:flex-1 sm:translate-y-3"
+            style={conversationFontStyle}
+          >
             <AnimatePresence mode="wait">
               {uiState === "idle" && (mode === "idle" || !mode) && (
                 <InputBubble key="input-bubble" />

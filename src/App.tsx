@@ -22,7 +22,7 @@ import { useThemeHotkey } from "./hooks/useThemeHotkey";
 import { useChatHotkeys } from "./hooks/useChatHotkeys";
 import { usePermissionRequests } from "./hooks/usePermissionRequests";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
-import { useSettingsStore } from "./stores/useSettingsStore";
+import { APP_FONT_SIZE_ROOT_PX, useSettingsStore } from "./stores/useSettingsStore";
 import { useProfileStore } from "./stores/useProfileStore";
 import { syncAllBackendPrefsToRust } from "./lib/backendPrefs";
 
@@ -35,6 +35,7 @@ const hasCustomTopBar = isTauri && !isMacOS;
 function App(): JSX.Element {
   const mobileLeftDrawerOpen = useUiStore((s) => s.mobileLeftDrawerOpen);
   const closeMobileLeftDrawer = useUiStore((s) => s.closeMobileLeftDrawer);
+  const fontSize = useSettingsStore((s) => s.fontSize);
 
   useThemeHotkey();
   useChatHotkeys();
@@ -72,6 +73,12 @@ function App(): JSX.Element {
     // 三个 backend 的偏好回灌给 Rust（与设置页 / 引导向导用同一个 syncBackendPrefsToRust）
     syncAllBackendPrefsToRust();
   }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.fontSize = APP_FONT_SIZE_ROOT_PX[fontSize];
+    root.dataset.appFontSize = fontSize;
+  }, [fontSize]);
 
   // 桌面端三栏；移动端 (<lg) 单栏 + 抽屉：
   //   - 顶部 MobileTopBar（汉堡 → 左栏抽屉 / 设置）

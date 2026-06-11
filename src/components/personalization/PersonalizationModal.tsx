@@ -14,11 +14,20 @@
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useUiStore } from "../../stores/useUiStore";
+import {
+  FONT_SIZE_PX_OPTIONS,
+  useSettingsStore,
+  type FontSizePx,
+} from "../../stores/useSettingsStore";
 import { PetCharacterSection } from "../settings/PetCharacterSection";
 
 export function PersonalizationModal(): JSX.Element {
   const isOpen = useUiStore((s) => s.isPersonalizationModalOpen);
   const close = useUiStore((s) => s.closePersonalizationModal);
+  const fontSize = useSettingsStore((s) => s.fontSize);
+  const conversationFontSize = useSettingsStore((s) => s.conversationFontSize);
+  const setFontSize = useSettingsStore((s) => s.setFontSize);
+  const setConversationFontSize = useSettingsStore((s) => s.setConversationFontSize);
 
   return (
     <AnimatePresence>
@@ -59,6 +68,21 @@ export function PersonalizationModal(): JSX.Element {
               </div>
 
               <div className="flex flex-col gap-6 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
+                <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                  <FontSizeControl
+                    title="应用字体"
+                    description="调整侧栏、标题、设置等主界面文字大小。"
+                    value={fontSize}
+                    onChange={setFontSize}
+                  />
+                  <FontSizeControl
+                    title="对话字体"
+                    description="只调整对话区消息、命令输出和结果/错误文本。"
+                    value={conversationFontSize}
+                    onChange={setConversationFontSize}
+                  />
+                </section>
+
                 <PetCharacterSection />
               </div>
 
@@ -81,5 +105,51 @@ export function PersonalizationModal(): JSX.Element {
         </React.Fragment>
       )}
     </AnimatePresence>
+  );
+}
+
+function FontSizeControl({
+  title,
+  description,
+  value,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  value: FontSizePx;
+  onChange: (value: FontSizePx) => void;
+}): JSX.Element {
+  return (
+    <div className="flex flex-col gap-3">
+      <header className="flex flex-col gap-0.5">
+        <h3 className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">
+          {title}
+        </h3>
+        <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+          {description}
+        </p>
+      </header>
+
+      <div className="flex flex-wrap gap-1 rounded-lg border border-black/5 bg-white/45 p-1 dark:border-white/5 dark:bg-slate-800/45">
+        {FONT_SIZE_PX_OPTIONS.map((option) => {
+          const active = option === value;
+          return (
+            <button
+              key={option}
+              type="button"
+              onClick={() => onChange(option)}
+              aria-pressed={active}
+              className={`min-h-[36px] rounded-md px-3 py-1.5 text-sm font-medium transition-all ${
+                active
+                  ? "bg-sky-500 text-white shadow-sm shadow-sky-400/25"
+                  : "text-zinc-600 hover:bg-white/70 hover:text-zinc-900 dark:text-zinc-300 dark:hover:bg-slate-700/70 dark:hover:text-white"
+              }`}
+            >
+              {option}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }

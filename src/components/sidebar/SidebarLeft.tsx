@@ -36,13 +36,13 @@ function MenuButton({ label, icon, onClick, active }: MenuButtonProps): JSX.Elem
       type="button"
       onClick={onClick}
       title={label}
-      className={`flex h-11 w-full items-center gap-2.5 rounded-md px-2 text-[14px] font-medium transition-colors sm:h-8 sm:gap-2 sm:text-[12px] ${
+      className={`flex h-12 w-full items-center gap-3 rounded-lg px-3 text-[15px] font-semibold transition-colors ${
         active
           ? "bg-sky-400/15 text-sky-700 dark:bg-sky-400/15 dark:text-sky-200"
           : "text-zinc-600 hover:bg-black/5 dark:text-zinc-300 dark:hover:bg-white/5"
       }`}
     >
-      <span className="flex h-4 w-4 shrink-0 items-center justify-center text-zinc-500 dark:text-zinc-400">
+      <span className="flex h-5 w-5 shrink-0 items-center justify-center text-zinc-500 dark:text-zinc-400 [&>svg]:h-5 [&>svg]:w-5">
         {icon}
       </span>
       <span className="truncate">{label}</span>
@@ -121,7 +121,7 @@ export function SidebarLeft(): JSX.Element {
 
       {/* 顶部菜单：紧贴 drag bar 下方（pt-0），让第一个按钮顶部 y === drag bar
           底边（28px），跟中栏 pt-7 起点对齐，避免左侧出现一段空白 */}
-      <div className="flex flex-col gap-0.5 border-b border-black/5 px-2 pb-2 dark:border-white/5">
+      <div className="flex flex-col gap-1 border-b border-black/5 px-3 pb-3 dark:border-white/5">
         <MenuButton
           label="所有项目"
           active={leftSidebarView === "projects"}
@@ -181,7 +181,7 @@ export function SidebarLeft(): JSX.Element {
       )}
 
       {/* 底部菜单 */}
-      <div className="flex flex-col gap-0.5 border-t border-black/5 px-2 py-2 dark:border-white/5">
+      <div className="flex flex-col gap-1 border-t border-black/5 px-3 py-3 dark:border-white/5">
         <MenuButton
           label={theme === "dark" ? "切换浅色" : "切换深色"}
           onClick={toggleTheme}
