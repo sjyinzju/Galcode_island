@@ -14,11 +14,14 @@
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useUiStore } from "../../stores/useUiStore";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { PetCharacterSection } from "../settings/PetCharacterSection";
 
 export function PersonalizationModal(): JSX.Element {
   const isOpen = useUiStore((s) => s.isPersonalizationModalOpen);
   const close = useUiStore((s) => s.closePersonalizationModal);
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
+  const setPetEnabled = useSettingsStore((s) => s.setPetEnabled);
 
   return (
     <AnimatePresence>
@@ -46,16 +49,44 @@ export function PersonalizationModal(): JSX.Element {
                 <h2 className="text-lg font-bold text-zinc-800 sm:text-xl dark:text-zinc-100">
                   个性化
                 </h2>
-                <button
-                  type="button"
-                  onClick={close}
-                  aria-label="关闭个性化"
-                  className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-black/5 dark:text-zinc-400 dark:hover:bg-white/5"
-                >
-                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-3.5 w-3.5">
-                    <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" strokeLinecap="round" />
-                  </svg>
-                </button>
+                <div className="flex items-center gap-1 sm:gap-3">
+                  {/* 显示萌宠总开关：嵌在标题栏不占内容区；label+switch 整体可点，
+                      详细说明放 title 悬浮提示，即时生效（跟本弹窗其它改动一致） */}
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={petEnabled}
+                    onClick={() => setPetEnabled(!petEnabled)}
+                    title="关闭后主面板不再显示萌宠形象和互动气泡（问候语、情绪反馈）。默认开启。"
+                    className="flex min-h-[36px] items-center gap-2 rounded-lg px-2 transition-colors hover:bg-black/5 dark:hover:bg-white/5"
+                  >
+                    <span className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+                      显示萌宠
+                    </span>
+                    <span
+                      aria-hidden="true"
+                      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                        petEnabled ? "bg-sky-500" : "bg-zinc-300 dark:bg-zinc-600"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                          petEnabled ? "translate-x-[18px]" : "translate-x-1"
+                        }`}
+                      />
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={close}
+                    aria-label="关闭个性化"
+                    className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-black/5 dark:text-zinc-400 dark:hover:bg-white/5"
+                  >
+                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-3.5 w-3.5">
+                      <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" strokeLinecap="round" />
+                    </svg>
+                  </button>
+                </div>
               </div>
 
               <div className="flex flex-col gap-6 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">

@@ -19,10 +19,12 @@ import { RunningBubble } from "./chat-bubble/RunningBubble";
 import { StatusMonitor } from "./status-monitor/StatusMonitor";
 import { GlobalOverview } from "./overview/GlobalOverview";
 import { ProjectOverview } from "./overview/ProjectOverview";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 export function MainView(): JSX.Element {
   const tab = useActiveTab();
   const activeTabId = useActiveTabId();
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
   const uiState = tab.uiState;
   const mode = tab.mode;
   const cliBlockCount = tab.cliBlocks.length;
@@ -96,17 +98,21 @@ export function MainView(): JSX.Element {
           卡片内部 summary 自带 max-h-[35vh] cap，避免长内容撑爆。
           没有活动 tab 时整块隐藏 —— 此时由 GlobalOverview 提供启动入口。 */}
       {!showGlobalOverview && (
-        <div className="relative flex w-full shrink-0 flex-col items-stretch gap-2 sm:flex-row sm:items-end sm:gap-3 sm:min-h-[220px]">
+        // sm:min-h-[220px] 是给桌宠立绘留的高度，萌宠关闭时去掉，避免气泡上方一段空白
+        <div className={`relative flex w-full shrink-0 flex-col items-stretch gap-2 sm:flex-row sm:items-end sm:gap-3 ${petEnabled ? "sm:min-h-[220px]" : ""}`}>
           {/* 戳戳气泡 absolute 在 PetCharacter 内部，z-50。但 ResultCard 外层
               motion.div 跑 framer-motion animate 时持续挂 transform，自成 stacking
               context，把 pet 内的 z-50 困在 pet 这一边的 SC 里出不来。
               这里给 pet 一侧的 wrapper 显式 relative + z-30，让它在 flex row 这层
               建一个高 z 的 SC，气泡跟着浮到 ResultCard 之上。 */}
-          <div className="relative z-30 hidden shrink-0 sm:block">
-            <PetCharacter />
-          </div>
+          {petEnabled && (
+            <div className="relative z-30 hidden shrink-0 sm:block">
+              <PetCharacter />
+            </div>
+          )}
 
-          <div className="flex w-full flex-col sm:flex-1 sm:translate-y-3">
+          {/* sm:translate-y-3 是为了跟左侧桌宠底部对齐，萌宠关闭时不需要这 12px 下移 */}
+          <div className={`flex w-full flex-col sm:flex-1 ${petEnabled ? "sm:translate-y-3" : ""}`}>
             <AnimatePresence mode="wait">
               {uiState === "idle" && (mode === "idle" || !mode) && (
                 <InputBubble key="input-bubble" />

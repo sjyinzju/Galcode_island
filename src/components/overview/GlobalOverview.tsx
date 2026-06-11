@@ -13,6 +13,7 @@ import { useCallback, useMemo, useState } from "react";
 import { pickFolder } from "../../lib/bridge";
 import { useNow } from "../../hooks/useNow";
 import { useAppStore } from "../../stores/useAppStore";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useUiStore } from "../../stores/useUiStore";
 import { PetCharacter } from "../pet-character/PetCharacter";
@@ -56,6 +57,7 @@ export function GlobalOverview(): JSX.Element {
   const restoreFromHistory = useTabsStore((s) => s.restoreFromHistory);
   const history = useTabsStore((s) => s.history);
   const setLeftSidebarView = useUiStore((s) => s.setLeftSidebarView);
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
   const now = useNow();
 
   const [pendingProjectPath, setPendingProjectPath] = useState<string | null>(null);
@@ -284,7 +286,7 @@ export function GlobalOverview(): JSX.Element {
       </div>
 
       {/* 最近项目 + 桌宠 */}
-      <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px] flex-1">
+      <div className={`mt-3 grid flex-1 gap-3 ${petEnabled ? "lg:grid-cols-[minmax(0,1fr)_220px]" : ""}`}>
         <div className="min-w-0 rounded-2xl border border-white/60 bg-white/55 p-4 backdrop-blur-md dark:border-white/10 dark:bg-slate-800/45">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-400 dark:text-zinc-500">
@@ -327,9 +329,11 @@ export function GlobalOverview(): JSX.Element {
         </div>
 
         {/* 桌宠：仅桌面端右侧；移动端隐藏，避免抢屏 */}
-        <div className="hidden items-end justify-center lg:flex">
-          <PetCharacter />
-        </div>
+        {petEnabled && (
+          <div className="hidden items-end justify-center lg:flex">
+            <PetCharacter />
+          </div>
+        )}
       </div>
 
       {/* 最近会话快列 */}

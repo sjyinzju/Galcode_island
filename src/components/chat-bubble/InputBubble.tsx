@@ -45,6 +45,7 @@ export function InputBubble(): JSX.Element {
 
   const [greeting, setGreeting] = useState("");
   const [displayedGreeting, setDisplayedGreeting] = useState("");
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
   // 中文输入法 composition 期间不要把 Enter 当发送 — 双保险用 keydown.isComposing
   // + composition* 事件标记
   const isComposingRef = useRef(false);
@@ -86,6 +87,12 @@ export function InputBubble(): JSX.Element {
 
   useEffect(() => {
     if (agentStatus !== "idle") return;
+    // 萌宠关闭时不生成问候语：界面上没有"无宠说话"的气泡，也省一次 LLM 调用
+    if (!petEnabled) {
+      setGreeting("");
+      setDisplayedGreeting("");
+      return;
+    }
     // 优先策略：若启用了自定义桌宠且 welcome 类有任意一张图带 communityPrompt，
     // 调 LLM 用该 prompt 当人设生成一句开场欢迎语；失败 / 无 prompt → 回退默认 GREETINGS。
     let cancelled = false;
@@ -143,7 +150,7 @@ export function InputBubble(): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [agentStatus, displayNickname]);
+  }, [agentStatus, displayNickname, petEnabled]);
 
   useEffect(() => {
     if (!greeting || agentStatus !== "idle") return;
@@ -256,25 +263,29 @@ export function InputBubble(): JSX.Element {
           {/* Inner glass content container —— 自然高度，三段式（嵌入桌宠头部 /
               textarea / 启动按钮）；textarea 自身 min-h 提供编辑区高度 */}
           <div className="relative flex w-full flex-col gap-3 rounded-[22px] rounded-bl-[6px] border border-white/60 bg-white/70 p-3.5 backdrop-blur-2xl sm:p-5 dark:border-white/10 dark:bg-slate-800/60">
-            {/* 移动端嵌入式头部：左 桌宠 compact + 右 greeting 文字 */}
-            <div className="flex shrink-0 items-start gap-3 sm:hidden">
-              <div className="shrink-0">
-                <PetCharacter size="compact" />
+            {/* 移动端嵌入式头部：左 桌宠 compact + 右 greeting 文字。
+                萌宠关闭时整行隐藏（greeting 是桌宠台词，没有宠就不该说话） */}
+            {petEnabled && (
+              <div className="flex shrink-0 items-start gap-3 sm:hidden">
+                <div className="shrink-0">
+                  <PetCharacter size="compact" />
+                </div>
+                <div className="min-h-[5rem] flex-1 self-stretch text-[14px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
+                  {displayedGreeting}
+                  {displayedGreeting.length < greeting.length && (
+                    <motion.span
+                      animate={{ opacity: [1, 0] }}
+                      transition={{ repeat: Infinity, duration: 0.8 }}
+                      className="ml-1 inline-block h-[14px] w-2 bg-sky-400/70 align-middle"
+                    />
+                  )}
+                </div>
               </div>
-              <div className="min-h-[5rem] flex-1 self-stretch text-[14px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
-                {displayedGreeting}
-                {displayedGreeting.length < greeting.length && (
-                  <motion.span
-                    animate={{ opacity: [1, 0] }}
-                    transition={{ repeat: Infinity, duration: 0.8 }}
-                    className="ml-1 inline-block h-[14px] w-2 bg-sky-400/70 align-middle"
-                  />
-                )}
-              </div>
-            </div>
+            )}
 
-            {/* 桌面端 greeting 单独行（移动端已嵌入头部） */}
-            <div className="hidden shrink-0 min-h-[3rem] items-start justify-between gap-3 sm:flex">
+            {/* 桌面端 greeting 单独行（移动端已嵌入头部）；萌宠关闭时 greeting 为空，
+                去掉 min-h 让这一行只剩右侧权限徽章的自然高度 */}
+            <div className={`hidden shrink-0 items-start justify-between gap-3 sm:flex ${petEnabled ? "min-h-[3rem]" : ""}`}>
               <div className="flex-1 text-[15px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
                 {displayedGreeting}
                 {displayedGreeting.length < greeting.length && (
@@ -296,7 +307,7 @@ export function InputBubble(): JSX.Element {
               ref={textareaRef}
               value={task}
               onChange={(e) => update({ task: e.target.value })}
-              placeholder="和桌宠对话……  (Enter 发送，Shift+Enter 换行，/ 查看命令)"
+              placeholder={`${petEnabled ? "和桌宠对话" : "输入任务"}……  (Enter 发送，Shift+Enter 换行，/ 查看命令)`}
               // 移动端 min-h 100px 给足输入区；桌面端 min-h-[100px]
               className="min-h-[100px] max-h-[40vh] w-full resize-none rounded-xl border border-black/5 bg-white/50 p-3 text-base text-zinc-800 outline-none transition-all placeholder:text-zinc-400 focus:border-sky-400/50 focus:bg-white/80 focus:ring-2 focus:ring-sky-400/15 sm:max-h-none sm:p-3.5 sm:text-sm dark:border-white/5 dark:bg-slate-900/40 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-sky-400/40 dark:focus:bg-slate-900/60 dark:focus:ring-sky-400/10"
               onCompositionStart={() => {
