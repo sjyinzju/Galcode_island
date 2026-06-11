@@ -127,7 +127,9 @@ interface SettingsState {
   /// 转换为英文输入：默认关。开启时把用户中文 prompt 翻成英文喂给 agent，
   /// agent 英文输出再翻回中文。关闭时全程中文不走翻译。
   translateInput: boolean;
-  /// 主面板是否显示萌宠。默认显示；关闭后主面板所有 PetCharacter 实例都不渲染。
+  /// 主面板是否显示萌宠。默认显示；关闭后主面板所有 PetCharacter 实例都不渲染，
+  /// 拟人化气泡（开场问候语 / 情绪反馈）也一并隐藏，问候语的 LLM 生成同样跳过。
+  /// 个性化弹窗 / 预览对话框里的桌宠不受影响。
   petEnabled: boolean;
   /// 缓存上次拉到的模型列表，避免每次 SettingsModal 打开都拉
   availableModels: string[];

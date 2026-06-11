@@ -192,28 +192,29 @@ export function ResultCard(): JSX.Element {
               </div>
             </div>
 
-            {/* 移动端嵌入式头部：左 桌宠 compact + 右 emotion 气泡 */}
-            <div className="flex shrink-0 items-start gap-3 sm:hidden">
-              {petEnabled && (
+            {/* 移动端嵌入式头部：左 桌宠 compact + 右 emotion 气泡。
+                emotion 是桌宠的情绪台词，萌宠关闭时整行隐藏（summary 仍正常展示） */}
+            {petEnabled && (
+              <div className="flex shrink-0 items-start gap-3 sm:hidden">
                 <div className="shrink-0">
                   <PetCharacter size="compact" />
                 </div>
-              )}
-              {emotionText ? (
-                <div className="relative min-w-0 flex-1 self-stretch rounded-t-2xl rounded-br-2xl rounded-bl-sm border border-white/50 bg-white/70 p-3 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-slate-700/60">
-                  <p className="text-[15px] font-bold leading-snug text-zinc-800 dark:text-zinc-100">
-                    {emotionText}
-                  </p>
-                </div>
-              ) : (
-                <div className="flex-1 self-stretch flex items-center text-zinc-400 text-[13px] dark:text-zinc-500">
-                  ……
-                </div>
-              )}
-            </div>
+                {emotionText ? (
+                  <div className="relative min-w-0 flex-1 self-stretch rounded-t-2xl rounded-br-2xl rounded-bl-sm border border-white/50 bg-white/70 p-3 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-slate-700/60">
+                    <p className="text-[15px] font-bold leading-snug text-zinc-800 dark:text-zinc-100">
+                      {emotionText}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex-1 self-stretch flex items-center text-zinc-400 text-[13px] dark:text-zinc-500">
+                    ……
+                  </div>
+                )}
+              </div>
+            )}
 
-            {/* 桌面端 emotion 气泡（移动端已内嵌到上方头部） */}
-            {emotionText && (
+            {/* 桌面端 emotion 气泡（移动端已内嵌到上方头部）；同样跟着萌宠开关走 */}
+            {petEnabled && emotionText && (
               <div className="relative hidden shrink-0 rounded-t-2xl rounded-br-2xl rounded-bl-sm border border-white/50 bg-white/70 p-4 shadow-sm backdrop-blur-md sm:block dark:border-white/10 dark:bg-slate-700/60">
                 <p className="text-[15px] font-bold leading-snug text-zinc-800 dark:text-zinc-100">
                   {emotionText}

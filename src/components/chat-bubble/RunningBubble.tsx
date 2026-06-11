@@ -68,21 +68,23 @@ export function RunningBubble(): JSX.Element {
               </div>
             </div>
 
-            {/* 移动端嵌入式：左 桌宠（thinking 立绘）+ 右 进度文字 */}
+            {/* 移动端嵌入式：左 桌宠（thinking 立绘）+ 右 进度文字。
+                进度文字是有效信息，萌宠关闭时保留，只去掉给立绘对齐用的 min-h，
+                兜底文案也换成中性的（"脑电波同步"是桌宠台词） */}
             <div className="flex shrink-0 items-start gap-3 sm:hidden">
               {petEnabled && (
                 <div className="shrink-0">
                   <PetCharacter size="compact" />
                 </div>
               )}
-              <p className="min-h-[5rem] flex-1 self-stretch text-[14px] font-medium leading-relaxed text-zinc-600 dark:text-zinc-300">
-                {bubble || "脑电波同步中..."}
+              <p className={`flex-1 self-stretch text-[14px] font-medium leading-relaxed text-zinc-600 dark:text-zinc-300 ${petEnabled ? "min-h-[5rem]" : ""}`}>
+                {bubble || (petEnabled ? "脑电波同步中..." : "正在执行...")}
               </p>
             </div>
 
             {/* 桌面端：进度文字单独行 */}
             <p className="hidden text-sm font-medium leading-relaxed text-zinc-600 sm:block dark:text-zinc-300">
-              {bubble || "脑电波同步中..."}
+              {bubble || (petEnabled ? "脑电波同步中..." : "正在执行...")}
             </p>
           </div>
         </motion.div>

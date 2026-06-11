@@ -14,11 +14,14 @@
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useUiStore } from "../../stores/useUiStore";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { PetCharacterSection } from "../settings/PetCharacterSection";
 
 export function PersonalizationModal(): JSX.Element {
   const isOpen = useUiStore((s) => s.isPersonalizationModalOpen);
   const close = useUiStore((s) => s.closePersonalizationModal);
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
+  const setPetEnabled = useSettingsStore((s) => s.setPetEnabled);
 
   return (
     <AnimatePresence>
@@ -59,6 +62,36 @@ export function PersonalizationModal(): JSX.Element {
               </div>
 
               <div className="flex flex-col gap-6 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
+                {/* 整行做成 switch 按钮：点文字也能切换，即时生效（跟本弹窗其它改动一致） */}
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={petEnabled}
+                  onClick={() => setPetEnabled(!petEnabled)}
+                  className="flex items-start gap-3 rounded-lg border border-black/5 bg-white/30 p-3 text-left transition-colors hover:bg-white/50 dark:border-white/5 dark:bg-slate-800/30 dark:hover:bg-slate-800/50"
+                >
+                  <span
+                    aria-hidden="true"
+                    className={`relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      petEnabled ? "bg-sky-500" : "bg-zinc-300 dark:bg-zinc-600"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                        petEnabled ? "translate-x-[18px]" : "translate-x-1"
+                      }`}
+                    />
+                  </span>
+                  <span className="flex flex-col gap-0.5">
+                    <span className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                      显示萌宠
+                    </span>
+                    <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                      关闭后主面板不再显示萌宠形象和互动气泡（问候语、情绪反馈）。默认开启。
+                    </span>
+                  </span>
+                </button>
+
                 <PetCharacterSection />
               </div>
 

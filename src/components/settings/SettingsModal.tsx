@@ -35,7 +35,6 @@ export function SettingsModal(): JSX.Element {
   const model = useSettingsStore((s) => s.model);
   const thinking = useSettingsStore((s) => s.thinking);
   const translateInput = useSettingsStore((s) => s.translateInput);
-  const petEnabled = useSettingsStore((s) => s.petEnabled);
   const availableModels = useSettingsStore((s) => s.availableModels);
 
   const setSystemPrompt = useSettingsStore((s) => s.setSystemPrompt);
@@ -45,7 +44,6 @@ export function SettingsModal(): JSX.Element {
   const setModel = useSettingsStore((s) => s.setModel);
   const setThinking = useSettingsStore((s) => s.setThinking);
   const setTranslateInput = useSettingsStore((s) => s.setTranslateInput);
-  const setPetEnabled = useSettingsStore((s) => s.setPetEnabled);
   const setAvailableModels = useSettingsStore((s) => s.setAvailableModels);
 
   const [localSystemPrompt, setLocalSystemPrompt] = React.useState(systemPrompt);
@@ -55,7 +53,6 @@ export function SettingsModal(): JSX.Element {
   const [localModel, setLocalModel] = React.useState(model);
   const [localThinking, setLocalThinking] = React.useState(thinking);
   const [localTranslateInput, setLocalTranslateInput] = React.useState(translateInput);
-  const [localPetEnabled, setLocalPetEnabled] = React.useState(petEnabled);
   const [localModels, setLocalModels] = React.useState<string[]>(availableModels);
 
   const [fetchState, setFetchState] = React.useState<
@@ -71,7 +68,6 @@ export function SettingsModal(): JSX.Element {
       setLocalModel(model);
       setLocalThinking(thinking);
       setLocalTranslateInput(translateInput);
-      setLocalPetEnabled(petEnabled);
       setLocalModels(availableModels);
       setFetchState({ kind: "idle" });
     }
@@ -84,7 +80,6 @@ export function SettingsModal(): JSX.Element {
     model,
     thinking,
     translateInput,
-    petEnabled,
     availableModels,
   ]);
 
@@ -141,7 +136,6 @@ export function SettingsModal(): JSX.Element {
     setModel(localModel);
     setThinking(localThinking);
     setTranslateInput(localTranslateInput);
-    setPetEnabled(localPetEnabled);
     setAvailableModels(localModels);
     try {
       await invoke("update_llm_settings", {
@@ -200,40 +194,6 @@ export function SettingsModal(): JSX.Element {
               </div>
 
               <div className="flex flex-col gap-6 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
-                <section className="flex flex-col gap-4">
-                  <h3 className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">
-                    界面显示
-                  </h3>
-
-                  <div className="flex items-start gap-3 rounded-lg border border-black/5 bg-white/30 p-3 dark:border-white/5 dark:bg-slate-800/30">
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={localPetEnabled}
-                      onClick={() => setLocalPetEnabled(!localPetEnabled)}
-                      className={`relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                        localPetEnabled ? "bg-sky-500" : "bg-zinc-300 dark:bg-zinc-600"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
-                          localPetEnabled ? "translate-x-[18px]" : "translate-x-1"
-                        }`}
-                      />
-                    </button>
-                    <div className="flex flex-col gap-0.5">
-                      <span className="text-sm font-medium text-zinc-800 dark:text-zinc-100">
-                        显示萌宠
-                      </span>
-                      <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                        关闭后主面板不再显示萌宠形象和互动气泡。默认开启。
-                      </span>
-                    </div>
-                  </div>
-                </section>
-
-                <hr className="border-black/5 dark:border-white/5" />
-
                 {/*
                  * "对团长说悄悄话"输入已移除：人设由桌宠图自带的 communityPrompt 接管，
                  * 让风格随图片走，避免全局悄悄话和单图 prompt 互相覆盖产生不确定结果。

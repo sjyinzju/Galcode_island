@@ -87,6 +87,12 @@ export function InputBubble(): JSX.Element {
 
   useEffect(() => {
     if (agentStatus !== "idle") return;
+    // 萌宠关闭时不生成问候语：界面上没有"无宠说话"的气泡，也省一次 LLM 调用
+    if (!petEnabled) {
+      setGreeting("");
+      setDisplayedGreeting("");
+      return;
+    }
     // 优先策略：若启用了自定义桌宠且 welcome 类有任意一张图带 communityPrompt，
     // 调 LLM 用该 prompt 当人设生成一句开场欢迎语；失败 / 无 prompt → 回退默认 GREETINGS。
     let cancelled = false;
@@ -144,7 +150,7 @@ export function InputBubble(): JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [agentStatus, displayNickname]);
+  }, [agentStatus, displayNickname, petEnabled]);
 
   useEffect(() => {
     if (!greeting || agentStatus !== "idle") return;
@@ -257,27 +263,29 @@ export function InputBubble(): JSX.Element {
           {/* Inner glass content container —— 自然高度，三段式（嵌入桌宠头部 /
               textarea / 启动按钮）；textarea 自身 min-h 提供编辑区高度 */}
           <div className="relative flex w-full flex-col gap-3 rounded-[22px] rounded-bl-[6px] border border-white/60 bg-white/70 p-3.5 backdrop-blur-2xl sm:p-5 dark:border-white/10 dark:bg-slate-800/60">
-            {/* 移动端嵌入式头部：左 桌宠 compact + 右 greeting 文字 */}
-            <div className="flex shrink-0 items-start gap-3 sm:hidden">
-              {petEnabled && (
+            {/* 移动端嵌入式头部：左 桌宠 compact + 右 greeting 文字。
+                萌宠关闭时整行隐藏（greeting 是桌宠台词，没有宠就不该说话） */}
+            {petEnabled && (
+              <div className="flex shrink-0 items-start gap-3 sm:hidden">
                 <div className="shrink-0">
                   <PetCharacter size="compact" />
                 </div>
-              )}
-              <div className="min-h-[5rem] flex-1 self-stretch text-[14px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
-                {displayedGreeting}
-                {displayedGreeting.length < greeting.length && (
-                  <motion.span
-                    animate={{ opacity: [1, 0] }}
-                    transition={{ repeat: Infinity, duration: 0.8 }}
-                    className="ml-1 inline-block h-[14px] w-2 bg-sky-400/70 align-middle"
-                  />
-                )}
+                <div className="min-h-[5rem] flex-1 self-stretch text-[14px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
+                  {displayedGreeting}
+                  {displayedGreeting.length < greeting.length && (
+                    <motion.span
+                      animate={{ opacity: [1, 0] }}
+                      transition={{ repeat: Infinity, duration: 0.8 }}
+                      className="ml-1 inline-block h-[14px] w-2 bg-sky-400/70 align-middle"
+                    />
+                  )}
+                </div>
               </div>
-            </div>
+            )}
 
-            {/* 桌面端 greeting 单独行（移动端已嵌入头部） */}
-            <div className="hidden shrink-0 min-h-[3rem] items-start justify-between gap-3 sm:flex">
+            {/* 桌面端 greeting 单独行（移动端已嵌入头部）；萌宠关闭时 greeting 为空，
+                去掉 min-h 让这一行只剩右侧权限徽章的自然高度 */}
+            <div className={`hidden shrink-0 items-start justify-between gap-3 sm:flex ${petEnabled ? "min-h-[3rem]" : ""}`}>
               <div className="flex-1 text-[15px] font-medium leading-relaxed tracking-wide text-zinc-600 dark:text-zinc-300">
                 {displayedGreeting}
                 {displayedGreeting.length < greeting.length && (
