@@ -4,6 +4,25 @@ import { createSharedStorage, onStorageExternalChange } from "../lib/sharedStora
 import type { PermissionMode } from "../types/agent";
 
 export type BackendKey = "claude-code" | "codex" | "opencode";
+export type AppFontSize = "small" | "default" | "large";
+
+export const APP_FONT_SIZE_LABELS: Record<AppFontSize, string> = {
+  small: "小",
+  default: "默认",
+  large: "大",
+};
+
+export const APP_FONT_SIZE_ROOT_PX: Record<AppFontSize, string> = {
+  small: "14px",
+  default: "16px",
+  large: "18px",
+};
+
+export function normalizeAppFontSize(value: unknown): AppFontSize {
+  return value === "small" || value === "large" || value === "default"
+    ? value
+    : "default";
+}
 
 export interface BackendPrefs {
   model: string;
@@ -132,6 +151,7 @@ interface SettingsState {
   /// 桌宠图社区后端地址（如 https://community.example.com）。空字符串 = 未启用，
   /// "看看大家的图"按钮变灰；上传图片时跳过社区同步只落本地。
   communityBaseUrl: string;
+  fontSize: AppFontSize;
 
   /// 三个 backend 各自的 model / effort / proxy / binary。空字符串表示用默认。
   /// 启动时由 App.tsx 同步到 Rust 端 update_backend_preferences；保存时也同步。
@@ -150,6 +170,7 @@ interface SettingsState {
   setTranslateInput: (translateInput: boolean) => void;
   setAvailableModels: (models: string[]) => void;
   setCommunityBaseUrl: (url: string) => void;
+  setFontSize: (fontSize: AppFontSize) => void;
   setBackendPref: (backend: BackendKey, field: keyof BackendPrefs, value: string) => void;
   setBackendPrefs: (backend: BackendKey, prefs: Partial<BackendPrefs>) => void;
   openSettingsModal: () => void;
@@ -168,6 +189,7 @@ export const useSettingsStore = create<SettingsState>()(
       translateInput: false,
       availableModels: [],
       communityBaseUrl: "",
+      fontSize: "default",
       backends: {
         "claude-code": emptyBackendPrefs(),
         codex: emptyBackendPrefs(),
@@ -184,6 +206,7 @@ export const useSettingsStore = create<SettingsState>()(
       setTranslateInput: (translateInput) => set({ translateInput }),
       setAvailableModels: (availableModels) => set({ availableModels }),
       setCommunityBaseUrl: (communityBaseUrl) => set({ communityBaseUrl }),
+      setFontSize: (fontSize) => set({ fontSize }),
       setBackendPref: (backend, field, value) =>
         set((state) => ({
           backends: {
@@ -215,7 +238,12 @@ export const useSettingsStore = create<SettingsState>()(
           codex: { ...emptyBackendPrefs(), ...(persisted.backends?.codex ?? {}) },
           opencode: { ...emptyBackendPrefs(), ...(persisted.backends?.opencode ?? {}) },
         };
-        return { ...currentState, ...persisted, backends: mergedBackends };
+        return {
+          ...currentState,
+          ...persisted,
+          fontSize: normalizeAppFontSize(persisted.fontSize),
+          backends: mergedBackends,
+        };
       },
       partialize: (state) => ({
         systemPrompt: state.systemPrompt,
@@ -227,6 +255,7 @@ export const useSettingsStore = create<SettingsState>()(
         translateInput: state.translateInput,
         availableModels: state.availableModels,
         communityBaseUrl: state.communityBaseUrl,
+        fontSize: state.fontSize,
         backends: state.backends,
       }),
     }

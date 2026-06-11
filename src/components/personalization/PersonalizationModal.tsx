@@ -14,11 +14,20 @@
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useUiStore } from "../../stores/useUiStore";
+import {
+  APP_FONT_SIZE_LABELS,
+  useSettingsStore,
+  type AppFontSize,
+} from "../../stores/useSettingsStore";
 import { PetCharacterSection } from "../settings/PetCharacterSection";
+
+const FONT_SIZE_OPTIONS: AppFontSize[] = ["small", "default", "large"];
 
 export function PersonalizationModal(): JSX.Element {
   const isOpen = useUiStore((s) => s.isPersonalizationModalOpen);
   const close = useUiStore((s) => s.closePersonalizationModal);
+  const fontSize = useSettingsStore((s) => s.fontSize);
+  const setFontSize = useSettingsStore((s) => s.setFontSize);
 
   return (
     <AnimatePresence>
@@ -59,6 +68,38 @@ export function PersonalizationModal(): JSX.Element {
               </div>
 
               <div className="flex flex-col gap-6 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
+                <section className="flex flex-col gap-3">
+                  <header className="flex flex-col gap-0.5">
+                    <h3 className="text-sm font-semibold text-zinc-700 dark:text-zinc-200">
+                      字体大小
+                    </h3>
+                    <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                      调整主界面文字大小，设置会自动保存。
+                    </p>
+                  </header>
+
+                  <div className="inline-flex w-full rounded-lg border border-black/5 bg-white/45 p-1 dark:border-white/5 dark:bg-slate-800/45 sm:w-fit">
+                    {FONT_SIZE_OPTIONS.map((option) => {
+                      const active = option === fontSize;
+                      return (
+                        <button
+                          key={option}
+                          type="button"
+                          onClick={() => setFontSize(option)}
+                          aria-pressed={active}
+                          className={`min-h-[40px] flex-1 rounded-md px-4 py-2 text-sm font-medium transition-all sm:min-h-0 sm:flex-none ${
+                            active
+                              ? "bg-sky-500 text-white shadow-sm shadow-sky-400/25"
+                              : "text-zinc-600 hover:bg-white/70 hover:text-zinc-900 dark:text-zinc-300 dark:hover:bg-slate-700/70 dark:hover:text-white"
+                          }`}
+                        >
+                          {APP_FONT_SIZE_LABELS[option]}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+
                 <PetCharacterSection />
               </div>
 
