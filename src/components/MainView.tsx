@@ -19,10 +19,12 @@ import { RunningBubble } from "./chat-bubble/RunningBubble";
 import { StatusMonitor } from "./status-monitor/StatusMonitor";
 import { GlobalOverview } from "./overview/GlobalOverview";
 import { ProjectOverview } from "./overview/ProjectOverview";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 export function MainView(): JSX.Element {
   const tab = useActiveTab();
   const activeTabId = useActiveTabId();
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
   const uiState = tab.uiState;
   const mode = tab.mode;
   const cliBlockCount = tab.cliBlocks.length;
@@ -102,9 +104,11 @@ export function MainView(): JSX.Element {
               context，把 pet 内的 z-50 困在 pet 这一边的 SC 里出不来。
               这里给 pet 一侧的 wrapper 显式 relative + z-30，让它在 flex row 这层
               建一个高 z 的 SC，气泡跟着浮到 ResultCard 之上。 */}
-          <div className="relative z-30 hidden shrink-0 sm:block">
-            <PetCharacter />
-          </div>
+          {petEnabled && (
+            <div className="relative z-30 hidden shrink-0 sm:block">
+              <PetCharacter />
+            </div>
+          )}
 
           <div className="flex w-full flex-col sm:flex-1 sm:translate-y-3">
             <AnimatePresence mode="wait">

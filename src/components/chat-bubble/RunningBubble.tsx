@@ -2,6 +2,7 @@ import { invoke } from "../../lib/bridge";
 import { motion, AnimatePresence } from "framer-motion";
 import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
 import { useAppStore } from "../../stores/useAppStore";
+import { useSettingsStore } from "../../stores/useSettingsStore";
 import { PetCharacter } from "../pet-character/PetCharacter";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 
@@ -12,6 +13,7 @@ export function RunningBubble(): JSX.Element {
   const bubble = tab.bubble;
   const uiState = tab.uiState;
   const mode = tab.mode;
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
   const isVisible = uiState === "running" || mode === "thinking" || mode === "working";
 
   const handleStop = async (): Promise<void> => {
@@ -68,9 +70,11 @@ export function RunningBubble(): JSX.Element {
 
             {/* 移动端嵌入式：左 桌宠（thinking 立绘）+ 右 进度文字 */}
             <div className="flex shrink-0 items-start gap-3 sm:hidden">
-              <div className="shrink-0">
-                <PetCharacter size="compact" />
-              </div>
+              {petEnabled && (
+                <div className="shrink-0">
+                  <PetCharacter size="compact" />
+                </div>
+              )}
               <p className="min-h-[5rem] flex-1 self-stretch text-[14px] font-medium leading-relaxed text-zinc-600 dark:text-zinc-300">
                 {bubble || "脑电波同步中..."}
               </p>

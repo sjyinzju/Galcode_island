@@ -22,6 +22,7 @@ export function ResultCard(): JSX.Element {
   const emotionText = tab.emotionText;
   const summaryTranslation = tab.summaryTranslation;
   const suggestionOptions = tab.suggestionOptions;
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
   // 错误模式下喂给归因卡片的原始错误文本：优先 bubble（agent://error 写入的最准消息），
   // 其次 summaryTranslation（LLM finalize 失败时填的错误描述），再退到 emotionText
   const errorMessage = (tab.bubble || tab.summaryTranslation || tab.emotionText || "").trim();
@@ -193,9 +194,11 @@ export function ResultCard(): JSX.Element {
 
             {/* 移动端嵌入式头部：左 桌宠 compact + 右 emotion 气泡 */}
             <div className="flex shrink-0 items-start gap-3 sm:hidden">
-              <div className="shrink-0">
-                <PetCharacter size="compact" />
-              </div>
+              {petEnabled && (
+                <div className="shrink-0">
+                  <PetCharacter size="compact" />
+                </div>
+              )}
               {emotionText ? (
                 <div className="relative min-w-0 flex-1 self-stretch rounded-t-2xl rounded-br-2xl rounded-bl-sm border border-white/50 bg-white/70 p-3 shadow-sm backdrop-blur-md dark:border-white/10 dark:bg-slate-700/60">
                   <p className="text-[15px] font-bold leading-snug text-zinc-800 dark:text-zinc-100">
