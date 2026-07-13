@@ -1464,6 +1464,26 @@ pub fn kill_claude_stream_client(client: &ClaudeStreamClient) {
     }
 }
 
+/// cc-switch 等外部工具改写 `~/.claude/settings.json` 后调用：杀掉所有**空闲**
+/// （无进行中 turn）的 per-tab stream client。下一轮 turn 在
+/// ensure_claude_stream_client 里带新 settings.json 重启，从而用上新服务商；
+/// `resume_session` 字段随重启保留，`--resume` 会续上原对话上下文。
+///
+/// 正忙的 tab 跳过不杀，返回 `false` 让调用方稍后重试，避免打断进行中的对话。
+pub fn reset_idle_claude_clients(state: &RuntimeState) -> bool {
+    let (idle, all_idle) = drain_idle_claude_clients(state);
+    for client in &idle {
+        kill_claude_stream_client(client);
+    }
+    if !idle.is_empty() {
+        log::info!(
+            "[config-watch] Claude 重置了 {} 个空闲 stream client（settings.json 变更），下一轮以新配置重启",
+            idle.len()
+        );
+    }
+    all_idle
+}
+
 pub fn claude_stream_client_matches(
     client: &ClaudeStreamClient,
     directory: &str,

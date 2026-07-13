@@ -89,6 +89,17 @@ pub fn run() {
             // 避免端口被占用或重复消耗 token。
             agent::sysutils::cleanup_stale_runtime_orphans(&handle);
 
+            // cc-switch 兼容：监听外部工具对 ~/.claude/settings.json 与
+            // ~/.codex/config.toml 的改动，切换服务商后就近重启空闲的长驻 CLI
+            // 进程，让下一轮对话自动用上新服务商（不打断进行中的 turn）。
+            {
+                let runtime_state = handle
+                    .state::<Arc<agent::runtime::RuntimeState>>()
+                    .inner()
+                    .clone();
+                agent::config_watch::spawn_config_watch_loop(runtime_state);
+            }
+
             // 启动本地 HTTP MCP 服务用于桥接 Claude Code 的 permission-prompt-tool。
             // 失败不阻塞主流程：MCP 起不来时 Claude CLI 启动会自动跳过桥接、退化到
             // 纯 --permission-mode 行为（与本特性出现前一致）。

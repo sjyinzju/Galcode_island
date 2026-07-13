@@ -1412,6 +1412,53 @@ pub fn reset_shared_codex_client(state: &RuntimeState) {
     }
 }
 
+/// cc-switch 等外部工具改写 `~/.codex/config.toml` 后调用：若共享 app-server
+/// **空闲**（无进行中的 turn）就停掉它，下一轮 turn 会经
+/// ensure_codex_app_server_client 带新 config.toml 重启，从而用上新服务商；
+/// 若正忙则不动，返回 `false` 让调用方稍后重试，避免打断进行中的对话。
+///
+/// 空闲判断与 take 在同一把 codex map 锁内完成，避免与 turn 启动竞态。
+pub fn reset_shared_codex_client_if_idle(state: &RuntimeState) -> bool {
+    enum Outcome {
+        NoClient,
+        Busy,
+        Take(Arc<CodexAppServerClient>),
+    }
+
+    let outcome = with_codex_state(state, CODEX_SHARED_KEY, |codex| {
+        let Some(client) = codex.client.as_ref() else {
+            return Outcome::NoClient;
+        };
+        let busy = client
+            .active_turns
+            .lock()
+            .map(|turns| !turns.is_empty())
+            .unwrap_or(false);
+        if busy {
+            Outcome::Busy
+        } else {
+            match codex.client.take() {
+                Some(client) => Outcome::Take(client),
+                None => Outcome::NoClient,
+            }
+        }
+    });
+
+    match outcome {
+        // 锁被 poison 时按「已处理」返回，避免调用方在 pending 状态里空转。
+        Err(_) => true,
+        Ok(Outcome::NoClient) => true,
+        Ok(Outcome::Busy) => false,
+        Ok(Outcome::Take(client)) => {
+            client.stop();
+            log::info!(
+                "[config-watch] Codex 共享 app-server 已重置（config.toml 变更），下一轮以新配置重启"
+            );
+            true
+        }
+    }
+}
+
 pub fn run_codex_app_server_turn(
     app: &AppHandle,
     state: &RuntimeState,
