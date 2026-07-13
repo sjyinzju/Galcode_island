@@ -15,10 +15,19 @@ export interface ExternalSessionRef {
   nativeSessionId: string;
 }
 
+export type ImportedTranscriptPart =
+  | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
+  | { type: "image"; dataUrl: string; alt: string | null }
+  | { type: "toolCall"; toolCallId: string | null; name: string; input: unknown }
+  | { type: "toolResult"; toolCallId: string | null; output: unknown; isError: boolean }
+  | { type: "event"; kind: string; data: unknown };
+
 export interface ImportedTranscriptMessage {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "developer" | "system" | "tool";
   content: string;
+  parts?: ImportedTranscriptPart[];
   timestamp: number;
 }
 

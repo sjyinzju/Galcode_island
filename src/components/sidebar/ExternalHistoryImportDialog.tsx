@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "../../lib/bridge";
 import {
   externalSessionKey,
@@ -130,7 +131,7 @@ export function ExternalHistoryImportDialog({
     }
   };
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-[220] flex items-center justify-center bg-black/45 p-3 backdrop-blur-sm"
       onClick={(event) => {
@@ -146,7 +147,7 @@ export function ExternalHistoryImportDialog({
           <div>
             <h2 className="text-base font-semibold text-zinc-800 dark:text-zinc-100">导入本机聊天记录</h2>
             <p className="mt-1 text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
-              扫描 Codex 与 Claude Code 的本地记录。导入只复制文本到 Galcode，不会修改原始记录。
+              扫描 Codex 与 Claude Code 的本地记录。导入会复制文本、图片、思考和工具记录，不会修改原始记录。
             </p>
           </div>
           <button
@@ -292,6 +293,7 @@ export function ExternalHistoryImportDialog({
           </div>
         </footer>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }

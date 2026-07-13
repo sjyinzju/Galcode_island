@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +11,7 @@ use tauri::{AppHandle, Manager};
 
 const CODEX_SOURCE: &str = "codex";
 const CLAUDE_SOURCE: &str = "claude-code";
-const STORE_VERSION: u8 = 1;
+const STORE_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,12 +32,47 @@ pub struct ExternalSessionPreview {
     pub message_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ImportedTranscriptPart {
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    Image {
+        #[serde(rename = "dataUrl")]
+        data_url: String,
+        alt: Option<String>,
+    },
+    ToolCall {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: Option<String>,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: Option<String>,
+        output: Value,
+        #[serde(rename = "isError")]
+        is_error: bool,
+    },
+    Event {
+        kind: String,
+        data: Value,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedTranscriptMessage {
     pub id: String,
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub parts: Vec<ImportedTranscriptPart>,
     pub timestamp: i64,
 }
 
@@ -86,6 +122,7 @@ struct ImportedConversationsFile {
 struct ParsedMessage {
     role: String,
     content: String,
+    parts: Vec<ImportedTranscriptPart>,
     timestamp: i64,
     source_path: String,
     line_number: usize,
@@ -379,18 +416,16 @@ fn assemble_codex_conversations(
             }
         }
         for message in piece.messages {
-            let dedupe_key = format!(
-                "{}\u{0}{}\u{0}{}",
-                message.role, message.timestamp, message.content
-            );
+            let dedupe_key = message_dedupe_key(&message);
             if !entry.seen_messages.insert(dedupe_key) {
                 continue;
             }
-            if entry.first_user_text.is_none()
-                && message.role == "user"
-                && !is_context_only_prompt(&message.content)
-            {
-                entry.first_user_text = Some(message.content.clone());
+            if entry.first_user_text.is_none() && message.role == "user" {
+                if let Some(text) =
+                    first_text_part(&message.parts).filter(|text| !is_context_only_prompt(text))
+                {
+                    entry.first_user_text = Some(text.to_string());
+                }
             }
             entry.message_count += 1;
             if include_messages {
@@ -478,10 +513,7 @@ fn assemble_claude_conversations(
         replace_with_latest(&mut entry.last_prompt, piece.last_prompt);
         replace_with_earliest(&mut entry.first_user_text, piece.first_user_text);
         for message in piece.messages {
-            let dedupe_key = format!(
-                "{}\u{0}{}\u{0}{}",
-                message.role, message.timestamp, message.content
-            );
+            let dedupe_key = message_dedupe_key(&message);
             if !entry.seen_messages.insert(dedupe_key) {
                 continue;
             }
@@ -546,7 +578,6 @@ fn parse_codex_file(path: &Path, fallback_id: String) -> Option<CodexPiece> {
             if found_session_meta {
                 continue;
             }
-            found_session_meta = true;
             let payload = record.get("payload").unwrap_or(&Value::Null);
             let is_subagent = payload
                 .get("thread_source")
@@ -557,8 +588,9 @@ fn parse_codex_file(path: &Path, fallback_id: String) -> Option<CodexPiece> {
                     .and_then(Value::as_object)
                     .is_some_and(|source| source.contains_key("subagent"));
             if is_subagent {
-                return None;
+                continue;
             }
+            found_session_meta = true;
             rollout_id = payload
                 .get("id")
                 .and_then(Value::as_str)
@@ -602,16 +634,17 @@ fn parse_codex_file(path: &Path, fallback_id: String) -> Option<CodexPiece> {
             continue;
         }
         let payload = record.get("payload").unwrap_or(&Value::Null);
-        let Some((role, content)) = extract_codex_message(payload) else {
+        let Some((role, content, parts)) = extract_codex_message(payload) else {
             continue;
         };
-        if role == "user" && is_context_only_prompt(&content) {
+        if role == "user" && contains_only_text(&parts) && is_context_only_prompt(&content) {
             continue;
         }
         let timestamp = record_time.unwrap_or(0);
         messages.push(ParsedMessage {
             role,
             content,
+            parts,
             timestamp,
             source_path: source_path.clone(),
             line_number: line_index,
@@ -692,28 +725,37 @@ fn parse_claude_file(path: &Path) -> Vec<ClaudePiece> {
 
         match record.get("type").and_then(Value::as_str) {
             Some("custom-title") => {
-                replace_with_latest(&mut entry.custom_title, record
-                    .get("customTitle")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                    .filter(|title| !title.trim().is_empty())
-                    .map(|title| (title, title_time)));
+                replace_with_latest(
+                    &mut entry.custom_title,
+                    record
+                        .get("customTitle")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .filter(|title| !title.trim().is_empty())
+                        .map(|title| (title, title_time)),
+                );
             }
             Some("ai-title") => {
-                replace_with_latest(&mut entry.ai_title, record
-                    .get("aiTitle")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                    .filter(|title| !title.trim().is_empty())
-                    .map(|title| (title, title_time)));
+                replace_with_latest(
+                    &mut entry.ai_title,
+                    record
+                        .get("aiTitle")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .filter(|title| !title.trim().is_empty())
+                        .map(|title| (title, title_time)),
+                );
             }
             Some("last-prompt") => {
-                replace_with_latest(&mut entry.last_prompt, record
-                    .get("lastPrompt")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                    .filter(|prompt| !prompt.trim().is_empty())
-                    .map(|prompt| (prompt, title_time)));
+                replace_with_latest(
+                    &mut entry.last_prompt,
+                    record
+                        .get("lastPrompt")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .filter(|prompt| !prompt.trim().is_empty())
+                        .map(|prompt| (prompt, title_time)),
+                );
             }
             Some("user") | Some("assistant") => {
                 let role = record
@@ -721,18 +763,45 @@ fn parse_claude_file(path: &Path) -> Vec<ClaudePiece> {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let message = record.get("message").unwrap_or(&Value::Null);
-                let Some(content) = extract_claude_message(message, role) else {
+                let Some((content, parts)) = extract_claude_message(message, role) else {
                     continue;
                 };
-                if role == "user" && !is_context_only_prompt(&content) {
-                    replace_with_earliest(
-                        &mut entry.first_user_text,
-                        Some((content.clone(), title_time)),
-                    );
+                if role == "user" {
+                    if let Some(text) =
+                        first_text_part(&parts).filter(|text| !is_context_only_prompt(text))
+                    {
+                        replace_with_earliest(
+                            &mut entry.first_user_text,
+                            Some((text.to_string(), title_time)),
+                        );
+                    }
                 }
                 entry.messages.push(ParsedMessage {
                     role: role.to_string(),
                     content,
+                    parts,
+                    timestamp: record_time.unwrap_or(0),
+                    source_path: source_path.clone(),
+                    line_number: line_index,
+                });
+            }
+            Some("system") => {
+                let kind = record
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .unwrap_or("system")
+                    .to_string();
+                let parts = vec![ImportedTranscriptPart::Event {
+                    kind,
+                    data: record.clone(),
+                }];
+                let Some(content) = parts_to_legacy_content(&parts) else {
+                    continue;
+                };
+                entry.messages.push(ParsedMessage {
+                    role: "system".to_string(),
+                    content,
+                    parts,
                     timestamp: record_time.unwrap_or(0),
                     source_path: source_path.clone(),
                     line_number: line_index,
@@ -744,51 +813,302 @@ fn parse_claude_file(path: &Path) -> Vec<ClaudePiece> {
     pieces.into_values().collect()
 }
 
-fn extract_codex_message(payload: &Value) -> Option<(String, String)> {
-    if payload.get("type").and_then(Value::as_str) != Some("message") {
+fn extract_codex_message(payload: &Value) -> Option<(String, String, Vec<ImportedTranscriptPart>)> {
+    let payload_type = payload.get("type").and_then(Value::as_str)?;
+    let (role, parts) = match payload_type {
+        "message" => {
+            let role = payload.get("role").and_then(Value::as_str)?;
+            let parts = extract_content_parts(payload.get("content")?);
+            (role.to_string(), parts)
+        }
+        "reasoning" => {
+            let mut parts = payload
+                .get("summary")
+                .map(extract_thinking_parts)
+                .unwrap_or_default();
+            if parts.is_empty() {
+                parts.push(ImportedTranscriptPart::Event {
+                    kind: "reasoning".to_string(),
+                    data: payload.clone(),
+                });
+            }
+            ("assistant".to_string(), parts)
+        }
+        "function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(payload_type)
+                .to_string();
+            let input = payload
+                .get("arguments")
+                .or_else(|| payload.get("input"))
+                .or_else(|| payload.get("action"))
+                .map(parse_json_string)
+                .unwrap_or(Value::Null);
+            let part = ImportedTranscriptPart::ToolCall {
+                tool_call_id: codex_call_id(payload),
+                name,
+                input,
+            };
+            ("assistant".to_string(), vec![part])
+        }
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+            let output = payload
+                .get("output")
+                .cloned()
+                .unwrap_or_else(|| payload.clone());
+            let part = ImportedTranscriptPart::ToolResult {
+                tool_call_id: codex_call_id(payload),
+                output: parse_json_string(&output),
+                is_error: payload.get("status").and_then(Value::as_str) == Some("failed"),
+            };
+            ("tool".to_string(), vec![part])
+        }
+        "image_generation_call" => {
+            let data = payload.get("result").and_then(Value::as_str)?.trim();
+            if data.is_empty() {
+                return None;
+            }
+            let alt = payload
+                .get("revised_prompt")
+                .and_then(Value::as_str)
+                .and_then(normalized_message_text);
+            let call = ImportedTranscriptPart::ToolCall {
+                tool_call_id: codex_call_id(payload),
+                name: "image_generation".to_string(),
+                input: payload
+                    .get("revised_prompt")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            };
+            let image = ImportedTranscriptPart::Image {
+                data_url: format!("data:image/png;base64,{data}"),
+                alt,
+            };
+            ("assistant".to_string(), vec![call, image])
+        }
+        "agent_message" => {
+            let text = payload.get("message").and_then(Value::as_str)?;
+            let text = normalized_message_text(text)?;
+            (
+                "assistant".to_string(),
+                vec![ImportedTranscriptPart::Text { text }],
+            )
+        }
+        _ => (
+            "assistant".to_string(),
+            vec![ImportedTranscriptPart::Event {
+                kind: payload_type.to_string(),
+                data: payload.clone(),
+            }],
+        ),
+    };
+    let content = parts_to_legacy_content(&parts)?;
+    Some((role, content, parts))
+}
+
+fn extract_claude_message(
+    message: &Value,
+    role: &str,
+) -> Option<(String, Vec<ImportedTranscriptPart>)> {
+    if !matches!(role, "user" | "assistant") {
         return None;
     }
-    let role = payload.get("role").and_then(Value::as_str)?;
-    let accepted_types: &[&str] = match role {
-        "user" => &["input_text", "text"],
-        "assistant" => &["output_text", "text"],
-        _ => return None,
-    };
-    let content = extract_content_text(payload.get("content")?, accepted_types)?;
-    Some((role.to_string(), content))
+    let parts = extract_content_parts(message.get("content")?);
+    let content = parts_to_legacy_content(&parts)?;
+    Some((content, parts))
 }
 
-fn extract_claude_message(message: &Value, role: &str) -> Option<String> {
-    let accepted_types: &[&str] = match role {
-        "user" | "assistant" => &["text"],
-        _ => return None,
-    };
-    extract_content_text(message.get("content")?, accepted_types)
-}
-
-fn extract_content_text(content: &Value, accepted_types: &[&str]) -> Option<String> {
-    if let Some(text) = content.as_str() {
-        return normalized_message_text(text);
+fn extract_content_parts(content: &Value) -> Vec<ImportedTranscriptPart> {
+    if let Some(text) = content.as_str().and_then(normalized_message_text) {
+        return vec![ImportedTranscriptPart::Text { text }];
     }
-    let mut parts = Vec::new();
     let items: Vec<&Value> = match content {
         Value::Array(items) => items.iter().collect(),
         Value::Object(_) => vec![content],
         _ => Vec::new(),
     };
+    let mut parts = Vec::new();
     for item in items {
-        let item_type = item.get("type").and_then(Value::as_str);
-        if !item_type.is_some_and(|item_type| accepted_types.contains(&item_type)) {
-            continue;
-        }
-        if let Some(text) = item.get("text").and_then(Value::as_str) {
-            let text = text.trim();
-            if !text.is_empty() {
-                parts.push(text.to_string());
+        match item.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text" | "output_text") => {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(normalized_message_text)
+                {
+                    parts.push(ImportedTranscriptPart::Text { text });
+                }
             }
+            Some("thinking" | "reasoning" | "summary_text") => {
+                if let Some(text) = item
+                    .get("thinking")
+                    .or_else(|| item.get("text"))
+                    .and_then(Value::as_str)
+                    .and_then(normalized_message_text)
+                {
+                    parts.push(ImportedTranscriptPart::Thinking { text });
+                } else {
+                    parts.push(ImportedTranscriptPart::Event {
+                        kind: item
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("thinking")
+                            .to_string(),
+                        data: item.clone(),
+                    });
+                }
+            }
+            Some("image" | "input_image") => {
+                let data_url = item
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| image_source_data_url(item.get("source")?));
+                if let Some(data_url) = data_url.filter(|value| !value.trim().is_empty()) {
+                    parts.push(ImportedTranscriptPart::Image {
+                        data_url,
+                        alt: item
+                            .get("alt")
+                            .and_then(Value::as_str)
+                            .and_then(normalized_message_text),
+                    });
+                }
+            }
+            Some("tool_use") => {
+                parts.push(ImportedTranscriptPart::ToolCall {
+                    tool_call_id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string(),
+                    input: item.get("input").cloned().unwrap_or(Value::Null),
+                });
+            }
+            Some("tool_result") => {
+                parts.push(ImportedTranscriptPart::ToolResult {
+                    tool_call_id: item
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    output: item.get("content").cloned().unwrap_or(Value::Null),
+                    is_error: item
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+                if let Some(result_content) = item.get("content") {
+                    parts.extend(
+                        extract_content_parts(result_content)
+                            .into_iter()
+                            .filter(|part| matches!(part, ImportedTranscriptPart::Image { .. })),
+                    );
+                }
+            }
+            Some(kind) => parts.push(ImportedTranscriptPart::Event {
+                kind: kind.to_string(),
+                data: item.clone(),
+            }),
+            None => {}
         }
     }
-    normalized_message_text(&parts.join("\n\n"))
+    parts
+}
+
+fn extract_thinking_parts(content: &Value) -> Vec<ImportedTranscriptPart> {
+    extract_content_parts(content)
+        .into_iter()
+        .filter_map(|part| match part {
+            ImportedTranscriptPart::Text { text } => {
+                Some(ImportedTranscriptPart::Thinking { text })
+            }
+            ImportedTranscriptPart::Thinking { .. } => Some(part),
+            _ => None,
+        })
+        .collect()
+}
+
+fn image_source_data_url(source: &Value) -> Option<String> {
+    let source_type = source.get("type").and_then(Value::as_str)?;
+    match source_type {
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(Value::as_str)?;
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        "url" => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn codex_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn parse_json_string(value: &Value) -> Value {
+    value
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| value.clone())
+}
+
+fn parts_to_legacy_content(parts: &[ImportedTranscriptPart]) -> Option<String> {
+    let mut values = Vec::new();
+    for part in parts {
+        match part {
+            ImportedTranscriptPart::Text { text } | ImportedTranscriptPart::Thinking { text } => {
+                values.push(text.clone())
+            }
+            ImportedTranscriptPart::Image { .. } => values.push("[Image]".to_string()),
+            ImportedTranscriptPart::ToolCall { name, .. } => {
+                values.push(format!("[Tool call: {name}]"));
+            }
+            ImportedTranscriptPart::ToolResult { .. } => {
+                values.push("[Tool result]".to_string());
+            }
+            ImportedTranscriptPart::Event { kind, .. } => values.push(format!("[{kind}]")),
+        }
+    }
+    normalized_message_text(&values.join("\n\n"))
+}
+
+fn contains_only_text(parts: &[ImportedTranscriptPart]) -> bool {
+    parts
+        .iter()
+        .all(|part| matches!(part, ImportedTranscriptPart::Text { .. }))
+}
+
+fn first_text_part(parts: &[ImportedTranscriptPart]) -> Option<&str> {
+    parts.iter().find_map(|part| match part {
+        ImportedTranscriptPart::Text { text } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+fn message_dedupe_key(message: &ParsedMessage) -> String {
+    let mut hasher = DefaultHasher::new();
+    message.role.hash(&mut hasher);
+    message.timestamp.hash(&mut hasher);
+    message.content.hash(&mut hasher);
+    serde_json::to_vec(&message.parts)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn normalized_message_text(text: &str) -> Option<String> {
@@ -813,6 +1133,7 @@ fn finalize_messages(
             id: format!("{native_session_id}:{index}"),
             role: message.role,
             content: message.content,
+            parts: message.parts,
             timestamp: message.timestamp,
         })
         .collect()
@@ -923,9 +1244,36 @@ fn save_imported_file(app: &AppHandle, contents: &ImportedConversationsFile) -> 
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, bytes)
         .map_err(|error| format!("Could not save imported conversations: {error}"))?;
-    fs::rename(&temporary, &path)
-        .map_err(|error| format!("Could not finalize imported conversations: {error}"))?;
+    replace_file(&temporary, &path)?;
     Ok(())
+}
+
+fn replace_file(temporary: &Path, path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|error| {
+                format!("Could not clear imported conversations backup: {error}")
+            })?;
+        }
+        fs::rename(path, &backup)
+            .map_err(|error| format!("Could not back up imported conversations: {error}"))?;
+        return match fs::rename(temporary, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(backup);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::rename(&backup, path);
+                Err(format!(
+                    "Could not finalize imported conversations: {error}"
+                ))
+            }
+        };
+    }
+    fs::rename(temporary, path)
+        .map_err(|error| format!("Could not finalize imported conversations: {error}"))
 }
 
 fn collect_jsonl_files(root: &Path, output: &mut Vec<PathBuf>) {
@@ -1069,6 +1417,10 @@ fn is_context_only_prompt(text: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "external_history_rich_migration_tests.rs"]
+mod rich_migration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1095,53 +1447,127 @@ mod tests {
     }
 
     #[test]
-    fn extracts_only_plain_codex_user_and_assistant_text() {
+    fn extracts_codex_text_and_images() {
         let user = json!({
             "type": "message",
             "role": "user",
             "content": [
                 {"type": "input_text", "text": "  explain this file  "},
-                {"type": "input_image", "image_url": "ignored"}
+                {"type": "input_image", "image_url": "data:image/png;base64,abc"}
             ]
         });
         let assistant = json!({
             "type": "message",
             "role": "assistant",
             "content": [
-                {"type": "output_text", "text": "Here is the answer."},
-                {"type": "reasoning", "text": "ignored"}
+                {"type": "output_text", "text": "Here is the answer."}
             ]
         });
+        let reasoning = json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "considering options"}]
+        });
+        let encrypted_reasoning = json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "opaque"
+        });
 
-        assert_eq!(
-            extract_codex_message(&user),
-            Some(("user".to_string(), "explain this file".to_string()))
-        );
-        assert_eq!(
-            extract_codex_message(&assistant),
-            Some(("assistant".to_string(), "Here is the answer.".to_string()))
-        );
+        let (role, content, parts) = extract_codex_message(&user).expect("user message");
+        assert_eq!(role, "user");
+        assert_eq!(content, "explain this file\n\n[Image]");
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts[1], ImportedTranscriptPart::Image { .. }));
+
+        let (role, content, parts) = extract_codex_message(&assistant).expect("assistant message");
+        assert_eq!(role, "assistant");
+        assert_eq!(content, "Here is the answer.");
+        assert_eq!(parts.len(), 1);
+
+        let (_, content, parts) = extract_codex_message(&reasoning).expect("reasoning message");
+        assert_eq!(content, "considering options");
+        assert!(matches!(parts[0], ImportedTranscriptPart::Thinking { .. }));
+
+        let (_, content, parts) =
+            extract_codex_message(&encrypted_reasoning).expect("encrypted reasoning");
+        assert_eq!(content, "[reasoning]");
+        assert!(matches!(parts[0], ImportedTranscriptPart::Event { .. }));
     }
 
     #[test]
-    fn extracts_text_from_claude_string_and_content_array() {
+    fn extracts_claude_text_thinking_and_tools() {
         let user = json!({"content": "Write a test"});
         let assistant = json!({
             "content": [
-                {"type": "thinking", "thinking": "ignored"},
+                {"type": "thinking", "thinking": "considering edge cases"},
+                {"type": "thinking", "thinking": "", "signature": "opaque"},
                 {"type": "text", "text": "Test added."},
-                {"type": "tool_use", "name": "Write"}
+                {"type": "tool_use", "id": "call-1", "name": "Write", "input": {"file_path": "a.rs"}}
             ]
         });
 
         assert_eq!(
-            extract_claude_message(&user, "user"),
+            extract_claude_message(&user, "user").map(|message| message.0),
             Some("Write a test".to_string())
         );
+        let (content, parts) =
+            extract_claude_message(&assistant, "assistant").expect("assistant message");
         assert_eq!(
-            extract_claude_message(&assistant, "assistant"),
-            Some("Test added.".to_string())
+            content,
+            "considering edge cases\n\n[thinking]\n\nTest added.\n\n[Tool call: Write]"
         );
+        assert_eq!(parts.len(), 4);
+        assert!(matches!(parts[0], ImportedTranscriptPart::Thinking { .. }));
+        assert!(matches!(parts[1], ImportedTranscriptPart::Event { .. }));
+        assert!(matches!(parts[3], ImportedTranscriptPart::ToolCall { .. }));
+    }
+
+    #[test]
+    fn extracts_claude_images_and_tool_results() {
+        let message = json!({
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "written",
+                    "is_error": false
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "abc"
+                    }
+                }
+            ]
+        });
+
+        let (_, parts) = extract_claude_message(&message, "user").expect("user result");
+        assert!(matches!(
+            &parts[0],
+            ImportedTranscriptPart::ToolResult { tool_call_id, .. }
+                if tool_call_id.as_deref() == Some("call-1")
+        ));
+        assert!(matches!(
+            &parts[1],
+            ImportedTranscriptPart::Image { data_url, .. }
+                if data_url == "data:image/png;base64,abc"
+        ));
+    }
+
+    #[test]
+    fn reads_version_one_messages_without_structured_parts() {
+        let message: ImportedTranscriptMessage = serde_json::from_value(json!({
+            "id": "old:0",
+            "role": "assistant",
+            "content": "old message",
+            "timestamp": 1
+        }))
+        .expect("version one message should remain readable");
+
+        assert_eq!(message.content, "old message");
+        assert!(message.parts.is_empty());
     }
 
     #[test]
@@ -1150,6 +1576,9 @@ mod tests {
             ParsedMessage {
                 role: "assistant".to_string(),
                 content: "second".to_string(),
+                parts: vec![ImportedTranscriptPart::Text {
+                    text: "second".to_string(),
+                }],
                 timestamp: 20,
                 source_path: "b.jsonl".to_string(),
                 line_number: 1,
@@ -1157,6 +1586,9 @@ mod tests {
             ParsedMessage {
                 role: "user".to_string(),
                 content: "first".to_string(),
+                parts: vec![ImportedTranscriptPart::Text {
+                    text: "first".to_string(),
+                }],
                 timestamp: 10,
                 source_path: "a.jsonl".to_string(),
                 line_number: 2,
@@ -1233,6 +1665,87 @@ mod tests {
         assert_eq!(piece.messages.len(), 1);
         assert_eq!(piece.messages[0].content, "real request");
         fs::remove_file(top_level_path).ok();
+    }
+
+    #[test]
+    fn skips_subagent_metadata_without_discarding_later_user_session() {
+        let path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "child", "source": { "subagent": { "other": "test" } } }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "child output" }] }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "session_meta",
+                "payload": { "session_id": "parent", "thread_source": "user" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "real request" }] }
+            }),
+        ]);
+
+        let piece = parse_codex_file(&path, "fallback".to_string())
+            .expect("later user session should be parsed");
+        assert_eq!(piece.native_session_id, "parent");
+        assert_eq!(piece.messages.len(), 1);
+        assert_eq!(piece.messages[0].content, "real request");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn extracts_codex_tool_call_and_result() {
+        let call = json!({
+            "type": "function_call",
+            "name": "shell_command",
+            "arguments": "{\"command\":\"git status\"}",
+            "call_id": "call-1"
+        });
+        let result = json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "clean"
+        });
+
+        let (_, _, call_parts) = extract_codex_message(&call).expect("tool call");
+        let (role, _, result_parts) = extract_codex_message(&result).expect("tool result");
+        assert!(matches!(
+            &call_parts[0],
+            ImportedTranscriptPart::ToolCall { tool_call_id, name, .. }
+                if tool_call_id.as_deref() == Some("call-1") && name == "shell_command"
+        ));
+        assert_eq!(role, "tool");
+        assert!(matches!(
+            &result_parts[0],
+            ImportedTranscriptPart::ToolResult { tool_call_id, .. }
+                if tool_call_id.as_deref() == Some("call-1")
+        ));
+    }
+
+    #[test]
+    fn replaces_existing_storage_file() {
+        let counter = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "galcode-external-history-replace-{}-{counter}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join("imported-conversations.json");
+        let temporary = directory.join("imported-conversations.json.tmp");
+        fs::write(&path, "old").expect("old file");
+        fs::write(&temporary, "new").expect("temporary file");
+
+        replace_file(&temporary, &path).expect("replacement should succeed");
+        assert_eq!(fs::read_to_string(&path).expect("new file"), "new");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(directory).ok();
     }
 
     #[test]
