@@ -3,6 +3,10 @@ use crate::agent::codex::{self as codex_agent, CodexModelsResult, CodexStatus, C
 use crate::agent::manager::{self, LaunchResult};
 use crate::agent::opencode::{self as opencode_agent, OpencodeStatus};
 use crate::agent::runtime::{RuntimeState, DEFAULT_RUN_ID};
+use crate::external_history::{
+    self, ExternalSessionPreview, ExternalSessionRef, ImportExternalSessionsResult,
+    ImportedConversation, ImportedConversationSummary,
+};
 use crate::AppState;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -62,6 +66,38 @@ pub fn list_sessions(state: State<Arc<AppState>>) -> Result<Vec<SessionSummary>,
     // 按最近创建（elapsed 越小越新）排在前面
     summaries.sort_by_key(|s| s.created_at_ms);
     Ok(summaries)
+}
+
+/// Scan the local Codex and Claude Code folders without modifying either source.
+#[tauri::command]
+pub fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
+    external_history::scan_external_sessions()
+}
+
+/// Copy selected external transcripts into Galcode's own app-data file.
+#[tauri::command]
+pub fn import_external_sessions(
+    app: AppHandle,
+    selections: Vec<ExternalSessionRef>,
+) -> Result<ImportExternalSessionsResult, String> {
+    external_history::import_external_sessions(&app, selections)
+}
+
+#[tauri::command]
+pub fn list_imported_conversations(
+    app: AppHandle,
+) -> Result<Vec<ImportedConversationSummary>, String> {
+    external_history::list_imported_conversations(&app)
+}
+
+#[tauri::command]
+pub fn load_imported_conversation(app: AppHandle, id: String) -> Result<ImportedConversation, String> {
+    external_history::load_imported_conversation(&app, &id)
+}
+
+#[tauri::command]
+pub fn remove_imported_conversation(app: AppHandle, id: String) -> Result<(), String> {
+    external_history::remove_imported_conversation(&app, &id)
 }
 
 #[tauri::command]
