@@ -10,6 +10,7 @@
 )]
 
 mod agent;
+mod external_history;
 mod ipc;
 mod lan;
 mod llm;
@@ -22,15 +23,15 @@ use tauri::Manager;
 use ipc::commands::{
     claude_login_open, claude_models, claude_run_in_terminal, claude_send_prompt, claude_status,
     claude_verify, codex_login_open, codex_models, codex_send_prompt, codex_status, codex_verify,
-    finalize_pending, get_session_logs, lan_clear_password, lan_get_state, lan_get_storage,
+    finalize_pending, get_session_logs, import_external_sessions, lan_clear_password, lan_get_state, lan_get_storage,
     lan_list_storage, lan_remove_storage, lan_revoke_all_devices, lan_set_enabled,
-    lan_set_password, lan_set_port, lan_set_storage, lan_sync_projects, list_directory,
+    lan_set_password, lan_set_port, lan_set_storage, lan_sync_projects, list_directory, list_imported_conversations,
     list_llm_models, list_project_slash_commands, list_sessions, opencode_create_session,
     opencode_list_providers, opencode_login_open, opencode_send_prompt, opencode_set_auth,
     opencode_start, opencode_status, opencode_stop, respond_permission,
-    respond_permission_decision, select_project_folder, set_click_through, start_agent,
+    respond_permission_decision, remove_imported_conversation, scan_external_sessions, select_project_folder, set_click_through, start_agent,
     stop_agent, translate_only, update_backend_preferences, update_llm_settings,
-    generate_welcome_speech, generate_poke_speech,
+    generate_welcome_speech, generate_poke_speech, load_imported_conversation,
 };
 use ipc::git::{
     git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
@@ -215,6 +216,11 @@ pub fn run() {
             respond_permission_decision,
             get_session_logs,
             list_sessions,
+            scan_external_sessions,
+            import_external_sessions,
+            list_imported_conversations,
+            load_imported_conversation,
+            remove_imported_conversation,
             finalize_pending,
             translate_only,
             generate_welcome_speech,
