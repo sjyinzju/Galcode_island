@@ -108,6 +108,9 @@ export interface SharedStorageOptions {
   /// 已经处理（外层 setItem 不再重试）；返回 false / 抛错表示放弃。
   /// 默认：直接吞掉错误（已经写到后端镜像，本地丢失也能从远端恢复）。
   onLocalQuotaError?: (key: string, raw: string, err: unknown) => boolean | void;
+  /// 合并短时间内的连续写入。流式输出等高频状态只保留最新快照，避免每个
+  /// 增量都 stringify 整个 store、同步写 localStorage 并发送 IPC。
+  writeDelayMs?: number;
 }
 
 /// 创建一份"双端共享、桌面权威"的 zustand persist storage。
@@ -123,6 +126,94 @@ export function createSharedStorage(
   installGlobalListener();
   // T 已被擦除；adapter 内部按 unknown JSON value 处理
   type AnyValue = StorageValue<unknown>;
+  type RemoteOperation =
+    | { kind: "set"; raw: string }
+    | { kind: "remove" };
+
+  const writeDelayMs = Math.max(0, options.writeDelayMs ?? 0);
+  const pendingWrites = new Map<string, AnyValue>();
+  const pendingRemote = new Map<string, RemoteOperation>();
+  const activeRemote = new Set<string>();
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const writeLocal = (name: string, raw: string): void => {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(name, raw);
+    } catch (err) {
+      if (options.onLocalQuotaError) {
+        try { options.onLocalQuotaError(name, raw, err); } catch { /* ignore */ }
+      }
+    }
+  };
+
+  // 同一个 key 的远端写只允许一个在途；期间产生的新快照只保留最后一个。
+  // 这既减少 IPC，也避免多个异步命令完成顺序颠倒后旧值覆盖新值。
+  const drainRemote = async (name: string): Promise<void> => {
+    while (pendingRemote.has(name)) {
+      const next = pendingRemote.get(name)!;
+      pendingRemote.delete(name);
+      try {
+        await (next.kind === "set"
+          ? invoke("lan_set_storage", {
+              key: name,
+              value: next.raw,
+              source: CLIENT_ID,
+              notifyWebview: !isTauri,
+            })
+          : invoke("lan_remove_storage", {
+              key: name,
+              source: CLIENT_ID,
+              notifyWebview: !isTauri,
+            }));
+      } catch (err) {
+        console.warn(`[shared-storage] ${next.kind} backend failed`, err);
+      }
+    }
+    activeRemote.delete(name);
+  };
+
+  const enqueueRemote = (name: string, operation: RemoteOperation): void => {
+    pendingRemote.set(name, operation);
+    if (activeRemote.has(name)) return;
+    activeRemote.add(name);
+    void drainRemote(name);
+  };
+
+  const persistNow = (name: string, value: AnyValue): void => {
+    const raw = JSON.stringify(value);
+    writeLocal(name, raw);
+    enqueueRemote(name, { kind: "set", raw });
+  };
+
+  const flush = (): void => {
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    const writes = Array.from(pendingWrites.entries());
+    pendingWrites.clear();
+    for (const [name, value] of writes) persistNow(name, value);
+  };
+
+  const scheduleWrite = (name: string, value: AnyValue): void => {
+    if (writeDelayMs === 0) {
+      persistNow(name, value);
+      return;
+    }
+    pendingWrites.set(name, value);
+    if (flushTimer === null) {
+      flushTimer = setTimeout(flush, writeDelayMs);
+    }
+  };
+
+  if (writeDelayMs > 0 && typeof window !== "undefined") {
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") flush();
+    });
+  }
+
   const adapter: PersistStorage<unknown> = {
     // Tauri 桌面端：同步从 localStorage 读 —— 这一步必须同步！否则 zustand persist
     // 在 store 创建时启动 hydrate，hydrate 是 await getItem 后 setState；用户刚启动
@@ -148,44 +239,18 @@ export function createSharedStorage(
       })();
     },
 
-    setItem: (name, value) => {
-      const raw = JSON.stringify(value);
-      if (typeof localStorage !== "undefined") {
-        try {
-          localStorage.setItem(name, raw);
-        } catch (err) {
-          if (options.onLocalQuotaError) {
-            try { options.onLocalQuotaError(name, raw, err); } catch { /* ignore */ }
-          }
-        }
-      }
-      // 推到 Rust 镜像 —— **fire-and-forget，不 await**，让 setItem 同步返回。
-      // zustand persist 在 setItem 同步完成时也走同步路径，避免"setState 触发的
-      // setItem 还没完成时 hydrate 又过来 setState"的竞态。后端写入失败也无所谓:
-      // localStorage 是真相，下次 setItem 会再推一次。
-      //
-      // notifyWebview: !isTauri —— 桌面 webview 自己发的事件不需要 app.emit 回到
-      // 自己（已经在自己端写过 state，回声只能被 source 比对跳过）；浏览器（移动端）
-      // 发的需要让桌面 webview 收到 → 用默认 true 触发 app.emit。
-      void invoke("lan_set_storage", {
-        key: name,
-        value: raw,
-        source: CLIENT_ID,
-        notifyWebview: !isTauri,
-      }).catch((err) => {
-        console.warn("[shared-storage] push to backend failed", err);
-      });
-    },
+    setItem: scheduleWrite,
 
     removeItem: (name) => {
+      pendingWrites.delete(name);
+      if (pendingWrites.size === 0 && flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
       if (typeof localStorage !== "undefined") {
         try { localStorage.removeItem(name); } catch { /* ignore */ }
       }
-      void invoke("lan_remove_storage", {
-        key: name,
-        source: CLIENT_ID,
-        notifyWebview: !isTauri,
-      }).catch((err) => console.warn("[shared-storage] remove on backend failed", err));
+      enqueueRemote(name, { kind: "remove" });
     },
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

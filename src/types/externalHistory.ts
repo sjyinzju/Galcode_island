@@ -18,7 +18,20 @@ export interface ExternalSessionRef {
 export type ImportedTranscriptPart =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
-  | { type: "image"; dataUrl: string; alt: string | null }
+  | {
+      type: "image";
+      dataUrl: string | null;
+      assetId?: string | null;
+      alt: string | null;
+    }
+  | {
+      type: "attachment";
+      name: string | null;
+      mediaType: string | null;
+      dataUrl: string | null;
+      assetId?: string | null;
+      url: string | null;
+    }
   | { type: "toolCall"; toolCallId: string | null; name: string; input: unknown }
   | { type: "toolResult"; toolCallId: string | null; output: unknown; isError: boolean }
   | { type: "event"; kind: string; data: unknown };
@@ -29,6 +42,10 @@ export interface ImportedTranscriptMessage {
   content: string;
   parts?: ImportedTranscriptPart[];
   timestamp: number;
+  /// Explicit semantic classification written by v4 imports; absent on legacy shards.
+  isUserPrompt?: boolean;
+  /// Stable source turn identity, including queued prompts sent during execution.
+  sourceTurnId?: string | null;
 }
 
 export interface ImportedConversationSummary {

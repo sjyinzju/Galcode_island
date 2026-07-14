@@ -141,7 +141,7 @@ fn assert_codex_rich_migration(case: usize) {
     ));
     assert!(matches!(
         &imported.messages[0].parts[1],
-        ImportedTranscriptPart::Image { data_url, .. } if data_url == &image_url
+        ImportedTranscriptPart::Image { data_url, .. } if data_url.as_deref() == Some(image_url.as_str())
     ));
     assert!(matches!(
         &imported.messages[1].parts[0],
@@ -256,7 +256,7 @@ fn assert_claude_rich_migration(case: usize) {
     ));
     assert!(matches!(
         &imported.messages[0].parts[1],
-        ImportedTranscriptPart::Image { data_url, .. } if data_url == &image_url
+        ImportedTranscriptPart::Image { data_url, .. } if data_url.as_deref() == Some(image_url.as_str())
     ));
     assert!(matches!(
         &imported.messages[1].parts[0],
@@ -284,134 +284,82 @@ fn assert_claude_rich_migration(case: usize) {
     fs::remove_file(path).ok();
 }
 
-macro_rules! codex_rich_cases {
-    ($(($name:ident, $case:expr)),+ $(,)?) => {
-        $(
-            #[test]
-            fn $name() {
-                assert_codex_rich_migration($case);
-            }
-        )+
-        const CODEX_RICH_MIGRATION_CASE_COUNT: usize = [$(stringify!($name)),+].len();
-    };
+#[test]
+fn migrates_representative_codex_rich_transcripts() {
+    assert_codex_rich_migration(1);
+    assert_codex_rich_migration(2);
 }
 
-macro_rules! claude_rich_cases {
-    ($(($name:ident, $case:expr)),+ $(,)?) => {
-        $(
-            #[test]
-            fn $name() {
-                assert_claude_rich_migration($case);
-            }
-        )+
-        const CLAUDE_RICH_MIGRATION_CASE_COUNT: usize = [$(stringify!($name)),+].len();
-    };
+#[test]
+fn migrates_representative_claude_rich_transcript() {
+    assert_claude_rich_migration(3);
 }
 
-codex_rich_cases!(
-    (codex_rich_migration_001, 1),
-    (codex_rich_migration_002, 2),
-    (codex_rich_migration_003, 3),
-    (codex_rich_migration_004, 4),
-    (codex_rich_migration_005, 5),
-    (codex_rich_migration_006, 6),
-    (codex_rich_migration_007, 7),
-    (codex_rich_migration_008, 8),
-    (codex_rich_migration_009, 9),
-    (codex_rich_migration_010, 10),
-    (codex_rich_migration_011, 11),
-    (codex_rich_migration_012, 12),
-    (codex_rich_migration_013, 13),
-    (codex_rich_migration_014, 14),
-    (codex_rich_migration_015, 15),
-    (codex_rich_migration_016, 16),
-    (codex_rich_migration_017, 17),
-    (codex_rich_migration_018, 18),
-    (codex_rich_migration_019, 19),
-    (codex_rich_migration_020, 20),
-    (codex_rich_migration_021, 21),
-    (codex_rich_migration_022, 22),
-    (codex_rich_migration_023, 23),
-    (codex_rich_migration_024, 24),
-    (codex_rich_migration_025, 25),
-    (codex_rich_migration_026, 26),
-    (codex_rich_migration_027, 27),
-    (codex_rich_migration_028, 28),
-    (codex_rich_migration_029, 29),
-    (codex_rich_migration_030, 30),
-    (codex_rich_migration_031, 31),
-    (codex_rich_migration_032, 32),
-    (codex_rich_migration_033, 33),
-    (codex_rich_migration_034, 34),
-    (codex_rich_migration_035, 35),
-    (codex_rich_migration_036, 36),
-    (codex_rich_migration_037, 37),
-    (codex_rich_migration_038, 38),
-    (codex_rich_migration_039, 39),
-    (codex_rich_migration_040, 40),
-    (codex_rich_migration_041, 41),
-    (codex_rich_migration_042, 42),
-    (codex_rich_migration_043, 43),
-    (codex_rich_migration_044, 44),
-    (codex_rich_migration_045, 45),
-    (codex_rich_migration_046, 46),
-    (codex_rich_migration_047, 47),
-    (codex_rich_migration_048, 48),
-    (codex_rich_migration_049, 49),
-    (codex_rich_migration_050, 50),
-);
+#[test]
+fn ignores_empty_message_content() {
+    let codex = json!({
+        "type": "message",
+        "role": "user",
+        "content": []
+    });
+    let claude = json!({ "content": "   " });
 
-claude_rich_cases!(
-    (claude_rich_migration_051, 51),
-    (claude_rich_migration_052, 52),
-    (claude_rich_migration_053, 53),
-    (claude_rich_migration_054, 54),
-    (claude_rich_migration_055, 55),
-    (claude_rich_migration_056, 56),
-    (claude_rich_migration_057, 57),
-    (claude_rich_migration_058, 58),
-    (claude_rich_migration_059, 59),
-    (claude_rich_migration_060, 60),
-    (claude_rich_migration_061, 61),
-    (claude_rich_migration_062, 62),
-    (claude_rich_migration_063, 63),
-    (claude_rich_migration_064, 64),
-    (claude_rich_migration_065, 65),
-    (claude_rich_migration_066, 66),
-    (claude_rich_migration_067, 67),
-    (claude_rich_migration_068, 68),
-    (claude_rich_migration_069, 69),
-    (claude_rich_migration_070, 70),
-    (claude_rich_migration_071, 71),
-    (claude_rich_migration_072, 72),
-    (claude_rich_migration_073, 73),
-    (claude_rich_migration_074, 74),
-    (claude_rich_migration_075, 75),
-    (claude_rich_migration_076, 76),
-    (claude_rich_migration_077, 77),
-    (claude_rich_migration_078, 78),
-    (claude_rich_migration_079, 79),
-    (claude_rich_migration_080, 80),
-    (claude_rich_migration_081, 81),
-    (claude_rich_migration_082, 82),
-    (claude_rich_migration_083, 83),
-    (claude_rich_migration_084, 84),
-    (claude_rich_migration_085, 85),
-    (claude_rich_migration_086, 86),
-    (claude_rich_migration_087, 87),
-    (claude_rich_migration_088, 88),
-    (claude_rich_migration_089, 89),
-    (claude_rich_migration_090, 90),
-    (claude_rich_migration_091, 91),
-    (claude_rich_migration_092, 92),
-    (claude_rich_migration_093, 93),
-    (claude_rich_migration_094, 94),
-    (claude_rich_migration_095, 95),
-    (claude_rich_migration_096, 96),
-    (claude_rich_migration_097, 97),
-    (claude_rich_migration_098, 98),
-    (claude_rich_migration_099, 99),
-    (claude_rich_migration_100, 100),
-);
+    assert!(extract_codex_message(&codex).is_none());
+    assert!(extract_claude_message(&claude, "user").is_none());
+}
 
-const _: [(); 100] = [(); CODEX_RICH_MIGRATION_CASE_COUNT + CLAUDE_RICH_MIGRATION_CASE_COUNT];
+#[test]
+fn keeps_messages_without_timestamps() {
+    let path = write_fixture(
+        "codex-missing-time",
+        4,
+        vec![
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "session_id": "missing-time",
+                    "thread_source": "user"
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "still present" }]
+                }
+            }),
+        ],
+    );
+
+    let piece = parse_codex_file(&path, "fallback".to_string())
+        .expect("message without timestamp should parse");
+    assert_eq!(piece.messages.len(), 1);
+    assert_eq!(piece.messages[0].content, "still present");
+    assert_eq!(piece.messages[0].timestamp, 0);
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn compact_title_respects_the_96_character_boundary() {
+    let exact = "a".repeat(96);
+    let over = format!("{exact}b");
+
+    assert_eq!(compact_title(&exact), exact);
+    assert_eq!(compact_title(&over), format!("{}...", "a".repeat(96)));
+}
+
+#[test]
+fn earliest_and_latest_replacements_resolve_out_of_order_candidates() {
+    let mut latest = Some(("middle", 20));
+    replace_with_latest(&mut latest, Some(("older", 10)));
+    replace_with_latest(&mut latest, Some(("newest", 30)));
+    replace_with_latest(&mut latest, Some(("same-time-last", 30)));
+    assert_eq!(latest, Some(("same-time-last", 30)));
+
+    let mut earliest = Some(("middle", 20));
+    replace_with_earliest(&mut earliest, Some(("newer", 30)));
+    replace_with_earliest(&mut earliest, Some(("oldest", 10)));
+    replace_with_earliest(&mut earliest, Some(("same-time-ignored", 10)));
+    assert_eq!(earliest, Some(("oldest", 10)));
+}

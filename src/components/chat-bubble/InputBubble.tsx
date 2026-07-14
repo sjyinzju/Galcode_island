@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, type KeyboardEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { invoke } from "../../lib/bridge";
+import { invoke, isTauri, pickFiles, pickFolder } from "../../lib/bridge";
+import { buildImportedFallbackContext } from "../../lib/importedConversation";
+import { resolveLaunchMessage } from "../../lib/chatLaunch";
 import { useAppStore } from "../../stores/useAppStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
@@ -45,10 +47,15 @@ export function InputBubble(): JSX.Element {
 
   const [greeting, setGreeting] = useState("");
   const [displayedGreeting, setDisplayedGreeting] = useState("");
+  const [attachmentPaths, setAttachmentPaths] = useState<string[]>([]);
   const petEnabled = useSettingsStore((s) => s.petEnabled);
   // 中文输入法 composition 期间不要把 Enter 当发送 — 双保险用 keydown.isComposing
   // + composition* 事件标记
   const isComposingRef = useRef(false);
+
+  useEffect(() => {
+    setAttachmentPaths([]);
+  }, [activeTabId]);
 
   // textarea ref：让外部（user-prompt block 的"编辑重发"按钮）可以 focus 进来；
   // 同时给 slash 面板 hook 在 Tab/Enter 补全后调 setSelectionRange 移光标
@@ -168,18 +175,48 @@ export function InputBubble(): JSX.Element {
   }, [greeting, agentStatus]);
 
   const handleLaunch = async (): Promise<void> => {
-    if (!task.trim() || !activeTabId) return;
+    const launchMessage = resolveLaunchMessage(task, attachmentPaths.length);
+    if (!launchMessage || !activeTabId) return;
+    const { visibleText, agentInput } = launchMessage;
     // 斜杠命令优先：能本地处理就不走 start_agent。
     // tryRunBuiltin 内部已 clear value 并返回 true；passthrough / 项目命令 /
     // 未知命令返回 false，落到下面的 start_agent 透传路径。
-    if (await slash.tryRunBuiltin()) return;
-    if (!projectPath) return;
+    if (visibleText && await slash.tryRunBuiltin()) return;
+    let launchProjectPath = projectPath;
+    if (launchProjectPath) {
+      try {
+        await invoke("validate_directory", { path: launchProjectPath });
+      } catch {
+        launchProjectPath = null;
+      }
+    }
+    if (!launchProjectPath) {
+      launchProjectPath = await pickFolder({
+        defaultPath: projectPath ?? undefined,
+        title: "选择用于继续会话的有效项目目录",
+      });
+      if (!launchProjectPath) {
+        addLogEntry({
+          timestamp: Date.now(),
+          level: "error",
+          message: "Cannot continue: project directory is unavailable.",
+        });
+        window.alert("项目目录不可用，请选择有效目录后再继续。");
+        return;
+      }
+      update({ projectPath: launchProjectPath });
+    }
     try {
       // 上一轮 backend native session id（Claude CLI session / Codex thread /
       // OpenCode session）作为 resume 候选 —— 重启 app 后内存 last_session_per_context
       // 是空的，前端持久化的 native id 能续上下文。**不能传 tab.sessionId**（那是
       // 前端 AgentSession UUID，跟后端 --resume 期望的 ID 不是一回事）。
       const resumeHint = tab.agentNativeSessionId;
+      const importedFallbackContext = tab.importedConversationId
+        ? buildImportedFallbackContext(tab.cliBlocks)
+        : "";
+      const userBlockId = `user-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const userTimestamp = Date.now();
 
       // 切到 running 状态。
       // **不清 cliBlocks** —— 单项目多轮会话累积保留，让用户能看到完整工作历史；
@@ -191,23 +228,34 @@ export function InputBubble(): JSX.Element {
         uiState: "running",
         mode: "working",
         agentStatus: "running",
-        lastUserPrompt: task.trim().slice(0, 80),
+        ...(visibleText ? { lastUserPrompt: visibleText.slice(0, 80) } : {}),
         lastActiveAt: Date.now(),
       });
       // 在流式区追加一条用户消息气泡（右对齐），让多轮对话有清晰的"用户/agent"
       // 交替顺序。前端自管，不依赖 backend emit。
       useTabsStore.getState().appendCliBlock(activeTabId, {
-        id: `user-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: userBlockId,
         type: "user-prompt",
-        content: task.trim(),
+        content: visibleText,
+        sourceMessageId: userBlockId,
+        sourceTimestamp: userTimestamp,
+        sourceRole: "user",
+        sourceTurnId: `galcode:${userBlockId}`,
+        attachments: attachmentPaths.map((path) => ({
+          name: path.split(/[\\/]/).filter(Boolean).at(-1) || "attachment",
+          mediaType: "application/octet-stream",
+          localPath: path,
+        })),
       });
 
       const res = await invoke<{ sessionId?: string }>("start_agent", {
-        userInputZh: task,
-        cwd: projectPath || ".",
+        userInputZh: agentInput,
+        cwd: launchProjectPath,
         agent: tab.agent,
         runId: activeTabId,
         sessionId: resumeHint,
+        importedFallbackContext: importedFallbackContext || null,
+        attachmentPaths,
         // 仅 claude-code 后端读取；codex/opencode 在 Rust 侧忽略
         permissionMode: tab.agent === "claude-code" ? tab.permissionMode : null,
         promptOverride: (() => {
@@ -223,11 +271,12 @@ export function InputBubble(): JSX.Element {
       if (res?.sessionId) {
         update({ sessionId: res.sessionId });
       }
+      setAttachmentPaths([]);
       // start_agent 成功才计入当天活跃 —— 失败的尝试不该把今天点亮
       useActivityStore.getState().recordActivity({
-        projectPath,
+        projectPath: launchProjectPath,
         agent: tab.agent,
-        prompt: task.trim(),
+        prompt: visibleText,
       });
     } catch (err) {
       addLogEntry({
@@ -337,17 +386,57 @@ export function InputBubble(): JSX.Element {
             </AnimatePresence>
             </div>
 
+            {attachmentPaths.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {attachmentPaths.map((path) => (
+                  <span
+                    key={path}
+                    className="inline-flex max-w-full items-center gap-1 rounded-md border border-sky-400/25 bg-sky-400/10 px-2 py-1 text-[11px] text-sky-700 dark:text-sky-200"
+                  >
+                    <span className="truncate">
+                      {path.split(/[\\/]/).filter(Boolean).at(-1) || path}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="移除附件"
+                      onClick={() => setAttachmentPaths((paths) => paths.filter((item) => item !== path))}
+                      className="shrink-0 rounded px-1 hover:bg-sky-400/15"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 sm:gap-3">
+              <button
+                type="button"
+                disabled={!isTauri}
+                title={isTauri ? "添加本地附件" : "LAN 模式不支持选择本地附件"}
+                onClick={() => {
+                  void pickFiles({
+                    defaultPath: projectPath ?? undefined,
+                    title: "选择要发送的附件",
+                  }).then((paths) => {
+                    if (paths.length === 0) return;
+                    setAttachmentPaths((current) => Array.from(new Set([...current, ...paths])));
+                  });
+                }}
+                className="mr-auto rounded-lg border border-zinc-300/70 px-2.5 py-1.5 text-[11px] text-zinc-600 transition-colors hover:bg-white/60 disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/10 dark:text-zinc-300 dark:hover:bg-white/5"
+              >
+                添加附件
+              </button>
               {!projectPath && (
                 <span className="text-[11px] text-amber-600/90 dark:text-amber-300/90">
-                  请先在顶部选择项目目录
+                  发送时请选择有效项目目录
                 </span>
               )}
               <motion.button
                 whileHover={{ scale: 1.02, y: -1 }}
                 whileTap={{ scale: 0.98 }}
                 onClick={() => void handleLaunch()}
-                disabled={!task.trim() || !projectPath}
+                disabled={!task.trim() && attachmentPaths.length === 0}
                 // 移动端 px-7/py-3 = 44px+ 触控目标；桌面端保留原尺寸
                 className="min-h-[44px] rounded-xl bg-sky-500 px-7 py-3 text-[15px] font-semibold tracking-wide text-white shadow-md shadow-sky-400/25 transition-all hover:bg-sky-600 hover:shadow-sky-400/40 active:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:px-6 sm:py-2.5 sm:text-sm"
               >

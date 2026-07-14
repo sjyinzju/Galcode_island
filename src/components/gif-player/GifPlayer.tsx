@@ -36,21 +36,38 @@ interface DecodedGif {
   }>;
 }
 
-/// CPU 端解码缓存：同一 src 复用解码结果（GIF / 静态图都进同一个池）。
-///
-/// 容量：LRU 上限 24 张 —— 桌宠场景常见 6 类 × 多张，再算上戳戳互动池，24
-/// 足够覆盖一次会话内反复切换。超过后按访问顺序淘汰最旧。
-///
-/// 失败不缓存（catch 里 delete 掉 promise），避免一次网络抖动卡死后续重试。
-const DECODE_CACHE_MAX = 24;
-const decodeCache = new Map<string, Promise<DecodedGif>>();
+/// CPU 端解码缓存。完整 RGBA 帧远大于原 GIF：一张 500×500、30 帧的图约占
+/// 30 MB，不能只按“图片张数”限制，否则 24 张会长期占住数百 MB 内存。
+interface DecodeCacheEntry {
+  promise: Promise<DecodedGif>;
+  bytes: number;
+}
 
-function touchCache(key: string, value: Promise<DecodedGif>): void {
-  if (decodeCache.has(key)) decodeCache.delete(key);
-  decodeCache.set(key, value);
-  if (decodeCache.size > DECODE_CACHE_MAX) {
-    const oldest = decodeCache.keys().next().value;
-    if (oldest !== undefined) decodeCache.delete(oldest);
+const DECODE_CACHE_MAX_ENTRIES = 3;
+const DECODE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+const decodeCache = new Map<string, DecodeCacheEntry>();
+let decodeCacheBytes = 0;
+
+function decodedGifBytes(decoded: DecodedGif): number {
+  return decoded.frames.reduce((total, frame) => total + frame.pixels.byteLength, 0);
+}
+
+function removeCacheEntry(key: string, entry: DecodeCacheEntry): void {
+  if (decodeCache.get(key) !== entry) return;
+  decodeCache.delete(key);
+  decodeCacheBytes -= entry.bytes;
+}
+
+function trimDecodeCache(): void {
+  while (
+    decodeCache.size > DECODE_CACHE_MAX_ENTRIES ||
+    decodeCacheBytes > DECODE_CACHE_MAX_BYTES
+  ) {
+    const oldest = decodeCache.entries().next().value as
+      | [string, DecodeCacheEntry]
+      | undefined;
+    if (!oldest) return;
+    removeCacheEntry(oldest[0], oldest[1]);
   }
 }
 
@@ -232,14 +249,23 @@ function getDecoded(src: string): Promise<DecodedGif> {
     // 访问刷新 LRU 顺序
     decodeCache.delete(src);
     decodeCache.set(src, existing);
-    return existing;
+    return existing.promise;
   }
-  const p = decodeOnce(src);
-  touchCache(src, p);
-  p.catch(() => {
-    if (decodeCache.get(src) === p) decodeCache.delete(src);
+  const entry: DecodeCacheEntry = {
+    promise: decodeOnce(src),
+    bytes: 0,
+  };
+  decodeCache.set(src, entry);
+  trimDecodeCache();
+  void entry.promise.then((decoded) => {
+    if (decodeCache.get(src) !== entry) return;
+    entry.bytes = decodedGifBytes(decoded);
+    decodeCacheBytes += entry.bytes;
+    trimDecodeCache();
+  }).catch(() => {
+    removeCacheEntry(src, entry);
   });
-  return p;
+  return entry.promise;
 }
 
 // --- WebGL renderer ---

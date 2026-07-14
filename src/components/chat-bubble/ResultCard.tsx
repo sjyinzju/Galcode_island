@@ -1,4 +1,5 @@
-import { invoke } from "../../lib/bridge";
+import { invoke, pickFolder } from "../../lib/bridge";
+import { buildImportedFallbackContext } from "../../lib/importedConversation";
 import { useRef, useState, type KeyboardEvent } from "react";
 import { useAppStore } from "../../stores/useAppStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
@@ -72,9 +73,33 @@ export function ResultCard(): JSX.Element {
   /// 新 turn 完成时被新的 session-complete 事件覆盖（RunningBubble 期间显示中）。
   const handleOptionClick = async (opt: string): Promise<void> => {
     if (!activeTabId) return;
+    let launchProjectPath = tab.projectPath;
+    if (launchProjectPath) {
+      try {
+        await invoke("validate_directory", { path: launchProjectPath });
+      } catch {
+        launchProjectPath = null;
+      }
+    }
+    if (!launchProjectPath) {
+      launchProjectPath = await pickFolder({
+        defaultPath: tab.projectPath ?? undefined,
+        title: "选择用于继续会话的有效项目目录",
+      });
+      if (!launchProjectPath) {
+        window.alert("项目目录不可用，请选择有效目录后再继续。");
+        return;
+      }
+      update({ projectPath: launchProjectPath });
+    }
     // backend native session id 作 resume hint（Claude CLI session / Codex thread /
     // OpenCode session），让上下文延续；前端 sessionId 是 AgentSession UUID 不能用
     const resumeHint = tab.agentNativeSessionId;
+    const importedFallbackContext = tab.importedConversationId
+      ? buildImportedFallbackContext(tab.cliBlocks)
+      : "";
+    const userBlockId = `user-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const userTimestamp = Date.now();
     update({
       task: opt,
       percent: 0,
@@ -86,18 +111,24 @@ export function ResultCard(): JSX.Element {
     });
     // 流式区追加用户消息气泡，跟 InputBubble 启动路径行为一致
     useTabsStore.getState().appendCliBlock(activeTabId, {
-      id: `user-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: userBlockId,
       type: "user-prompt",
       content: opt,
+      sourceMessageId: userBlockId,
+      sourceTimestamp: userTimestamp,
+      sourceRole: "user",
+      sourceTurnId: `galcode:${userBlockId}`,
     });
 
     try {
       const res = await invoke<{ sessionId?: string }>("start_agent", {
         userInputZh: opt,
-        cwd: tab.projectPath || ".",
+        cwd: launchProjectPath,
         agent: tab.agent,
         runId: activeTabId,
         sessionId: resumeHint,
+        importedFallbackContext: importedFallbackContext || null,
+        attachmentPaths: [],
         promptOverride: (() => {
           const sel = selectPromptOverride();
           if (sel) {
@@ -111,7 +142,7 @@ export function ResultCard(): JSX.Element {
       if (res?.sessionId) update({ sessionId: res.sessionId });
       // 计入当天活跃 —— 跟 InputBubble 启动路径口径一致
       useActivityStore.getState().recordActivity({
-        projectPath: tab.projectPath,
+        projectPath: launchProjectPath,
         agent: tab.agent,
         prompt: opt,
       });

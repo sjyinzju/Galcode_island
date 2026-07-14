@@ -1,18 +1,18 @@
 import { invoke } from "../../lib/bridge";
 import { motion, AnimatePresence } from "framer-motion";
-import { useActiveTab, useActiveTabActions } from "../../hooks/useActiveTab";
+import { useActiveTabActions, useActiveTabField } from "../../hooks/useActiveTab";
 import { useAppStore } from "../../stores/useAppStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
 import { PetCharacter } from "../pet-character/PetCharacter";
 import { PermissionModeBadge } from "../PermissionModeBadge";
 
 export function RunningBubble(): JSX.Element {
-  const tab = useActiveTab();
   const { activeTabId, reset } = useActiveTabActions();
   const addLogEntry = useAppStore((s) => s.addLogEntry);
-  const bubble = tab.bubble;
-  const uiState = tab.uiState;
-  const mode = tab.mode;
+  const bubble = useActiveTabField("bubble");
+  const uiState = useActiveTabField("uiState");
+  const mode = useActiveTabField("mode");
+  const sessionId = useActiveTabField("sessionId");
   const petEnabled = useSettingsStore((s) => s.petEnabled);
   const isVisible = uiState === "running" || mode === "thinking" || mode === "working";
 
@@ -20,7 +20,7 @@ export function RunningBubble(): JSX.Element {
     try {
       await invoke("stop_agent", {
         runId: activeTabId,
-        sessionId: tab.sessionId,
+        sessionId,
       });
       reset();
       addLogEntry({ timestamp: Date.now(), level: "info", message: "已停止当前 tab 的 Agent。" });

@@ -70,17 +70,23 @@ pub fn list_sessions(state: State<Arc<AppState>>) -> Result<Vec<SessionSummary>,
 
 /// Scan the local Codex and Claude Code folders without modifying either source.
 #[tauri::command]
-pub fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
-    external_history::scan_external_sessions()
+pub async fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
+    tauri::async_runtime::spawn_blocking(external_history::scan_external_sessions)
+        .await
+        .map_err(|error| format!("External history scan task failed: {error}"))?
 }
 
 /// Copy selected external transcripts into Galcode's own app-data file.
 #[tauri::command]
-pub fn import_external_sessions(
+pub async fn import_external_sessions(
     app: AppHandle,
     selections: Vec<ExternalSessionRef>,
 ) -> Result<ImportExternalSessionsResult, String> {
-    external_history::import_external_sessions(&app, selections)
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::import_external_sessions(&app, selections)
+    })
+    .await
+    .map_err(|error| format!("External history import task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -93,6 +99,11 @@ pub fn list_imported_conversations(
 #[tauri::command]
 pub fn load_imported_conversation(app: AppHandle, id: String) -> Result<ImportedConversation, String> {
     external_history::load_imported_conversation(&app, &id)
+}
+
+#[tauri::command]
+pub fn load_imported_asset(app: AppHandle, asset_id: String) -> Result<String, String> {
+    external_history::load_imported_asset(&app, &asset_id)
 }
 
 #[tauri::command]
@@ -182,6 +193,18 @@ pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> 
         parent,
         entries,
     })
+}
+
+#[tauri::command]
+pub fn validate_directory(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(path.trim());
+    if !target.exists() {
+        return Err(format!("Directory does not exist: {}", target.display()));
+    }
+    if !target.is_dir() {
+        return Err(format!("Path is not a directory: {}", target.display()));
+    }
+    Ok(())
 }
 
 /// 项目 / 用户 / 插件级斜杠命令元数据。
@@ -445,6 +468,8 @@ pub async fn start_agent(
     // 可选：前端持久化的 tab.sessionId（重启 app 后内存 last_session_per_context
     // 是空的，前端 localStorage 留着 sessionId，传过来当 resume hint）。
     session_id: Option<String>,
+    imported_fallback_context: Option<String>,
+    attachment_paths: Option<Vec<String>>,
     // 仅 claude-code 使用：Claude CLI 的 --permission-mode 参数值，
     // 来自 tab.permissionMode（Shift+Tab 切换 / 全局默认）。其它 backend 忽略此参数。
     permission_mode: Option<String>,
@@ -492,6 +517,8 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            imported_fallback_context,
+            attachment_paths.unwrap_or_default(),
             permission_mode,
             prompt_override,
         ),
@@ -503,6 +530,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            attachment_paths.unwrap_or_default(),
             prompt_override,
         ),
         "codex" => manager::launch_codex_agent(
@@ -513,6 +541,8 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            imported_fallback_context,
+            attachment_paths.unwrap_or_default(),
             prompt_override,
         ),
         _ => Err(format!("暂不支持的 agent 类型: {}", agent_type)),

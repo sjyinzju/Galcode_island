@@ -13,7 +13,7 @@ import {
 interface ExternalHistoryImportDialogProps {
   importedIds: ReadonlySet<string>;
   onClose: () => void;
-  onImported: () => void;
+  onImported: (result: ImportExternalSessionsResult) => void;
 }
 
 type LoadState =
@@ -24,8 +24,22 @@ type LoadState =
 type ImportState =
   | { kind: "idle" }
   | { kind: "importing" }
-  | { kind: "done"; message: string }
+  | { kind: "done"; message: string; warnings: string[] }
   | { kind: "error"; message: string };
+
+export function summarizeImportResult(result: ImportExternalSessionsResult): {
+  message: string;
+  warnings: string[];
+} {
+  const skippedText = result.skipped.length > 0 ? `，跳过 ${result.skipped.length} 条` : "";
+  const warningText = result.warnings.length > 0
+    ? `，${result.warnings.length} 条记录需要注意`
+    : "";
+  return {
+    message: `已导入 ${result.imported.length} 个完整对话${skippedText}${warningText}`,
+    warnings: result.warnings,
+  };
+}
 
 function formatDate(timestamp: number): string {
   if (!timestamp) return "Unknown date";
@@ -122,9 +136,8 @@ export function ExternalHistoryImportDialog({
     setImportState({ kind: "importing" });
     try {
       const result = await invoke<ImportExternalSessionsResult>("import_external_sessions", { selections });
-      onImported();
-      const skippedText = result.skipped.length > 0 ? `，跳过 ${result.skipped.length} 条` : "";
-      setImportState({ kind: "done", message: `已导入 ${result.imported.length} 个完整对话${skippedText}` });
+      onImported(result);
+      setImportState({ kind: "done", ...summarizeImportResult(result) });
       setSelected(new Set());
     } catch (error) {
       setImportState({ kind: "error", message: String(error) });
@@ -258,8 +271,21 @@ export function ExternalHistoryImportDialog({
           </>
         )}
 
+        {importState.kind === "done" && importState.warnings.length > 0 && (
+          <details className="border-t border-amber-400/25 bg-amber-50/80 px-5 py-2 text-[11px] text-amber-800 dark:bg-amber-400/10 dark:text-amber-200">
+            <summary className="cursor-pointer font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60">
+              查看 {importState.warnings.length} 条导入警告
+            </summary>
+            <ul className="mt-2 max-h-28 list-disc space-y-1 overflow-y-auto pl-4 [overflow-wrap:anywhere]">
+              {importState.warnings.map((warning, index) => (
+                <li key={`${index}-${warning}`}>{warning}</li>
+              ))}
+            </ul>
+          </details>
+        )}
+
         <footer className="flex items-center justify-between gap-3 border-t border-black/5 px-5 py-3 dark:border-white/10">
-          <div className={`min-w-0 text-[11px] ${
+          <div aria-live="polite" className={`min-w-0 text-[11px] ${
             importState.kind === "error"
               ? "text-rose-600 dark:text-rose-300"
               : importState.kind === "done"

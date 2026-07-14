@@ -10,24 +10,33 @@
 // 下半部分：InputBubble / RunningBubble / ResultCard 跟过去一致。
 
 import { AnimatePresence, motion } from "framer-motion";
-import { useActiveTab, useActiveTabId } from "../hooks/useActiveTab";
+import { Suspense } from "react";
+import { useActiveTabField, useActiveTabId } from "../hooks/useActiveTab";
 import { PetCharacter } from "./pet-character/PetCharacter";
 
 import { InputBubble } from "./chat-bubble/InputBubble";
 import { ResultCard } from "./chat-bubble/ResultCard";
 import { RunningBubble } from "./chat-bubble/RunningBubble";
-import { StatusMonitor } from "./status-monitor/StatusMonitor";
 import { GlobalOverview } from "./overview/GlobalOverview";
 import { ProjectOverview } from "./overview/ProjectOverview";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useTabsStore } from "../stores/useTabsStore";
+import { lazyNamed } from "../lib/lazyNamed";
+
+const StatusMonitor = lazyNamed(
+  () => import("./status-monitor/StatusMonitor"),
+  "StatusMonitor",
+);
 
 export function MainView(): JSX.Element {
-  const tab = useActiveTab();
   const activeTabId = useActiveTabId();
   const petEnabled = useSettingsStore((s) => s.petEnabled);
-  const uiState = tab.uiState;
-  const mode = tab.mode;
-  const cliBlockCount = tab.cliBlocks.length;
+  const uiState = useActiveTabField("uiState");
+  const mode = useActiveTabField("mode");
+  const cliBlockCount = useTabsStore((state) => {
+    const tab = state.activeTabId ? state.tabs[state.activeTabId] : null;
+    return tab?.cliBlocks.length ?? 0;
+  });
   // 完成后保留 StatusMonitor 让 BlockStream 历史可见，跟 ResultCard 共存。
   const showStatus =
     uiState === "running" ||
@@ -88,7 +97,9 @@ export function MainView(): JSX.Element {
             transition={{ duration: 0.3 }}
             className="flex min-h-0 flex-1 flex-col overflow-hidden"
           >
-            <StatusMonitor />
+            <Suspense fallback={null}>
+              <StatusMonitor />
+            </Suspense>
           </motion.div>
         )}
       </AnimatePresence>

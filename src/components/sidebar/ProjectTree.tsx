@@ -23,6 +23,7 @@ interface DirectoryGroup {
   key: string;
   label: string;
   tabs: TabState[];
+  latestAt: number;
 }
 
 function groupTabsByDirectory(tabs: Record<string, TabState>, order: string[]): DirectoryGroup[] {
@@ -33,19 +34,17 @@ function groupTabsByDirectory(tabs: Record<string, TabState>, order: string[]): 
     const key = tab.projectPath ?? NO_DIR_KEY;
     const label =
       tab.projectPath === null ? "未选择目录" : basename(tab.projectPath) || tab.projectPath;
-    if (!map.has(key)) map.set(key, { key, label, tabs: [] });
-    map.get(key)!.tabs.push(tab);
+    if (!map.has(key)) map.set(key, { key, label, tabs: [], latestAt: 0 });
+    const group = map.get(key)!;
+    group.tabs.push(tab);
+    group.latestAt = Math.max(group.latestAt, tab.lastActiveAt || tab.createdAt);
   }
   // 每组内按 lastActiveAt 倒序：最近活动的项目排最上
   for (const group of map.values()) {
     group.tabs.sort((a, b) => (b.lastActiveAt || b.createdAt) - (a.lastActiveAt || a.createdAt));
   }
   // 组之间也按"组内最新 lastActiveAt"倒序
-  return Array.from(map.values()).sort((a, b) => {
-    const aMax = Math.max(...a.tabs.map((t) => t.lastActiveAt || t.createdAt));
-    const bMax = Math.max(...b.tabs.map((t) => t.lastActiveAt || t.createdAt));
-    return bMax - aMax;
-  });
+  return Array.from(map.values()).sort((a, b) => b.latestAt - a.latestAt);
 }
 
 function basename(p: string): string {
@@ -143,7 +142,6 @@ function ProjectCard({ tab, isActive, now, onSelect, onClose }: ProjectCardProps
 }
 
 export function ProjectTree(): JSX.Element {
-  const tabs = useTabsStore((s) => s.tabs);
   const order = useTabsStore((s) => s.order);
   const activeTabId = useTabsStore((s) => s.activeTabId);
   const setActiveTab = useTabsStore((s) => s.setActiveTab);
@@ -153,15 +151,37 @@ export function ProjectTree(): JSX.Element {
   const setIsStarted = useAppStore((s) => s.setIsStarted);
   const addLogEntry = useAppStore((s) => s.addLogEntry);
 
-  const groups = useMemo(() => groupTabsByDirectory(tabs, order), [tabs, order]);
   // 订阅墙上时钟，让"X 分钟前"在窗口长期闲置时也按 30s 自动刷新（不靠用户点击触发）
   const now = useNow();
+  // 只订阅项目卡真正展示的轻量字段。cliBlocks/bubble/percent 每次流式变化时
+  // 不再触发整棵项目树重新分组、排序和渲染；lastActiveAt 随 30s 时钟刷新即可。
+  const navigationKey = useTabsStore((state) => state.order.map((id) => {
+    const tab = state.tabs[id];
+    if (!tab) return id;
+    return [
+      id,
+      tab.title,
+      tab.agent,
+      tab.projectPath ?? "",
+      tab.task,
+      tab.lastUserPrompt ?? "",
+      tab.agentStatus,
+      tab.uiState,
+      tab.hasUnread ? "1" : "0",
+    ].join("\u0000");
+  }).join("\u001e"));
+  const tabs = useMemo(
+    () => useTabsStore.getState().tabs,
+    [navigationKey, now],
+  );
+  const groups = useMemo(() => groupTabsByDirectory(tabs, order), [tabs, order]);
 
   const handleCloseTab = async (id: string): Promise<void> => {
-    const tab = tabs[id];
+    const currentState = useTabsStore.getState();
+    const tab = currentState.tabs[id];
     if (!tab) return;
     const running = isTabRunning(tab);
-    const isLast = order.length === 1;
+    const isLast = currentState.order.length === 1;
     if (running) {
       const msg = isLast
         ? "任务还在进行中。关闭这个项目会停止当前任务并返回欢迎页，确定吗？"
