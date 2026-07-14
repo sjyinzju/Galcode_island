@@ -32,6 +32,7 @@ use ipc::commands::{
     respond_permission_decision, remove_imported_conversation, scan_external_sessions, select_project_folder, set_click_through, start_agent,
     stop_agent, translate_only, update_backend_preferences, update_llm_settings,
     generate_welcome_speech, generate_poke_speech, load_imported_conversation,
+    load_imported_asset, validate_directory,
 };
 use ipc::git::{
     git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
@@ -90,9 +91,7 @@ pub fn run() {
             // 避免端口被占用或重复消耗 token。
             agent::sysutils::cleanup_stale_runtime_orphans(&handle);
 
-            // cc-switch 兼容：监听外部工具对 ~/.claude/settings.json 与
-            // ~/.codex/config.toml 的改动，切换服务商后就近重启空闲的长驻 CLI
-            // 进程，让下一轮对话自动用上新服务商（不打断进行中的 turn）。
+            // Apply external Claude/Codex provider changes to idle resident clients.
             {
                 let runtime_state = handle
                     .state::<Arc<agent::runtime::RuntimeState>>()
@@ -220,6 +219,7 @@ pub fn run() {
             // 通用
             select_project_folder,
             list_directory,
+            validate_directory,
             list_project_slash_commands,
             start_agent,
             stop_agent,
@@ -231,6 +231,7 @@ pub fn run() {
             import_external_sessions,
             list_imported_conversations,
             load_imported_conversation,
+            load_imported_asset,
             remove_imported_conversation,
             finalize_pending,
             translate_only,

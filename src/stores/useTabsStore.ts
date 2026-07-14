@@ -14,6 +14,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { createSharedStorage, onStorageExternalChange } from "../lib/sharedStorage";
+import { limitCliBlocks } from "../lib/cliBlockRetention";
 import { useSettingsStore } from "./useSettingsStore";
 import type {
   AgentStatus,
@@ -81,6 +82,13 @@ export interface TabState {
   /// session-complete.agentNativeSessionId 更新；持久化后下次 launch 传给后端
   /// 当 resume hint，--resume 才能真正续上 conversation。
   agentNativeSessionId: string | null;
+  /// 原始导入记录 id；用于重启后从分片存储恢复完整可见时间线。
+  importedConversationId: string | null;
+  /// 当前内存中的 imported blocks 是否完整；普通会话始终为 false。
+  hasFullImportedHistory: boolean;
+  deletedImportedBlockIds: string[];
+  importedHistoryError: string | null;
+  importedHistoryRevision: number;
   /// 完成后的中文翻译输出
   resultZh: string;
   /// 凉宫春日总结
@@ -141,6 +149,10 @@ export interface ArchivedSession {
   /// backend native session id —— 真正能让 Claude `--resume` / Codex `thread/resume`
   /// / OpenCode 复用 session 续上对话的那个 ID
   agentNativeSessionId: string | null;
+  /// Imported history stays in shard storage; preserve its identity and local edits for restore.
+  importedConversationId: string | null;
+  deletedImportedBlockIds: string[];
+  importedHistoryError: string | null;
   /// 上次的 ResultCard 内容，恢复 tab 时回填，让用户能快速看到上次的结果
   summaryTranslation: string;
   emotionText: string;
@@ -227,6 +239,11 @@ function makeDefaultTab(init?: Partial<TabState>): TabState {
     percent: init?.percent ?? 0,
     sessionId: init?.sessionId ?? null,
     agentNativeSessionId: init?.agentNativeSessionId ?? null,
+    importedConversationId: init?.importedConversationId ?? null,
+    hasFullImportedHistory: init?.hasFullImportedHistory ?? false,
+    deletedImportedBlockIds: init?.deletedImportedBlockIds ?? [],
+    importedHistoryError: init?.importedHistoryError ?? null,
+    importedHistoryRevision: init?.importedHistoryRevision ?? 0,
     resultZh: init?.resultZh ?? "",
     summaryTranslation: init?.summaryTranslation ?? "",
     emotionText: init?.emotionText ?? "",
@@ -234,7 +251,11 @@ function makeDefaultTab(init?: Partial<TabState>): TabState {
     lastStage: init?.lastStage ?? "default",
     pendingResultRaw: init?.pendingResultRaw ?? null,
     pendingUserZh: init?.pendingUserZh ?? null,
-    cliBlocks: init?.cliBlocks ?? [],
+    cliBlocks: limitCliBlocks(
+      init?.cliBlocks ?? [],
+      MAX_BLOCKS,
+      init?.hasFullImportedHistory ?? false,
+    ),
     hasUnread: init?.hasUnread ?? false,
     createdAt: 0,
     lastActiveAt: init?.lastActiveAt ?? 0,
@@ -263,12 +284,71 @@ const MODE_RESULT_STATES = new Set(["complete", "suggestion", "error", "idle"]);
 /// 旧版本在 partialize 把这些重置成 idle，导致 setState({uiState:"running"}) 立即被
 /// 自己写入的 storage 反向覆盖回 idle，移动端"启动"按钮按了像没反应。
 function compactTabForPersist(tab: TabState): TabState {
-  const trimmedBlocks =
-    tab.cliBlocks.length > PERSIST_BLOCKS_PER_TAB
-      ? tab.cliBlocks.slice(-PERSIST_BLOCKS_PER_TAB)
-      : tab.cliBlocks;
-  if (trimmedBlocks === tab.cliBlocks) return tab;
-  return { ...tab, cliBlocks: trimmedBlocks };
+  const trimmedBlocks = limitCliBlocks(tab.cliBlocks, PERSIST_BLOCKS_PER_TAB, false);
+  const importedPrefix = tab.importedConversationId
+    ? `imported-${tab.importedConversationId}-`
+    : null;
+  const persistedBlocks = importedPrefix && trimmedBlocks.some(
+    (block) => block.id.startsWith(importedPrefix) && (
+      block.images?.some((image) => image.dataUrl) ||
+      block.attachments?.some((attachment) => attachment.dataUrl) ||
+      block.detailValue !== undefined
+    ),
+  )
+    ? trimmedBlocks.map((block) =>
+        block.id.startsWith(importedPrefix) && (
+          block.images?.some((image) => image.dataUrl) ||
+          block.attachments?.some((attachment) => attachment.dataUrl) ||
+          block.detailValue !== undefined
+        )
+          ? {
+              ...block,
+              images: block.images?.map(({ dataUrl: _dataUrl, ...image }) => image),
+              detailValue: undefined,
+              attachments: block.attachments?.map(({ dataUrl: _dataUrl, ...attachment }) =>
+                attachment
+              ),
+            }
+          : block
+      )
+    : trimmedBlocks;
+  const hasFullImportedHistory = Boolean(tab.hasFullImportedHistory) &&
+    persistedBlocks === tab.cliBlocks;
+  if (
+    persistedBlocks === tab.cliBlocks &&
+    hasFullImportedHistory === tab.hasFullImportedHistory
+  ) return tab;
+  return { ...tab, cliBlocks: persistedBlocks, hasFullImportedHistory };
+}
+
+interface CliBlockIndex {
+  blocks: readonly CliBlock[];
+  byId: Map<string, number>;
+}
+
+const cliBlockIndexes = new Map<string, CliBlockIndex>();
+
+function getCliBlockIndex(tabId: string, blocks: readonly CliBlock[]): Map<string, number> {
+  const cached = cliBlockIndexes.get(tabId);
+  if (cached?.blocks === blocks) return cached.byId;
+  const byId = new Map(blocks.map((block, index) => [block.id, index]));
+  cliBlockIndexes.set(tabId, { blocks, byId });
+  return byId;
+}
+
+function rememberCliBlockIndex(
+  tabId: string,
+  blocks: readonly CliBlock[],
+  byId: Map<string, number>,
+): void {
+  cliBlockIndexes.set(tabId, { blocks, byId });
+}
+
+function shallowEqualBlock(first: CliBlock, second: CliBlock): boolean {
+  const firstKeys = Object.keys(first) as Array<keyof CliBlock>;
+  const secondKeys = Object.keys(second) as Array<keyof CliBlock>;
+  return firstKeys.length === secondKeys.length &&
+    firstKeys.every((key) => Object.is(first[key], second[key]));
 }
 
 /// **首次 hydrate（页面 reload / app 重启）** 时清掉过期的运行态。
@@ -289,6 +369,16 @@ function sanitizeTabOnInitialLoad(tab: TabState): TabState {
       : tab.lastStage;
   return {
     ...tab,
+    importedConversationId:
+      typeof tab.importedConversationId === "string" ? tab.importedConversationId : null,
+    hasFullImportedHistory: Boolean(tab.hasFullImportedHistory),
+    deletedImportedBlockIds: Array.isArray(tab.deletedImportedBlockIds)
+      ? tab.deletedImportedBlockIds
+      : [],
+    importedHistoryError:
+      typeof tab.importedHistoryError === "string" ? tab.importedHistoryError : null,
+    importedHistoryRevision:
+      typeof tab.importedHistoryRevision === "number" ? tab.importedHistoryRevision : 0,
     percent: 0,
     bubble: "",
     agentStatus: "idle",
@@ -345,6 +435,7 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
+      cliBlockIndexes.delete(id);
       const nextTabs = { ...state.tabs };
       delete nextTabs[id];
       const nextOrder = state.order.filter((tid) => tid !== id);
@@ -382,6 +473,9 @@ export const useTabsStore = create<TabsStoreState>()(
           summary,
           sessionId: tab.sessionId,
           agentNativeSessionId: tab.agentNativeSessionId,
+          importedConversationId: tab.importedConversationId,
+          deletedImportedBlockIds: tab.deletedImportedBlockIds.slice(),
+          importedHistoryError: tab.importedHistoryError,
           summaryTranslation: tab.summaryTranslation,
           emotionText: tab.emotionText,
           resultZh: tab.resultZh,
@@ -417,6 +511,13 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
+      const changed = (Object.keys(patch) as Array<keyof TabState>).some(
+        (key) => !Object.is(tab[key], patch[key]),
+      );
+      if (!changed) return state;
+      if (patch.cliBlocks && patch.cliBlocks !== tab.cliBlocks) {
+        cliBlockIndexes.delete(id);
+      }
       return { tabs: { ...state.tabs, [id]: { ...tab, ...patch } } };
     });
   },
@@ -440,6 +541,7 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
+      cliBlockIndexes.delete(id);
       return {
         tabs: {
           ...state.tabs,
@@ -452,6 +554,11 @@ export const useTabsStore = create<TabsStoreState>()(
             bubble: "",
             percent: 0,
             sessionId: null,
+            importedConversationId: null,
+            hasFullImportedHistory: false,
+            deletedImportedBlockIds: [],
+            importedHistoryError: null,
+            importedHistoryRevision: 0,
             resultZh: "",
             summaryTranslation: "",
             emotionText: "",
@@ -469,8 +576,18 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
+      const previousIndex = getCliBlockIndex(id, tab.cliBlocks);
       const next = [...tab.cliBlocks, block];
-      const trimmed = next.length > MAX_BLOCKS ? next.slice(-TRIM_TARGET) : next;
+      const trimmed = next.length > MAX_BLOCKS
+        ? limitCliBlocks(next, TRIM_TARGET, tab.hasFullImportedHistory)
+        : next;
+      if (trimmed === next) {
+        const nextIndex = new Map(previousIndex);
+        nextIndex.set(block.id, next.length - 1);
+        rememberCliBlockIndex(id, next, nextIndex);
+      } else {
+        cliBlockIndexes.delete(id);
+      }
       return {
         tabs: {
           ...state.tabs,
@@ -484,15 +601,29 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
-      const idx = tab.cliBlocks.findIndex((b) => b.id === block.id);
+      // 流式更新几乎总是在更新最后一个 block；先走 O(1) 快路径，只有补写旧块
+      // 时才扫描历史列表。
+      const byId = getCliBlockIndex(id, tab.cliBlocks);
+      const idx = byId.get(block.id) ?? -1;
       let next: CliBlock[];
       if (idx >= 0) {
+        const merged = { ...tab.cliBlocks[idx], ...block };
+        if (shallowEqualBlock(tab.cliBlocks[idx]!, merged)) return state;
         next = tab.cliBlocks.slice();
-        next[idx] = { ...next[idx], ...block };
+        next[idx] = merged;
       } else {
         next = [...tab.cliBlocks, block];
       }
-      const trimmed = next.length > MAX_BLOCKS ? next.slice(-TRIM_TARGET) : next;
+      const trimmed = next.length > MAX_BLOCKS
+        ? limitCliBlocks(next, TRIM_TARGET, tab.hasFullImportedHistory)
+        : next;
+      if (trimmed === next) {
+        const nextIndex = new Map(byId);
+        nextIndex.set(block.id, idx >= 0 ? idx : next.length - 1);
+        rememberCliBlockIndex(id, next, nextIndex);
+      } else {
+        cliBlockIndexes.delete(id);
+      }
       return {
         tabs: {
           ...state.tabs,
@@ -506,7 +637,28 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
-      return { tabs: { ...state.tabs, [id]: { ...tab, cliBlocks: [] } } };
+      const existingTombstones = tab.deletedImportedBlockIds ?? [];
+      const deletedImportedBlockIds = tab.importedConversationId
+        ? Array.from(new Set([
+            ...existingTombstones,
+            ...tab.cliBlocks
+              .filter((block) => block.importedConversationId === tab.importedConversationId ||
+                block.id.startsWith(`imported-${tab.importedConversationId}-`))
+              .map((block) => block.id),
+          ]))
+        : existingTombstones;
+      cliBlockIndexes.delete(id);
+      return {
+        tabs: {
+          ...state.tabs,
+          [id]: {
+            ...tab,
+            cliBlocks: [],
+            hasFullImportedHistory: false,
+            deletedImportedBlockIds,
+          },
+        },
+      };
     });
   },
 
@@ -514,10 +666,30 @@ export const useTabsStore = create<TabsStoreState>()(
     set((state) => {
       const tab = state.tabs[id];
       if (!tab) return state;
+      const removed = tab.cliBlocks.find((block) => block.id === blockId);
       const next = tab.cliBlocks.filter((b) => b.id !== blockId);
       // 找不到该 id 时数组引用不变 —— 别走 set 避免无意义 rehydrate / 监听抖动
       if (next.length === tab.cliBlocks.length) return state;
-      return { tabs: { ...state.tabs, [id]: { ...tab, cliBlocks: next } } };
+      const isImported = Boolean(removed && tab.importedConversationId && (
+        removed.importedConversationId === tab.importedConversationId ||
+        removed.id.startsWith(`imported-${tab.importedConversationId}-`)
+      ));
+      const existingTombstones = tab.deletedImportedBlockIds ?? [];
+      const deletedImportedBlockIds = isImported && !existingTombstones.includes(blockId)
+        ? [...existingTombstones, blockId]
+        : existingTombstones;
+      cliBlockIndexes.delete(id);
+      return {
+        tabs: {
+          ...state.tabs,
+          [id]: {
+            ...tab,
+            cliBlocks: next,
+            hasFullImportedHistory: false,
+            deletedImportedBlockIds,
+          },
+        },
+      };
     });
   },
 
@@ -534,6 +706,9 @@ export const useTabsStore = create<TabsStoreState>()(
   restoreFromHistory: (archivedId) => {
     const archived = get().history.find((h) => h.id === archivedId);
     if (!archived) return null;
+    const importedConversationId = typeof archived.importedConversationId === "string"
+      ? archived.importedConversationId
+      : null;
     // 用归档元数据创建新 tab。**不复用原 id**：原 id 可能跟某个被 reattach
     // 出来的活跃 tab 撞 id；新 UUID 安全。后端 last_session_per_context 会
     // 按 (agent, cwd) 自动 resume，不依赖前端 runId。
@@ -544,22 +719,24 @@ export const useTabsStore = create<TabsStoreState>()(
     // archived 不持久化原始 cliBlocks（防 localStorage 撑爆），合成块只是"回顾"
     // 视觉骨架；用户继续追问时新的真实 block 自然接在后面。
     const synthesizedBlocks: CliBlock[] = [];
-    const promptText = archived.summary?.trim();
-    if (promptText) {
-      synthesizedBlocks.push({
-        id: `restored-prompt-${archived.id}`,
-        type: "user-prompt",
-        content: promptText,
-      });
-    }
-    const responseText =
-      (archived.resultZh || archived.summaryTranslation || "").trim();
-    if (responseText) {
-      synthesizedBlocks.push({
-        id: `restored-text-${archived.id}`,
-        type: "text",
-        content: responseText,
-      });
+    if (!importedConversationId) {
+      const promptText = archived.summary?.trim();
+      if (promptText) {
+        synthesizedBlocks.push({
+          id: `restored-prompt-${archived.id}`,
+          type: "user-prompt",
+          content: promptText,
+        });
+      }
+      const responseText =
+        (archived.resultZh || archived.summaryTranslation || "").trim();
+      if (responseText) {
+        synthesizedBlocks.push({
+          id: `restored-text-${archived.id}`,
+          type: "text",
+          content: responseText,
+        });
+      }
     }
 
     const newId = get().createTab({
@@ -568,6 +745,14 @@ export const useTabsStore = create<TabsStoreState>()(
       projectPath: archived.projectPath,
       sessionId: archived.sessionId,
       agentNativeSessionId: archived.agentNativeSessionId,
+      importedConversationId,
+      hasFullImportedHistory: false,
+      deletedImportedBlockIds: Array.isArray(archived.deletedImportedBlockIds)
+        ? archived.deletedImportedBlockIds.slice()
+        : [],
+      importedHistoryError: typeof archived.importedHistoryError === "string"
+        ? archived.importedHistoryError
+        : null,
       lastUserPrompt: archived.summary,
       summaryTranslation: archived.summaryTranslation,
       emotionText: archived.emotionText,
@@ -618,10 +803,12 @@ export const useTabsStore = create<TabsStoreState>()(
         }
         return state as TabsStoreState;
       },
-      // 共享 storage：桌面端写 localStorage + 同步推 Rust 镜像；移动端纯走 IPC
-      // 拿镜像。后端镜像没有配额限制；只有桌面端 localStorage 可能撞 quota，
-      // 这种情况下 onLocalQuotaError 砍 cliBlocks 后自己重试 localStorage（IPC 已写）。
+      // 共享 storage：桌面端把 partialize 后的紧凑快照写 localStorage 并同步给
+      // Rust 镜像；移动端纯走 IPC 拿同一份快照。只有 localStorage 会撞 quota。
       storage: createSharedStorage({
+        // 输入和流式 block 更新很密集；200ms 内只持久化最后一份完整快照，
+        // 页面隐藏时 sharedStorage 会立即 flush，兼顾响应速度和异常恢复。
+        writeDelayMs: 200,
         onLocalQuotaError: (key, raw, err) => {
           if (!isQuotaError(err)) {
             console.warn("[tabs] localStorage write failed", err);
@@ -635,9 +822,9 @@ export const useTabsStore = create<TabsStoreState>()(
             if (parsed.state?.tabs) {
               for (const id of Object.keys(parsed.state.tabs)) {
                 const blocks = parsed.state.tabs[id].cliBlocks ?? [];
-                parsed.state.tabs[id].cliBlocks = blocks.slice(
-                  -Math.floor(blocks.length / 2),
-                );
+                const tab = parsed.state.tabs[id];
+                tab.cliBlocks = limitCliBlocks(blocks, Math.floor(blocks.length / 2), false);
+                tab.hasFullImportedHistory = false;
               }
               try {
                 localStorage.setItem(key, JSON.stringify(parsed));
@@ -654,7 +841,7 @@ export const useTabsStore = create<TabsStoreState>()(
           } catch (e) {
             console.error("[tabs] quota fallback parse 失败", e);
           }
-          // localStorage 没救出来无所谓 —— Rust 镜像里已经存着完整数据
+          // localStorage 没救出来时，Rust 镜像仍保留 partialize 后的最近窗口。
           return true;
         },
       }),

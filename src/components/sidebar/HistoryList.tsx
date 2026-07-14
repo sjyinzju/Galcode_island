@@ -1,13 +1,33 @@
-import { useEffect, useMemo, useState } from "react";
+// 左栏“历史会话”视图：导入记录按 updatedAt、本地归档按 closedAt 统一倒序展示。
+// 点击归档项会恢复为可继续的 tab；点击导入项会打开或复用正常对话 tab 继续会话。
+// 导入项的“查看”按钮只打开完整记录查看器，删除导入项不会改动原始 Codex / Claude Code 记录。
+
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useTabsStore, type ArchivedSession } from "../../stores/useTabsStore";
 import { useUiStore } from "../../stores/useUiStore";
 import { useAppStore } from "../../stores/useAppStore";
 import { useImportedConversationsStore } from "../../stores/useImportedConversationsStore";
 import { useNow } from "../../hooks/useNow";
-import { isTauri } from "../../lib/bridge";
-import { sourceLabel, type ImportedConversationSummary } from "../../types/externalHistory";
-import { ExternalHistoryImportDialog } from "./ExternalHistoryImportDialog";
-import { ImportedConversationDialog } from "./ImportedConversationDialog";
+import { invoke, isTauri, pickFolder } from "../../lib/bridge";
+import {
+  importedHistoryErrorBlock,
+  mergeImportedConversationTimeline,
+} from "../../lib/importedConversation";
+import { lazyNamed } from "../../lib/lazyNamed";
+import {
+  sourceLabel,
+  type ImportedConversation,
+  type ImportedConversationSummary,
+} from "../../types/externalHistory";
+
+const ExternalHistoryImportDialog = lazyNamed(
+  () => import("./ExternalHistoryImportDialog"),
+  "ExternalHistoryImportDialog",
+);
+const ImportedConversationDialog = lazyNamed(
+  () => import("./ImportedConversationDialog"),
+  "ImportedConversationDialog",
+);
 
 function basename(path: string | null): string {
   if (!path) return "未选择项目";
@@ -22,6 +42,28 @@ function relativeTime(timestamp: number, now: number): string {
   if (difference < 3_600_000) return `${Math.floor(difference / 60_000)} 分钟前`;
   if (difference < 86_400_000) return `${Math.floor(difference / 3_600_000)} 小时前`;
   return `${Math.floor(difference / 86_400_000)} 天前`;
+}
+
+export type HistoryListEntry =
+  | { kind: "imported"; item: ImportedConversationSummary; timestamp: number }
+  | { kind: "archived"; item: ArchivedSession; timestamp: number };
+
+export function mergeHistoryEntries(
+  importedConversations: readonly ImportedConversationSummary[],
+  archivedSessions: readonly ArchivedSession[],
+): HistoryListEntry[] {
+  return [
+    ...importedConversations.map((item) => ({
+      kind: "imported" as const,
+      item,
+      timestamp: item.updatedAt,
+    })),
+    ...archivedSessions.map((item) => ({
+      kind: "archived" as const,
+      item,
+      timestamp: item.closedAt,
+    })),
+  ].sort((first, second) => second.timestamp - first.timestamp);
 }
 
 interface HistoryRowProps {
@@ -77,16 +119,23 @@ interface ImportedHistoryRowProps {
   item: ImportedConversationSummary;
   now: number;
   onOpen: () => void;
+  onView: () => void;
   onDelete: () => void;
 }
 
-function ImportedHistoryRow({ item, now, onOpen, onDelete }: ImportedHistoryRowProps): JSX.Element {
+function ImportedHistoryRow({
+  item,
+  now,
+  onOpen,
+  onView,
+  onDelete,
+}: ImportedHistoryRowProps): JSX.Element {
   return (
     <div
       onClick={onOpen}
       className="group relative cursor-pointer rounded-lg border border-sky-400/20 bg-sky-400/[0.06] px-3 py-2.5 text-[13px] text-zinc-700 transition-all hover:bg-sky-400/[0.12] sm:px-2.5 sm:py-2 dark:border-sky-300/15 dark:bg-sky-400/[0.07] dark:text-zinc-300 dark:hover:bg-sky-400/[0.12]"
       role="button"
-      title="查看已导入的完整对话"
+      title="在对话框中继续"
     >
       <div className="flex items-start gap-2 sm:gap-1.5">
         <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-sky-400 sm:mt-1 sm:h-1.5 sm:w-1.5" />
@@ -104,6 +153,21 @@ function ImportedHistoryRow({ item, now, onOpen, onDelete }: ImportedHistoryRowP
           </div>
         </div>
       </div>
+      <button
+        type="button"
+        onClick={(event) => {
+          event.stopPropagation();
+          onView();
+        }}
+        aria-label="查看完整导入记录"
+        title="查看完整导入记录"
+        className="absolute right-8 top-1 flex h-7 w-7 items-center justify-center rounded text-zinc-400 opacity-100 transition-opacity hover:bg-sky-400/15 hover:text-sky-600 sm:h-4 sm:w-4 sm:opacity-0 sm:group-hover:opacity-100 dark:text-zinc-500 dark:hover:text-sky-300"
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
+          <path d="M1.5 8s2.2-4 6.5-4 6.5 4 6.5 4-2.2 4-6.5 4-6.5-4-6.5-4Z" />
+          <circle cx="8" cy="8" r="1.8" />
+        </svg>
+      </button>
       <button
         type="button"
         onClick={(event) => {
@@ -126,19 +190,23 @@ export function HistoryList(): JSX.Element {
   const restoreFromHistory = useTabsStore((state) => state.restoreFromHistory);
   const removeFromHistory = useTabsStore((state) => state.removeFromHistory);
   const clearHistory = useTabsStore((state) => state.clearHistory);
+  const createTab = useTabsStore((state) => state.createTab);
+  const updateTab = useTabsStore((state) => state.updateTab);
   const setActiveTab = useTabsStore((state) => state.setActiveTab);
   const setLeftSidebarView = useUiStore((state) => state.setLeftSidebarView);
   const setIsStarted = useAppStore((state) => state.setIsStarted);
   const importedConversations = useImportedConversationsStore((state) => state.conversations);
   const importedLoaded = useImportedConversationsStore((state) => state.loaded);
   const refreshImportedConversations = useImportedConversationsStore((state) => state.refresh);
+  const mergeImportedConversations = useImportedConversationsStore((state) => state.merge);
   const removeImportedConversation = useImportedConversationsStore((state) => state.remove);
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [openImportedConversationId, setOpenImportedConversationId] = useState<string | null>(null);
+  const openingImportedConversation = useRef(false);
 
-  const archivedSessions = useMemo(
-    () => history.slice().sort((first, second) => second.closedAt - first.closedAt),
-    [history],
+  const historyEntries = useMemo(
+    () => mergeHistoryEntries(importedConversations, history),
+    [history, importedConversations],
   );
   const importedIds = useMemo(
     () => new Set(importedConversations.map((conversation) => conversation.id)),
@@ -150,12 +218,107 @@ export function HistoryList(): JSX.Element {
     if (!importedLoaded) void refreshImportedConversations();
   }, [importedLoaded, refreshImportedConversations]);
 
-  const handleRestore = (id: string): void => {
-    const newId = restoreFromHistory(id);
-    if (!newId) return;
-    setActiveTab(newId);
+  const activateTab = (id: string): void => {
+    setActiveTab(id);
     setLeftSidebarView("projects");
     setIsStarted(true);
+  };
+
+  const handleRestore = (id: string): void => {
+    const newId = restoreFromHistory(id);
+    if (newId) activateTab(newId);
+  };
+
+  const handleOpenImported = async (summary: ImportedConversationSummary): Promise<void> => {
+    if (openingImportedConversation.current) return;
+    const existingTab = Object.values(useTabsStore.getState().tabs).find(
+      (tab) =>
+        tab.importedConversationId === summary.id ||
+        (tab.agent === summary.source &&
+          tab.agentNativeSessionId === summary.nativeSessionId),
+    );
+    if (
+      existingTab?.importedConversationId === summary.id &&
+      existingTab.hasFullImportedHistory
+    ) {
+      try {
+        if (!existingTab.projectPath) throw new Error("Missing project directory");
+        await invoke("validate_directory", { path: existingTab.projectPath });
+        activateTab(existingTab.id);
+        return;
+      } catch {
+        // Continue below so the user can replace a missing or moved directory.
+      }
+    }
+    openingImportedConversation.current = true;
+    try {
+      let projectPath = existingTab?.projectPath ?? summary.projectPath;
+      if (projectPath) {
+        try {
+          await invoke("validate_directory", { path: projectPath });
+        } catch {
+          projectPath = null;
+        }
+      }
+      if (!projectPath) {
+        projectPath = await pickFolder({
+          defaultPath: summary.projectPath ?? undefined,
+          title: "选择用于继续此会话的有效项目目录",
+        });
+        if (!projectPath) {
+          return;
+        }
+      }
+      const conversation = await invoke<ImportedConversation>("load_imported_conversation", {
+        id: summary.id,
+      });
+      const importedTab = mergeImportedConversationTimeline(
+        conversation,
+        existingTab?.cliBlocks ?? [],
+        {
+          deletedImportedBlockIds: existingTab?.deletedImportedBlockIds,
+          projectPath,
+        },
+      );
+      if (existingTab) {
+        updateTab(existingTab.id, {
+          projectPath,
+          importedConversationId: summary.id,
+          hasFullImportedHistory: true,
+          importedHistoryError: null,
+          cliBlocks: importedTab.cliBlocks,
+          lastUserPrompt: importedTab.lastUserPrompt,
+        });
+        activateTab(existingTab.id);
+        return;
+      }
+      const tabId = createTab(importedTab);
+      activateTab(tabId);
+    } catch (error) {
+      console.error("Failed to open imported conversation", error);
+      const message = "导入历史文件不可用，请重新导入该会话后重试。";
+      if (existingTab) {
+        useTabsStore.getState().upsertCliBlock(
+          existingTab.id,
+          importedHistoryErrorBlock(summary.id, message),
+        );
+        updateTab(existingTab.id, { importedHistoryError: message });
+        activateTab(existingTab.id);
+      } else {
+        const tabId = createTab({
+          title: summary.title,
+          agent: summary.source,
+          projectPath: summary.projectPath,
+          agentNativeSessionId: summary.nativeSessionId,
+          importedConversationId: summary.id,
+          importedHistoryError: message,
+          cliBlocks: [importedHistoryErrorBlock(summary.id, message)],
+        });
+        activateTab(tabId);
+      }
+    } finally {
+      openingImportedConversation.current = false;
+    }
   };
 
   const handleDeleteImported = (id: string): void => {
@@ -167,22 +330,25 @@ export function HistoryList(): JSX.Element {
     });
   };
 
-  const importDialog = isImportOpen ? (
-    <ExternalHistoryImportDialog
-      importedIds={importedIds}
-      onClose={() => setIsImportOpen(false)}
-      onImported={() => void refreshImportedConversations()}
-    />
-  ) : null;
+  const dialogs = (
+    <Suspense fallback={null}>
+      {isImportOpen && (
+        <ExternalHistoryImportDialog
+          importedIds={importedIds}
+          onClose={() => setIsImportOpen(false)}
+          onImported={(result) => mergeImportedConversations(result.imported)}
+        />
+      )}
+      {openImportedConversationId && (
+        <ImportedConversationDialog
+          conversationId={openImportedConversationId}
+          onClose={() => setOpenImportedConversationId(null)}
+        />
+      )}
+    </Suspense>
+  );
 
-  const conversationDialog = openImportedConversationId ? (
-    <ImportedConversationDialog
-      conversationId={openImportedConversationId}
-      onClose={() => setOpenImportedConversationId(null)}
-    />
-  ) : null;
-
-  if (archivedSessions.length === 0 && importedConversations.length === 0) {
+  if (history.length === 0 && importedConversations.length === 0) {
     return (
       <>
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-4 text-center text-[11px] text-zinc-400 dark:text-zinc-500">
@@ -197,8 +363,7 @@ export function HistoryList(): JSX.Element {
             </button>
           )}
         </div>
-        {importDialog}
-        {conversationDialog}
+        {dialogs}
       </>
     );
   }
@@ -208,7 +373,7 @@ export function HistoryList(): JSX.Element {
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 py-2">
         <div className="mb-1.5 flex items-center justify-between gap-2 px-1">
           <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-400 dark:text-zinc-500">
-            历史会话 {archivedSessions.length + importedConversations.length}
+            历史会话 {historyEntries.length}
           </span>
           <div className="flex items-center gap-2">
             {isTauri && (
@@ -220,7 +385,7 @@ export function HistoryList(): JSX.Element {
                 导入记录
               </button>
             )}
-            {archivedSessions.length > 0 && (
+            {history.length > 0 && (
               <button
                 type="button"
                 onClick={() => {
@@ -234,28 +399,27 @@ export function HistoryList(): JSX.Element {
           </div>
         </div>
         <div className="flex flex-col gap-1">
-          {importedConversations.map((item) => (
+          {historyEntries.map((entry) => entry.kind === "imported" ? (
             <ImportedHistoryRow
-              key={item.id}
-              item={item}
+              key={`imported:${entry.item.id}`}
+              item={entry.item}
               now={now}
-              onOpen={() => setOpenImportedConversationId(item.id)}
-              onDelete={() => handleDeleteImported(item.id)}
+              onOpen={() => void handleOpenImported(entry.item)}
+              onView={() => setOpenImportedConversationId(entry.item.id)}
+              onDelete={() => handleDeleteImported(entry.item.id)}
             />
-          ))}
-          {archivedSessions.map((item) => (
+          ) : (
             <HistoryRow
-              key={item.id}
-              item={item}
+              key={`archived:${entry.item.id}`}
+              item={entry.item}
               now={now}
-              onRestore={() => handleRestore(item.id)}
-              onDelete={() => removeFromHistory(item.id)}
+              onRestore={() => handleRestore(entry.item.id)}
+              onDelete={() => removeFromHistory(entry.item.id)}
             />
           ))}
         </div>
       </div>
-      {importDialog}
-      {conversationDialog}
+      {dialogs}
     </>
   );
 }

@@ -1,12 +1,8 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { invoke, isTauri } from "./lib/bridge";
-import { useEffect, useMemo } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { MainView } from "./components/MainView";
 import { MobileTopBar } from "./components/MobileTopBar";
-import { SettingsModal } from "./components/settings/SettingsModal";
-import { PersonalizationModal } from "./components/personalization/PersonalizationModal";
-import { ProfileModal } from "./components/profile/ProfileModal";
-import { GuidedSetupModal } from "./components/guided-setup/GuidedSetupModal";
 import { SidebarLeft } from "./components/sidebar/SidebarLeft";
 import { SidebarRight } from "./components/sidebar/SidebarRight";
 import { InPageSearch } from "./components/InPageSearch";
@@ -24,7 +20,20 @@ import { usePermissionRequests } from "./hooks/usePermissionRequests";
 import { useUpdateBootstrap } from "./hooks/useUpdateBootstrap";
 import { useSettingsStore } from "./stores/useSettingsStore";
 import { useProfileStore } from "./stores/useProfileStore";
+import { useSetupStore } from "./stores/useSetupStore";
 import { syncAllBackendPrefsToRust } from "./lib/backendPrefs";
+import { lazyNamed } from "./lib/lazyNamed";
+
+const SettingsModal = lazyNamed(() => import("./components/settings/SettingsModal"), "SettingsModal");
+const PersonalizationModal = lazyNamed(
+  () => import("./components/personalization/PersonalizationModal"),
+  "PersonalizationModal",
+);
+const ProfileModal = lazyNamed(() => import("./components/profile/ProfileModal"), "ProfileModal");
+const GuidedSetupModal = lazyNamed(
+  () => import("./components/guided-setup/GuidedSetupModal"),
+  "GuidedSetupModal",
+);
 
 // 自画顶栏的存在条件：Tauri 桌面端非 mac（mac 走 lib.rs 的 set_decorations(true)
 // + titleBarStyle Overlay 的原生红绿灯）。motion.div 在该条件下 pt-7 让位 28px。
@@ -32,9 +41,21 @@ const isMacOS = typeof navigator !== "undefined"
   && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
 const hasCustomTopBar = isTauri && !isMacOS;
 
+function useDeferredMount(open: boolean): boolean {
+  const [hasOpened, setHasOpened] = useState(open);
+  useEffect(() => {
+    if (open) setHasOpened(true);
+  }, [open]);
+  return hasOpened;
+}
+
 function App(): JSX.Element {
   const mobileLeftDrawerOpen = useUiStore((s) => s.mobileLeftDrawerOpen);
   const closeMobileLeftDrawer = useUiStore((s) => s.closeMobileLeftDrawer);
+  const mountSettings = useDeferredMount(useSettingsStore((s) => s.isSettingsModalOpen));
+  const mountPersonalization = useDeferredMount(useUiStore((s) => s.isPersonalizationModalOpen));
+  const mountProfile = useDeferredMount(useProfileStore((s) => s.isProfileModalOpen));
+  const mountGuidedSetup = useDeferredMount(useSetupStore((s) => s.isOpen));
 
   useThemeHotkey();
   useChatHotkeys();
@@ -168,10 +189,12 @@ function App(): JSX.Element {
             {currentScreen}
           </motion.div>
         </AnimatePresence>
-        <SettingsModal />
-        <PersonalizationModal />
-        <ProfileModal />
-        <GuidedSetupModal />
+        <Suspense fallback={null}>
+          {mountSettings && <SettingsModal />}
+          {mountPersonalization && <PersonalizationModal />}
+          {mountProfile && <ProfileModal />}
+          {mountGuidedSetup && <GuidedSetupModal />}
+        </Suspense>
       </div>
       {/* Windows / Linux 自画顶栏。组件内部用 createPortal 挂到 document.body
           脱离 React DOM 祖先链，stacking ancestor 直接是文档根，绕开 webview 上

@@ -7,8 +7,9 @@
 //   - 下：主题 / 设置 / 个人档案
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { MouseEvent } from "react";
+import { Suspense, type MouseEvent } from "react";
 import { isTauri } from "../../lib/bridge";
+import { lazyNamed } from "../../lib/lazyNamed";
 import { useSettingsStore } from "../../stores/useSettingsStore";
 import { useAppStore } from "../../stores/useAppStore";
 import { useUiStore } from "../../stores/useUiStore";
@@ -16,9 +17,10 @@ import { useTabsStore } from "../../stores/useTabsStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { useAboutStore } from "../../stores/useAboutStore";
 import { ProjectTree } from "./ProjectTree";
-import { HistoryList } from "./HistoryList";
-import { SearchPanel } from "./SearchPanel";
-import { GitPanel } from "./GitPanel";
+
+const HistoryList = lazyNamed(() => import("./HistoryList"), "HistoryList");
+const SearchPanel = lazyNamed(() => import("./SearchPanel"), "SearchPanel");
+const GitPanel = lazyNamed(() => import("./GitPanel"), "GitPanel");
 
 const isMacOS = typeof navigator !== "undefined"
   && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
@@ -170,15 +172,17 @@ export function SidebarLeft(): JSX.Element {
       </div>
 
       {/* 中部按 view 切换 */}
-      {leftSidebarView === "history" ? (
-        <HistoryList />
-      ) : leftSidebarView === "search" ? (
-        <SearchPanel />
-      ) : leftSidebarView === "git" ? (
-        <GitPanel />
-      ) : (
-        <ProjectTree />
-      )}
+      <Suspense fallback={null}>
+        {leftSidebarView === "history" ? (
+          <HistoryList />
+        ) : leftSidebarView === "search" ? (
+          <SearchPanel />
+        ) : leftSidebarView === "git" ? (
+          <GitPanel />
+        ) : (
+          <ProjectTree />
+        )}
+      </Suspense>
 
       {/* 底部菜单 */}
       <div className="flex flex-col gap-0.5 border-t border-black/5 px-2 py-2 dark:border-white/5">
