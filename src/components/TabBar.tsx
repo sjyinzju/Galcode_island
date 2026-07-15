@@ -25,17 +25,23 @@ function isTabRunning(tab: TabState): boolean {
 }
 
 interface TabItemProps {
-  tab: TabState;
+  id: string;
   isActive: boolean;
   canClose: boolean;
-  onSelect: () => void;
   onClose: () => void;
-  onRename: (next: string) => void;
 }
 
-function TabItem({ tab, isActive, canClose, onSelect, onClose, onRename }: TabItemProps): JSX.Element {
+function TabItem({ id, isActive, canClose, onClose }: TabItemProps): JSX.Element {
+  const title = useTabsStore((state) => state.tabs[id]?.title ?? "");
+  const running = useTabsStore((state) => {
+    const tab = state.tabs[id];
+    return tab ? isTabRunning(tab) : false;
+  });
+  const hasUnread = useTabsStore((state) => state.tabs[id]?.hasUnread ?? false);
+  const setActiveTab = useTabsStore((state) => state.setActiveTab);
+  const updateTab = useTabsStore((state) => state.updateTab);
   const [isEditing, setIsEditing] = useState(false);
-  const [draft, setDraft] = useState(tab.title);
+  const [draft, setDraft] = useState(title);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -47,25 +53,23 @@ function TabItem({ tab, isActive, canClose, onSelect, onClose, onRename }: TabIt
 
   // tab.title 外部更新时同步 draft（避免重命名后还在显示旧值）
   useEffect(() => {
-    if (!isEditing) setDraft(tab.title);
-  }, [tab.title, isEditing]);
+    if (!isEditing) setDraft(title);
+  }, [title, isEditing]);
 
   const commitRename = (): void => {
     const next = draft.trim();
-    if (next && next !== tab.title) {
-      onRename(next);
+    if (next && next !== title) {
+      updateTab(id, { title: next });
     } else {
-      setDraft(tab.title);
+      setDraft(title);
     }
     setIsEditing(false);
   };
 
-  const running = isTabRunning(tab);
-
   return (
     <div
       onClick={() => {
-        if (!isActive) onSelect();
+        if (!isActive) setActiveTab(id);
       }}
       onAuxClick={(e) => {
         // 鼠标中键关闭
@@ -88,7 +92,7 @@ function TabItem({ tab, isActive, canClose, onSelect, onClose, onRename }: TabIt
       {/* 运行中状态点 / 未读小红点 */}
       {running ? (
         <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400 shadow-[0_0_4px_rgba(56,189,248,0.6)]" />
-      ) : tab.hasUnread ? (
+      ) : hasUnread ? (
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-400 shadow-[0_0_4px_rgba(251,113,133,0.6)]" />
       ) : null}
 
@@ -101,7 +105,7 @@ function TabItem({ tab, isActive, canClose, onSelect, onClose, onRename }: TabIt
           onKeyDown={(e) => {
             if (e.key === "Enter") commitRename();
             else if (e.key === "Escape") {
-              setDraft(tab.title);
+              setDraft(title);
               setIsEditing(false);
             }
           }}
@@ -109,8 +113,8 @@ function TabItem({ tab, isActive, canClose, onSelect, onClose, onRename }: TabIt
           className="min-w-[60px] max-w-[140px] truncate bg-transparent text-[11px] outline-none"
         />
       ) : (
-        <span className="truncate" title={tab.title}>
-          {tab.title}
+        <span className="truncate" title={title}>
+          {title}
         </span>
       )}
 
@@ -135,11 +139,9 @@ function TabItem({ tab, isActive, canClose, onSelect, onClose, onRename }: TabIt
 
 export function TabBar(): JSX.Element | null {
   const order = useTabsStore((s) => s.order);
-  const tabs = useTabsStore((s) => s.tabs);
   const activeTabId = useTabsStore((s) => s.activeTabId);
   const setActiveTab = useTabsStore((s) => s.setActiveTab);
   const removeTab = useTabsStore((s) => s.removeTab);
-  const updateTab = useTabsStore((s) => s.updateTab);
   const createTab = useTabsStore((s) => s.createTab);
   const selectedAgent = useAppStore((s) => s.selectedAgent);
   const setIsStarted = useAppStore((s) => s.setIsStarted);
@@ -157,11 +159,12 @@ export function TabBar(): JSX.Element | null {
   if (order.length === 0) return null;
 
   const handleClose = async (id: string): Promise<void> => {
-    const tab = tabs[id];
+    const currentState = useTabsStore.getState();
+    const tab = currentState.tabs[id];
     if (!tab) return;
 
     const running = isTabRunning(tab);
-    const isLastTab = order.length === 1;
+    const isLastTab = currentState.order.length === 1;
 
     // 关掉一个还在跑的 tab 是破坏性动作（杀进程 / 中断 turn）；最后一个 tab
     // 还在跑时关掉更"重"（直接回 WelcomeView）。两种情况都弹 confirm 防误触。
@@ -213,17 +216,13 @@ export function TabBar(): JSX.Element | null {
         role="tablist"
       >
         {order.map((id) => {
-          const tab = tabs[id];
-          if (!tab) return null;
           return (
             <TabItem
               key={id}
-              tab={tab}
+              id={id}
               isActive={activeTabId === id}
               canClose={order.length > 1}
-              onSelect={() => setActiveTab(id)}
               onClose={() => void handleClose(id)}
-              onRename={(next) => updateTab(id, { title: next })}
             />
           );
         })}
