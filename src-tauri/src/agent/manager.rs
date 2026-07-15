@@ -153,6 +153,11 @@ impl AgentManager {
             .get(&(agent_type.to_string(), run_id.to_string()))
             .cloned()
     }
+
+    fn forget_session(&mut self, agent_type: &str, run_id: &str) {
+        self.last_session_per_context
+            .remove(&(agent_type.to_string(), run_id.to_string()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +185,7 @@ pub fn launch_claude_agent(
     // 前端持久化的 tab.sessionId hint：用作 resume 候选。重启 app 后内存
     // last_session_per_context 空了，前端持久化的 sessionId 能续上下文。
     resume_hint: Option<String>,
+    imported_fallback_context: Option<String>,
     // Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
     // None 时由 claude.rs 内部 fallback 到 acceptEdits（保留老行为）。
     permission_mode: Option<String>,
@@ -230,6 +236,9 @@ pub fn launch_claude_agent(
     let user_zh = trimmed.clone();
     let cwd_owned = cwd.clone();
     let permission_mode_owned = permission_mode.clone();
+    let fallback_context = imported_fallback_context
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -256,11 +265,16 @@ pub fn launch_claude_agent(
 
         emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "Agent 工作中…", 50.0);
         let t_turn_start = std::time::Instant::now();
-        let turn_result = claude_agent::run_claude_stream_turn(
+        let initial_prompt = initial_imported_prompt(
+            fallback_context.as_deref(),
+            resume_session_id.as_deref(),
+            &prompt_for_agent,
+        );
+        let mut turn_result = claude_agent::run_claude_stream_turn(
             &app_handle,
             runtime_clone.as_ref(),
             &run_id,
-            &prompt_for_agent,
+            &initial_prompt,
             &cwd_owned,
             resume_session_id.as_deref(),
             prefs.model.as_deref(),
@@ -270,6 +284,35 @@ pub fn launch_claude_agent(
             permission_mode_owned.as_deref(),
             Some(&stream_id),
         );
+        if let (Some(context), Some(_)) = (fallback_context.as_deref(), resume_session_id.as_ref())
+        {
+            let should_retry = turn_result
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_missing_resume_error(error));
+            if should_retry {
+                emit_resume_fallback(&app_handle, &run_id, &sid);
+                if let Ok(mut manager) = state_clone.manager.lock() {
+                    manager.forget_session("claude-code", &run_id);
+                }
+                claude_agent::discard_claude_stream_client(runtime_clone.as_ref(), &run_id);
+                let fallback_prompt = compose_imported_fallback_prompt(context, &prompt_for_agent);
+                turn_result = claude_agent::run_claude_stream_turn(
+                    &app_handle,
+                    runtime_clone.as_ref(),
+                    &run_id,
+                    &fallback_prompt,
+                    &cwd_owned,
+                    None,
+                    prefs.model.as_deref(),
+                    prefs.effort.as_deref(),
+                    prefs.binary.as_deref(),
+                    prefs.proxy.as_deref(),
+                    permission_mode_owned.as_deref(),
+                    Some(&stream_id),
+                );
+            }
+        }
 
         let dur_turn = t_turn_start.elapsed();
         match turn_result {
@@ -347,6 +390,7 @@ pub fn launch_codex_agent(
     task_zh: String,
     // 前端持久化的 tab.sessionId（codex 这里其实是 thread_id）hint：作 resume 候选。
     resume_hint: Option<String>,
+    imported_fallback_context: Option<String>,
     // 桌宠社区图自定义"人设 prompt"
     prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
@@ -390,6 +434,9 @@ pub fn launch_codex_agent(
     let sid = session_id.clone();
     let user_zh = trimmed.clone();
     let cwd_owned = cwd.clone();
+    let fallback_context = imported_fallback_context
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -416,20 +463,52 @@ pub fn launch_codex_agent(
 
         emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "Agent 工作中…", 50.0);
         let t_turn_start = std::time::Instant::now();
-        let turn_result = codex_agent::run_codex_app_server_turn(
+        let initial_prompt = initial_imported_prompt(
+            fallback_context.as_deref(),
+            resume_thread_id.as_deref(),
+            &prompt_for_agent,
+        );
+        let mut turn_result = codex_agent::run_codex_app_server_turn(
             &app_handle,
             runtime_clone.as_ref(),
             &run_id,
             &cwd_owned,
             resume_thread_id.as_deref(),
             None,
-            &prompt_for_agent,
+            &initial_prompt,
             prefs.model.as_deref(),
             prefs.effort.as_deref(),
             prefs.binary.as_deref(),
             prefs.proxy.as_deref(),
             Some(&stream_id),
         );
+        if let (Some(context), Some(_)) = (fallback_context.as_deref(), resume_thread_id.as_ref()) {
+            let should_retry = turn_result
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_missing_resume_error(error));
+            if should_retry {
+                emit_resume_fallback(&app_handle, &run_id, &sid);
+                if let Ok(mut manager) = state_clone.manager.lock() {
+                    manager.forget_session("codex", &run_id);
+                }
+                let fallback_prompt = compose_imported_fallback_prompt(context, &prompt_for_agent);
+                turn_result = codex_agent::run_codex_app_server_turn(
+                    &app_handle,
+                    runtime_clone.as_ref(),
+                    &run_id,
+                    &cwd_owned,
+                    None,
+                    None,
+                    &fallback_prompt,
+                    prefs.model.as_deref(),
+                    prefs.effort.as_deref(),
+                    prefs.binary.as_deref(),
+                    prefs.proxy.as_deref(),
+                    Some(&stream_id),
+                );
+            }
+        }
 
         let dur_turn = t_turn_start.elapsed();
         match turn_result {
@@ -1268,4 +1347,119 @@ pub fn shutdown_runtime_clients(app: &AppHandle) {
 
 fn kill_claude_client(client: &ClaudeStreamClient) {
     crate::agent::claude::kill_claude_stream_client(client);
+}
+
+fn is_missing_resume_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_resume_target = lower.contains("session")
+        || lower.contains("thread")
+        || lower.contains("conversation")
+        || lower.contains("resume");
+    let explicitly_missing_or_invalid = lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("no conversation found")
+        || lower.contains("unknown thread")
+        || lower.contains("invalid session")
+        || lower.contains("invalid thread")
+        || lower.contains("invalid resume");
+    mentions_resume_target && explicitly_missing_or_invalid
+}
+
+fn compose_imported_fallback_prompt(transcript: &str, current_request: &str) -> String {
+    format!(
+        "The native session is unavailable. Continue from this imported transcript.\n\
+<imported_transcript>\n{}\n</imported_transcript>\n\
+<current_user_request>\n{}\n</current_user_request>",
+        transcript.trim(),
+        current_request.trim(),
+    )
+}
+
+fn initial_imported_prompt(
+    fallback_context: Option<&str>,
+    resume_target: Option<&str>,
+    current_request: &str,
+) -> String {
+    match (fallback_context, resume_target) {
+        (Some(context), None) => compose_imported_fallback_prompt(context, current_request),
+        _ => current_request.to_string(),
+    }
+}
+
+fn emit_resume_fallback(app: &AppHandle, run_id: &str, session_id: &str) {
+    let _ = app.emit(
+        "agent://resume-fallback",
+        serde_json::json!({
+            "runId": run_id,
+            "sessionId": session_id,
+        }),
+    );
+}
+
+#[cfg(test)]
+mod imported_resume_tests {
+    use super::{compose_imported_fallback_prompt, initial_imported_prompt, is_missing_resume_error};
+
+    #[test]
+    fn retries_only_explicit_missing_or_invalid_resume_errors() {
+        for message in [
+            "RESUME_SESSION_FAILED: thread not found",
+            "No conversation found with session ID abc",
+            "Invalid resume session id",
+            "Unknown thread: thread-123",
+        ] {
+            assert!(is_missing_resume_error(message), "{message}");
+        }
+        for message in [
+            "network connection timed out",
+            "permission denied",
+            "Codex turn stream was closed unexpectedly",
+            "rate limit exceeded",
+        ] {
+            assert!(!is_missing_resume_error(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn fallback_prompt_keeps_transcript_and_current_request_separate() {
+        let prompt = compose_imported_fallback_prompt(
+            "[User] Earlier request\n[Assistant] Earlier answer",
+            "Current request",
+        );
+        assert!(prompt.contains("<imported_transcript>"));
+        assert!(prompt.contains("[Assistant] Earlier answer"));
+        assert!(prompt.contains("<current_user_request>\nCurrent request"));
+    }
+
+    #[test]
+    fn claude_uses_imported_context_immediately_without_a_resume_candidate() {
+        let prompt = initial_imported_prompt(
+            Some("[User] Earlier Claude request"),
+            None,
+            "Continue Claude work",
+        );
+        assert!(prompt.contains("[User] Earlier Claude request"));
+        assert!(prompt.contains("<current_user_request>\nContinue Claude work"));
+    }
+
+    #[test]
+    fn codex_uses_imported_context_immediately_without_a_resume_candidate() {
+        let prompt = initial_imported_prompt(
+            Some("[Assistant] Earlier Codex answer"),
+            None,
+            "Continue Codex work",
+        );
+        assert!(prompt.contains("[Assistant] Earlier Codex answer"));
+        assert!(prompt.contains("<current_user_request>\nContinue Codex work"));
+    }
+
+    #[test]
+    fn native_resume_attempt_does_not_duplicate_the_imported_transcript() {
+        let prompt = initial_imported_prompt(
+            Some("[User] Earlier request"),
+            Some("native-session"),
+            "Current request",
+        );
+        assert_eq!(prompt, "Current request");
+    }
 }

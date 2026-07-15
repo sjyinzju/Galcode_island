@@ -20,6 +20,7 @@ import { useSettingsStore } from "../stores/useSettingsStore";
 import { useTabsStore, type TabState } from "../stores/useTabsStore";
 import type {
   ErrorPayload,
+  ResumeFallbackPayload,
   SessionCompletePayload,
   StatusChangedPayload,
 } from "../types/ipc";
@@ -140,6 +141,21 @@ export function useAgentIPC(): void {
           useTabsStore.getState().updateTab(tabId, {
             pendingResultRaw: p?.resultRaw ?? null,
             pendingUserZh: p?.userZh ?? null,
+          });
+        }),
+      );
+
+      unsubs.push(
+        await listen<ResumeFallbackPayload>("agent://resume-fallback", (e) => {
+          const p = e.payload;
+          const tabId = resolveTabId(p?.runId, p?.sessionId);
+          if (!tabId) return;
+          ensureSessionLinked(tabId, p?.sessionId);
+          useTabsStore.getState().updateTab(tabId, {
+            agentNativeSessionId: null,
+            uiState: "running",
+            agentStatus: "running",
+            bubble: "原生会话不可用，正在从导入历史创建新会话。",
           });
         }),
       );

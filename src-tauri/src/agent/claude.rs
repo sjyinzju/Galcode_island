@@ -1464,6 +1464,15 @@ pub fn kill_claude_stream_client(client: &ClaudeStreamClient) {
     }
 }
 
+pub fn discard_claude_stream_client(state: &RuntimeState, run_id: &str) {
+    let client = with_claude_state(state, run_id, |claude| claude.client.take())
+        .ok()
+        .flatten();
+    if let Some(client) = client {
+        kill_claude_stream_client(&client);
+    }
+}
+
 pub fn claude_stream_client_matches(
     client: &ClaudeStreamClient,
     directory: &str,

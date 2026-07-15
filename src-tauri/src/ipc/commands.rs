@@ -487,6 +487,7 @@ pub async fn start_agent(
     // 可选：前端持久化的 tab.sessionId（重启 app 后内存 last_session_per_context
     // 是空的，前端 localStorage 留着 sessionId，传过来当 resume hint）。
     session_id: Option<String>,
+    imported_fallback_context: Option<String>,
     // 仅 claude-code 使用：Claude CLI 的 --permission-mode 参数值，
     // 来自 tab.permissionMode（Shift+Tab 切换 / 全局默认）。其它 backend 忽略此参数。
     permission_mode: Option<String>,
@@ -534,6 +535,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            imported_fallback_context,
             permission_mode,
             prompt_override,
         ),
@@ -555,6 +557,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            imported_fallback_context,
             prompt_override,
         ),
         _ => Err(format!("暂不支持的 agent 类型: {}", agent_type)),

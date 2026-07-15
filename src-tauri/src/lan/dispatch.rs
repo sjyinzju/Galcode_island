@@ -53,6 +53,7 @@ struct StartAgentArgs {
     agent: Option<String>,
     run_id: Option<String>,
     session_id: Option<String>,
+    imported_fallback_context: Option<String>,
     permission_mode: Option<String>,
     prompt_override: Option<String>,
 }
@@ -379,6 +380,7 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                     p.agent,
                     p.run_id,
                     p.session_id,
+                    p.imported_fallback_context,
                     p.permission_mode,
                     p.prompt_override,
                 )
