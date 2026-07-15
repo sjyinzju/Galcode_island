@@ -30,6 +30,7 @@ const STORE_LOCK_FILE: &str = "imported-conversations.lock";
 const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ASSET_FILE_BYTES: usize = ((MAX_ATTACHMENT_BYTES + 2) / 3) * 4 + 1024;
 const MAX_IMPORT_WARNINGS: usize = 100;
+const JSONL_READ_BUFFER_BYTES: usize = 8 * 1024;
 const IMPORTED_STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
@@ -132,7 +133,10 @@ impl HistoryScanBudget {
         true
     }
 
-    fn open_file(&mut self, bytes: u64, warnings: &mut Vec<String>) -> bool {
+    fn open_file(&mut self, warnings: &mut Vec<String>) -> bool {
+        if self.total_limit_warned {
+            return false;
+        }
         if self.opened_files >= self.limits.max_files {
             self.incomplete = true;
             if !self.file_limit_warned {
@@ -147,6 +151,11 @@ impl HistoryScanBudget {
             }
             return false;
         }
+        self.opened_files += 1;
+        true
+    }
+
+    fn take_scan_bytes(&mut self, bytes: u64, warnings: &mut Vec<String>) -> bool {
         let Some(total_bytes) = self.total_bytes.checked_add(bytes) else {
             self.incomplete = true;
             if !self.total_limit_warned {
@@ -169,7 +178,6 @@ impl HistoryScanBudget {
             }
             return false;
         }
-        self.opened_files += 1;
         self.total_bytes = total_bytes;
         true
     }
@@ -229,6 +237,11 @@ enum BoundedJsonlLine {
     InvalidUtf8 { number: usize },
 }
 
+struct BoundedJsonlRead {
+    line: BoundedJsonlLine,
+    bytes_read: u64,
+}
+
 struct BoundedJsonlReader {
     reader: BufReader<std::io::Take<File>>,
     max_line_bytes: usize,
@@ -238,35 +251,43 @@ struct BoundedJsonlReader {
 impl BoundedJsonlReader {
     fn new(file: File, file_bytes: u64, max_line_bytes: usize) -> Self {
         Self {
-            reader: BufReader::new(file.take(file_bytes)),
+            // Keep speculative read-ahead bounded when an unselected Codex
+            // file is rejected immediately after its ownership record.
+            reader: BufReader::with_capacity(JSONL_READ_BUFFER_BYTES, file.take(file_bytes)),
             max_line_bytes,
             line_number: 0,
         }
     }
 
-    fn next_line(&mut self) -> std::io::Result<Option<BoundedJsonlLine>> {
-        let Some((mut bytes, too_long)) =
+    fn next_line(&mut self) -> std::io::Result<Option<BoundedJsonlRead>> {
+        let Some((mut bytes, too_long, bytes_read)) =
             read_bounded_physical_line(&mut self.reader, self.max_line_bytes)?
         else {
             return Ok(None);
         };
         self.line_number += 1;
         if too_long {
-            return Ok(Some(BoundedJsonlLine::TooLong {
-                number: self.line_number,
+            return Ok(Some(BoundedJsonlRead {
+                line: BoundedJsonlLine::TooLong {
+                    number: self.line_number,
+                },
+                bytes_read,
             }));
         }
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
-        Ok(Some(match String::from_utf8(bytes) {
-            Ok(text) => BoundedJsonlLine::Text {
-                number: self.line_number,
-                text,
+        Ok(Some(BoundedJsonlRead {
+            line: match String::from_utf8(bytes) {
+                Ok(text) => BoundedJsonlLine::Text {
+                    number: self.line_number,
+                    text,
+                },
+                Err(_) => BoundedJsonlLine::InvalidUtf8 {
+                    number: self.line_number,
+                },
             },
-            Err(_) => BoundedJsonlLine::InvalidUtf8 {
-                number: self.line_number,
-            },
+            bytes_read,
         }))
     }
 }
@@ -274,15 +295,16 @@ impl BoundedJsonlReader {
 fn read_bounded_physical_line(
     reader: &mut impl BufRead,
     max_line_bytes: usize,
-) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+) -> std::io::Result<Option<(Vec<u8>, bool, u64)>> {
     let mut line = Vec::new();
     let mut saw_bytes = false;
     let mut too_long = false;
+    let mut bytes_read = 0u64;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
             return if saw_bytes {
-                Ok(Some((line, too_long)))
+                Ok(Some((line, too_long, bytes_read)))
             } else {
                 Ok(None)
             };
@@ -290,6 +312,7 @@ fn read_bounded_physical_line(
         saw_bytes = true;
         let newline = available.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(available.len(), |index| index + 1);
+        bytes_read = bytes_read.saturating_add(consumed as u64);
         let content = newline.map_or(available, |index| &available[..index]);
         if !too_long {
             let remaining = max_line_bytes.saturating_sub(line.len());
@@ -302,7 +325,7 @@ fn read_bounded_physical_line(
         }
         reader.consume(consumed);
         if newline.is_some() {
-            return Ok(Some((line, too_long)));
+            return Ok(Some((line, too_long, bytes_read)));
         }
     }
 }
@@ -378,7 +401,7 @@ fn open_bounded_jsonl_reader(
         );
         return None;
     }
-    if !budget.open_file(metadata.len(), warnings) {
+    if !budget.open_file(warnings) {
         return None;
     }
     Some(BoundedJsonlReader::new(
@@ -399,31 +422,8 @@ fn next_bounded_jsonl_line(
         if !budget.take_record(warnings) {
             return None;
         }
-        match reader.next_line() {
-            Ok(Some(BoundedJsonlLine::Text { number, text })) => return Some((number, text)),
-            Ok(Some(BoundedJsonlLine::TooLong { number })) => {
-                budget.incomplete = true;
-                push_warning(
-                    warnings,
-                    format!(
-                        "Skipped overlong {label} line {}:{} (limit: {} bytes)",
-                        path.display(),
-                        number,
-                        budget.limits.max_line_bytes
-                    ),
-                );
-            }
-            Ok(Some(BoundedJsonlLine::InvalidUtf8 { number })) => {
-                budget.incomplete = true;
-                push_warning(
-                    warnings,
-                    format!(
-                        "Skipped non-UTF-8 {label} line {}:{}",
-                        path.display(),
-                        number
-                    ),
-                );
-            }
+        let read = match reader.next_line() {
+            Ok(Some(read)) => read,
             Ok(None) => {
                 // The record budget is claimed before the read so an absent
                 // trailing record must not consume it.
@@ -437,6 +437,35 @@ fn next_bounded_jsonl_line(
                     format!("Could not read {label} {}: {error}", path.display()),
                 );
                 return None;
+            }
+        };
+        if !budget.take_scan_bytes(read.bytes_read, warnings) {
+            return None;
+        }
+        match read.line {
+            BoundedJsonlLine::Text { number, text } => return Some((number, text)),
+            BoundedJsonlLine::TooLong { number } => {
+                budget.incomplete = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "Skipped overlong {label} line {}:{} (limit: {} bytes)",
+                        path.display(),
+                        number,
+                        budget.limits.max_line_bytes
+                    ),
+                );
+            }
+            BoundedJsonlLine::InvalidUtf8 { number } => {
+                budget.incomplete = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "Skipped non-UTF-8 {label} line {}:{}",
+                        path.display(),
+                        number
+                    ),
+                );
             }
         }
     }
@@ -461,6 +490,7 @@ pub struct ExternalSessionPreview {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: usize,
+    pub source_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -515,6 +545,8 @@ pub struct ImportedTranscriptMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_user_prompt: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_api_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<String>,
     pub content: String,
@@ -600,6 +632,7 @@ struct ParsedMessage {
     source_kind: &'static str,
     role: String,
     is_user_prompt: bool,
+    is_api_error: bool,
     source_turn_id: Option<String>,
     content: String,
     parts: Vec<ImportedTranscriptPart>,
@@ -616,6 +649,7 @@ struct ParsedConversation {
     created_at: i64,
     updated_at: i64,
     message_count: usize,
+    source_bytes: u64,
     messages: Vec<ImportedTranscriptMessage>,
 }
 
@@ -638,6 +672,7 @@ struct CodexPiece {
     project_path: Option<String>,
     created_at: i64,
     updated_at: i64,
+    source_bytes: u64,
     messages: Vec<ParsedMessage>,
     preview_messages: Vec<PreviewMessage>,
 }
@@ -648,6 +683,7 @@ struct PendingCodexPiece {
     project_path: Option<String>,
     created_at: Option<i64>,
     updated_at: Option<i64>,
+    source_bytes: u64,
     messages: Vec<ParsedMessage>,
 }
 
@@ -663,6 +699,7 @@ impl PendingCodexPiece {
             project_path: self.project_path,
             created_at: self.created_at.unwrap_or(fallback_time),
             updated_at: self.updated_at.unwrap_or(fallback_time),
+            source_bytes: self.source_bytes,
             messages: self.messages,
             preview_messages: Vec::new(),
         })
@@ -676,6 +713,7 @@ struct CodexAccumulator {
     title_hint: Option<(String, i64)>,
     first_user_text: Option<String>,
     message_count: usize,
+    source_bytes: u64,
     messages: Vec<ParsedMessage>,
     seen_messages: HashSet<String>,
 }
@@ -685,6 +723,7 @@ struct ClaudePiece {
     project_path: Option<String>,
     created_at: i64,
     updated_at: i64,
+    source_bytes: u64,
     custom_title: Option<(String, i64)>,
     ai_title: Option<(String, i64)>,
     last_prompt: Option<(String, i64)>,
@@ -697,6 +736,7 @@ struct ClaudeAccumulator {
     project_path: Option<String>,
     created_at: i64,
     updated_at: i64,
+    source_bytes: u64,
     custom_title: Option<(String, i64)>,
     ai_title: Option<(String, i64)>,
     last_prompt: Option<(String, i64)>,
@@ -951,6 +991,7 @@ fn assemble_codex_conversations(
                 title_hint: index_entry.clone(),
                 first_user_text: None,
                 message_count: 0,
+                source_bytes: 0,
                 messages: Vec::new(),
                 seen_messages: HashSet::new(),
             });
@@ -959,6 +1000,7 @@ fn assemble_codex_conversations(
         }
         entry.created_at = min_non_zero(entry.created_at, piece.created_at);
         entry.updated_at = entry.updated_at.max(piece.updated_at);
+        entry.source_bytes = entry.source_bytes.saturating_add(piece.source_bytes);
         if let Some((title, hint_updated_at)) = index_entry {
             let should_replace = entry
                 .title_hint
@@ -1011,18 +1053,25 @@ fn assemble_codex_conversations(
                 .filter(|title| !title.trim().is_empty())
                 .or_else(|| entry.first_user_text.map(|text| compact_title(&text)))
                 .unwrap_or_else(|| "Untitled conversation".to_string());
+            let messages = if include_messages {
+                finalize_messages(native_session_id.as_str(), entry.messages)
+            } else {
+                Vec::new()
+            };
+            let message_count = if include_messages {
+                messages.len()
+            } else {
+                entry.message_count
+            };
             ParsedConversation {
                 native_session_id: native_session_id.clone(),
                 title,
                 project_path: entry.project_path,
                 created_at: entry.created_at,
                 updated_at: entry.updated_at,
-                message_count: entry.message_count,
-                messages: if include_messages {
-                    finalize_messages(native_session_id.as_str(), entry.messages)
-                } else {
-                    Vec::new()
-                },
+                message_count,
+                source_bytes: entry.source_bytes,
+                messages,
             }
         })
         .collect::<Vec<_>>();
@@ -1077,6 +1126,7 @@ fn assemble_claude_conversations(
                 project_path: piece.project_path.clone(),
                 created_at: piece.created_at,
                 updated_at: piece.updated_at,
+                source_bytes: 0,
                 custom_title: None,
                 ai_title: None,
                 last_prompt: None,
@@ -1090,6 +1140,7 @@ fn assemble_claude_conversations(
         }
         entry.created_at = min_non_zero(entry.created_at, piece.created_at);
         entry.updated_at = entry.updated_at.max(piece.updated_at);
+        entry.source_bytes = entry.source_bytes.saturating_add(piece.source_bytes);
         replace_with_latest(&mut entry.custom_title, piece.custom_title);
         replace_with_latest(&mut entry.ai_title, piece.ai_title);
         replace_with_latest(&mut entry.last_prompt, piece.last_prompt);
@@ -1122,18 +1173,25 @@ fn assemble_claude_conversations(
                 .or_else(|| entry.first_user_text.map(|(text, _)| compact_title(&text)))
                 .or_else(|| entry.last_prompt.map(|(text, _)| compact_title(&text)))
                 .unwrap_or_else(|| "Untitled conversation".to_string());
+            let messages = if include_messages {
+                finalize_messages(native_session_id.as_str(), entry.messages)
+            } else {
+                Vec::new()
+            };
+            let message_count = if include_messages {
+                messages.len()
+            } else {
+                entry.message_count
+            };
             ParsedConversation {
                 native_session_id: native_session_id.clone(),
                 title,
                 project_path: entry.project_path,
                 created_at: entry.created_at,
                 updated_at: entry.updated_at,
-                message_count: entry.message_count,
-                messages: if include_messages {
-                    finalize_messages(native_session_id.as_str(), entry.messages)
-                } else {
-                    Vec::new()
-                },
+                message_count,
+                source_bytes: entry.source_bytes,
+                messages,
             }
         })
         .filter(|conversation| conversation.message_count > 0)
@@ -1300,6 +1358,7 @@ fn parse_codex_preview_file(
     let mut project_path = None;
     let mut created_at = None;
     let mut updated_at = None;
+    let mut source_bytes = 0u64;
     let mut preview_messages = Vec::new();
     let mut pending_user_message = None;
     let mut found_session_meta = false;
@@ -1307,6 +1366,10 @@ fn parse_codex_preview_file(
     while let Some((line_number, line)) =
         next_bounded_jsonl_line(&mut reader, path, "Codex history", warnings, budget)
     {
+        let line_bytes = line.len() as u64;
+        if found_session_meta {
+            source_bytes = source_bytes.saturating_add(line_bytes);
+        }
         let line_index = line_number - 1;
         let record =
             match serde_json::from_str::<PreviewCodexRecord>(line.trim_start_matches('\u{feff}')) {
@@ -1358,19 +1421,19 @@ fn parse_codex_preview_file(
                     .and_then(Value::as_object)
                     .is_some_and(|source| source.contains_key("subagent"));
             if is_subagent {
-                continue;
+                return None;
             }
             found_session_meta = true;
+            source_bytes = source_bytes.saturating_add(line_bytes);
             rollout_id = payload
                 .id
                 .as_deref()
                 .filter(|id| !id.trim().is_empty())
                 .map(ToString::to_string);
-            if let Some(id) = payload
-                .session_id
+            if let Some(id) = rollout_id
                 .as_deref()
+                .or(payload.session_id.as_deref())
                 .filter(|id| !id.trim().is_empty())
-                .or(rollout_id.as_deref())
             {
                 native_session_id = id.to_string();
             }
@@ -1427,12 +1490,13 @@ fn parse_codex_preview_file(
         push_pending_codex_preview(&mut preview_messages, pending, false);
     }
 
-    (!preview_messages.is_empty()).then_some(CodexPiece {
+    found_session_meta.then_some(CodexPiece {
         native_session_id,
         rollout_id,
         project_path,
         created_at: created_at.unwrap_or(fallback_time),
         updated_at: updated_at.unwrap_or(fallback_time),
+        source_bytes,
         messages: Vec::new(),
         preview_messages,
     })
@@ -1486,6 +1550,7 @@ fn parse_claude_preview_file(
                 project_path: record.cwd.clone(),
                 created_at: initial_time,
                 updated_at: initial_time,
+                source_bytes: 0,
                 custom_title: None,
                 ai_title: None,
                 last_prompt: None,
@@ -1495,6 +1560,7 @@ fn parse_claude_preview_file(
             });
         entry.created_at = min_non_zero(entry.created_at, initial_time);
         entry.updated_at = entry.updated_at.max(initial_time);
+        entry.source_bytes = entry.source_bytes.saturating_add(line.len() as u64);
         if entry.project_path.is_none() {
             entry.project_path = record.cwd.clone();
         }
@@ -1558,14 +1624,16 @@ fn parse_claude_preview_file(
                     .filter(|attachment| attachment.kind.as_deref() == Some("queued_command"))
                     .and_then(|attachment| attachment.prompt.as_deref())
                     .and_then(normalized_message_text);
-                let role = if queued_prompt.is_some() {
+                let is_internal_context =
+                    queued_prompt.as_deref().is_some_and(is_context_only_prompt);
+                let role = if queued_prompt.is_some() && !is_internal_context {
                     "user"
                 } else {
                     "system"
                 };
                 entry.preview_messages.push(PreviewMessage {
                     dedupe_key: preview_dedupe_key(role, record_time.unwrap_or(0), &line),
-                    user_text: queued_prompt,
+                    user_text: (role == "user").then_some(queued_prompt).flatten(),
                 });
             }
             Some("system") => entry.preview_messages.push(PreviewMessage {
@@ -1606,10 +1674,14 @@ fn parse_codex_file_with_options(
     while let Some((line_number, line)) =
         next_bounded_jsonl_line(&mut reader, path, "Codex history", warnings, budget)
     {
+        let line_bytes = line.len() as u64;
         let line_index = line_number - 1;
         let counted_for_import = current.is_some();
         if counted_for_import && !budget.take_import_bytes(line.len(), warnings) {
             break;
+        }
+        if let Some(current) = current.as_mut() {
+            current.source_bytes = current.source_bytes.saturating_add(line_bytes);
         }
         let raw_record = line.trim_start_matches('\u{feff}');
         let record = match serde_json::from_str::<Value>(raw_record) {
@@ -1649,8 +1721,8 @@ fn parse_codex_file_with_options(
         }
 
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
-            if let Some(piece) = current.take().and_then(|piece| piece.finish(fallback_time)) {
-                pieces.push(piece);
+            if current.is_some() {
+                continue;
             }
             let payload = record.get("payload").unwrap_or(&Value::Null);
             let is_subagent = payload
@@ -1662,22 +1734,21 @@ fn parse_codex_file_with_options(
                     .and_then(Value::as_object)
                     .is_some_and(|source| source.contains_key("subagent"));
             if is_subagent {
-                continue;
+                return Vec::new();
             }
             let rollout_id = payload
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
                 .map(ToString::to_string);
-            let native_session_id = payload
-                .get("session_id")
-                .and_then(Value::as_str)
+            let native_session_id = rollout_id
+                .as_deref()
+                .or_else(|| payload.get("session_id").and_then(Value::as_str))
                 .filter(|id| !id.trim().is_empty())
-                .or(rollout_id.as_deref())
                 .unwrap_or(fallback_id.as_str())
                 .to_string();
             if selected_ids.is_some_and(|ids| !ids.contains(&native_session_id)) {
-                continue;
+                return Vec::new();
             }
             let mut piece = PendingCodexPiece {
                 native_session_id,
@@ -1688,6 +1759,7 @@ fn parse_codex_file_with_options(
                     .map(ToString::to_string),
                 created_at: None,
                 updated_at: None,
+                source_bytes: (!counted_for_import).then_some(line_bytes).unwrap_or(0),
                 messages: Vec::new(),
             };
             piece.observe_time(record_time);
@@ -1740,6 +1812,7 @@ fn parse_codex_file_with_options(
             source_kind: CODEX_SOURCE,
             role,
             is_user_prompt: is_source_user && !is_context,
+            is_api_error: false,
             source_turn_id,
             content,
             parts,
@@ -1860,6 +1933,7 @@ fn parse_claude_file_with_options(
                 project_path: None,
                 created_at: initial_time,
                 updated_at: initial_time,
+                source_bytes: 0,
                 custom_title: None,
                 ai_title: None,
                 last_prompt: None,
@@ -1869,6 +1943,7 @@ fn parse_claude_file_with_options(
             });
         entry.created_at = min_non_zero(entry.created_at, initial_time);
         entry.updated_at = entry.updated_at.max(initial_time);
+        entry.source_bytes = entry.source_bytes.saturating_add(line.len() as u64);
         if entry.project_path.is_none() {
             entry.project_path = record
                 .get("cwd")
@@ -1929,6 +2004,10 @@ fn parse_claude_file_with_options(
                 let is_internal_context = role == "user"
                     && contains_only_text(&parts)
                     && is_context_only_prompt(&content);
+                let is_api_error = record
+                    .get("isApiErrorMessage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let semantic_role = if is_sidechain
                     || is_meta
                     || (role == "user" && is_task_notification)
@@ -1961,6 +2040,7 @@ fn parse_claude_file_with_options(
                         source_kind: CLAUDE_SOURCE,
                         role: semantic_role.to_string(),
                         is_user_prompt: semantic_role == "user",
+                        is_api_error,
                         source_turn_id: (semantic_role == "user")
                             .then(|| source_message_id.clone())
                             .flatten(),
@@ -1989,7 +2069,15 @@ fn parse_claude_file_with_options(
                 else {
                     continue;
                 };
-                if role == "user" {
+                let semantic_role = if role == "user"
+                    && contains_only_text(&parts)
+                    && is_context_only_prompt(&content)
+                {
+                    "system"
+                } else {
+                    role
+                };
+                if semantic_role == "user" {
                     if let Some(text) = first_text_part(&parts) {
                         replace_with_earliest(
                             &mut entry.first_user_text,
@@ -2006,9 +2094,10 @@ fn parse_claude_file_with_options(
                         .map(ToString::to_string);
                     entry.messages.push(ParsedMessage {
                         source_kind: CLAUDE_SOURCE,
-                        role: role.to_string(),
-                        is_user_prompt: role == "user",
-                        source_turn_id: (role == "user")
+                        role: semantic_role.to_string(),
+                        is_user_prompt: semantic_role == "user",
+                        is_api_error: false,
+                        source_turn_id: (semantic_role == "user")
                             .then(|| source_message_id.clone())
                             .flatten(),
                         content,
@@ -2021,11 +2110,11 @@ fn parse_claude_file_with_options(
                 } else {
                     entry.preview_messages.push(PreviewMessage {
                         dedupe_key: preview_dedupe_key(
-                            role,
+                            semantic_role,
                             record_time.unwrap_or(0),
                             line.trim_start_matches('\u{feff}'),
                         ),
-                        user_text: (role == "user")
+                        user_text: (semantic_role == "user")
                             .then(|| first_text_part(&parts).map(ToString::to_string))
                             .flatten(),
                     });
@@ -2057,6 +2146,7 @@ fn parse_claude_file_with_options(
                         source_kind: CLAUDE_SOURCE,
                         role: "system".to_string(),
                         is_user_prompt: false,
+                        is_api_error: false,
                         source_turn_id: None,
                         content,
                         parts,
@@ -2076,6 +2166,7 @@ fn parse_claude_file_with_options(
                     });
                 }
             }
+            Some("queue-operation") | Some("mode") => {}
             Some(kind) => push_warning(
                 warnings,
                 format!(
@@ -2839,20 +2930,29 @@ fn media_part_from_data_url(
         );
         return None;
     }
+    Some(validated_media_part(data_url, media_type, name, alt))
+}
+
+fn validated_media_part(
+    data_url: &str,
+    media_type: &str,
+    name: Option<String>,
+    alt: Option<String>,
+) -> ImportedTranscriptPart {
     if media_type.to_ascii_lowercase().starts_with("image/") {
-        Some(ImportedTranscriptPart::Image {
+        ImportedTranscriptPart::Image {
             data_url: Some(data_url.to_string()),
             asset_id: None,
             alt: alt.or(name),
-        })
+        }
     } else {
-        Some(ImportedTranscriptPart::Attachment {
+        ImportedTranscriptPart::Attachment {
             name,
             media_type: Some(media_type.to_string()),
             data_url: Some(data_url.to_string()),
             asset_id: None,
             url: None,
-        })
+        }
     }
 }
 
@@ -2931,47 +3031,33 @@ fn is_valid_media_type(media_type: &str) -> bool {
 fn sanitize_embedded_data_urls(
     text: &str,
     media: &mut Vec<ImportedTranscriptPart>,
-    warnings: &mut Vec<String>,
-    context: &str,
+    _warnings: &mut Vec<String>,
+    _context: &str,
 ) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut offset = 0;
-    while let Some(relative_start) = text[offset..].find("data:") {
-        let start = offset + relative_start;
-        result.push_str(&text[offset..start]);
-        let Some(relative_comma) = text[start..].find(',') else {
-            result.push_str(&text[start..]);
-            return result;
-        };
-        let comma = start + relative_comma;
-        let header = &text[start..=comma];
-        if !header.to_ascii_lowercase().contains(";base64,") {
-            result.push_str("data:");
-            offset = start + "data:".len();
-            continue;
-        }
-        let payload_start = comma + 1;
-        let payload_len = text[payload_start..]
-            .bytes()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-            .count();
-        let end = payload_start + payload_len;
-        let candidate = &text[start..end];
-        if let Some(part) = media_part_from_data_url(candidate, None, None, warnings, context) {
-            let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
-                "[Image data omitted]"
-            } else {
-                "[Attachment data omitted]"
-            };
-            push_media_part_unique(media, part);
-            result.push_str(placeholder);
-        } else {
-            result.push_str("[Invalid attachment data omitted]");
-        }
-        offset = end.max(payload_start);
+    let candidate = text.trim();
+    if !candidate.starts_with("data:") {
+        return text.to_string();
     }
-    result.push_str(&text[offset..]);
-    result
+    let Some((media_type, payload)) = parse_base64_data_url(candidate) else {
+        return text.to_string();
+    };
+    if validate_base64_payload(payload).is_err() {
+        return text.to_string();
+    }
+    let part = validated_media_part(candidate, media_type, None, None);
+    let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
+        "[Image data omitted]"
+    } else {
+        "[Attachment data omitted]"
+    };
+    push_media_part_unique(media, part);
+    let start = text.find(candidate).unwrap_or(0);
+    format!(
+        "{}{}{}",
+        &text[..start],
+        placeholder,
+        &text[start + candidate.len()..]
+    )
 }
 
 fn push_media_part_unique(media: &mut Vec<ImportedTranscriptPart>, part: ImportedTranscriptPart) {
@@ -3087,6 +3173,7 @@ fn message_dedupe_key(message: &ParsedMessage) -> String {
             message_fingerprint(
                 message.source_kind,
                 &message.role,
+                message.is_api_error,
                 message.timestamp,
                 &message.content,
                 &message.parts,
@@ -3246,6 +3333,7 @@ fn update_parts_fingerprint(hasher: &mut Sha256, parts: &[ImportedTranscriptPart
 fn message_fingerprint(
     source_kind: &str,
     role: &str,
+    is_api_error: bool,
     timestamp: i64,
     content: &str,
     parts: &[ImportedTranscriptPart],
@@ -3253,6 +3341,7 @@ fn message_fingerprint(
     let mut hasher = Sha256::new();
     update_fingerprint_field(&mut hasher, b"source-kind", source_kind.as_bytes());
     update_fingerprint_field(&mut hasher, b"role", role.as_bytes());
+    update_fingerprint_field(&mut hasher, b"is-api-error", &[u8::from(is_api_error)]);
     update_fingerprint_field(&mut hasher, b"timestamp", &timestamp.to_le_bytes());
     if parts.is_empty() {
         update_fingerprint_field(&mut hasher, b"content", content.as_bytes());
@@ -3265,10 +3354,80 @@ fn imported_message_fingerprint(source_kind: &str, message: &ImportedTranscriptM
     message_fingerprint(
         source_kind,
         &message.role,
+        message.is_api_error.unwrap_or(false),
         message.timestamp,
         &message.content,
         &message.parts,
     )
+}
+
+fn replayed_message_fingerprint(message: &ParsedMessage) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    update_fingerprint_field(&mut hasher, b"source-kind", message.source_kind.as_bytes());
+    update_fingerprint_field(&mut hasher, b"role", message.role.as_bytes());
+    update_fingerprint_field(
+        &mut hasher,
+        b"is-user-prompt",
+        &[u8::from(message.is_user_prompt)],
+    );
+    update_fingerprint_field(
+        &mut hasher,
+        b"is-api-error",
+        &[u8::from(message.is_api_error)],
+    );
+    update_fingerprint_field(&mut hasher, b"content", message.content.as_bytes());
+    update_parts_fingerprint(&mut hasher, &message.parts);
+    hasher.finalize().into()
+}
+
+fn replayed_turn_fingerprint(messages: &[ParsedMessage]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    update_fingerprint_field(
+        &mut hasher,
+        b"message-count",
+        &(messages.len() as u64).to_le_bytes(),
+    );
+    for message in messages {
+        update_fingerprint_field(
+            &mut hasher,
+            b"message",
+            &replayed_message_fingerprint(message),
+        );
+    }
+    hasher.finalize().into()
+}
+
+fn append_replay_filtered_turn(
+    turn: Vec<ParsedMessage>,
+    output: &mut Vec<ParsedMessage>,
+    seen_turns: &mut HashSet<(String, [u8; 32])>,
+) {
+    const MAX_REPLAY_TURN_FINGERPRINTS: usize = 50_000;
+    let source_turn_id = turn
+        .iter()
+        .find(|message| message.is_user_prompt)
+        .and_then(|message| message.source_turn_id.as_deref())
+        .map(str::trim)
+        .filter(|turn_id| !turn_id.is_empty());
+    let can_dedupe = source_turn_id.is_some()
+        && turn.iter().any(|message| message.is_user_prompt)
+        && turn.iter().any(|message| !message.is_user_prompt)
+        && turn.iter().all(|message| {
+            message.timestamp > 0
+                && message.source_turn_id.as_deref().map(str::trim) == source_turn_id
+        });
+    if can_dedupe {
+        if let Some(source_turn_id) = source_turn_id {
+            let fingerprint = (source_turn_id.to_string(), replayed_turn_fingerprint(&turn));
+            if seen_turns.contains(&fingerprint) {
+                return;
+            }
+            if seen_turns.len() < MAX_REPLAY_TURN_FINGERPRINTS {
+                seen_turns.insert(fingerprint);
+            }
+        }
+    }
+    output.extend(turn);
 }
 
 fn align_imported_message_ids(
@@ -3305,28 +3464,69 @@ fn finalize_messages(
     native_session_id: &str,
     mut messages: Vec<ParsedMessage>,
 ) -> Vec<ImportedTranscriptMessage> {
+    const MAX_REPLAY_SOURCE_IDENTITIES: usize = 50_000;
     messages.sort_by(|a, b| {
         a.timestamp
             .cmp(&b.timestamp)
             .then_with(|| a.source_path.cmp(&b.source_path))
             .then_with(|| a.line_number.cmp(&b.line_number))
     });
-    let mut occurrences: HashMap<String, usize> = HashMap::new();
     let mut active_turn_id: Option<String> = None;
-    messages
-        .into_iter()
-        .map(|mut message| {
-            if message.is_user_prompt {
-                let turn_id = message
-                    .source_turn_id
-                    .clone()
-                    .or_else(|| message.source_message_id.clone())
-                    .unwrap_or_else(|| message_dedupe_key(&message));
-                message.source_turn_id = Some(turn_id.clone());
-                active_turn_id = Some(turn_id);
-            } else if message.source_turn_id.is_none() {
-                message.source_turn_id = active_turn_id.clone();
+    for message in &mut messages {
+        if message.is_user_prompt {
+            active_turn_id = message.source_turn_id.clone();
+        } else if message.source_turn_id.is_none() {
+            message.source_turn_id = active_turn_id.clone();
+        }
+    }
+    let mut message_deduped = Vec::with_capacity(messages.len());
+    let mut replay_scope: Option<String> = None;
+    let mut seen_source_ids = HashSet::new();
+    for message in messages {
+        if message.is_user_prompt {
+            replay_scope = message.source_turn_id.clone();
+            seen_source_ids.clear();
+            message_deduped.push(message);
+            continue;
+        }
+        if message.source_turn_id != replay_scope {
+            replay_scope = message.source_turn_id.clone();
+            seen_source_ids.clear();
+        }
+        if let Some(source_message_id) = message.source_message_id.as_ref() {
+            let source_identity = (
+                source_message_id.clone(),
+                replayed_message_fingerprint(&message),
+            );
+            if seen_source_ids.contains(&source_identity) {
+                continue;
             }
+            if seen_source_ids.len() < MAX_REPLAY_SOURCE_IDENTITIES {
+                seen_source_ids.insert(source_identity);
+            }
+        }
+        message_deduped.push(message);
+    }
+
+    let mut replay_filtered = Vec::with_capacity(message_deduped.len());
+    let mut current_turn = Vec::new();
+    let mut seen_turns = HashSet::new();
+    for message in message_deduped {
+        if message.is_user_prompt && !current_turn.is_empty() {
+            append_replay_filtered_turn(
+                std::mem::take(&mut current_turn),
+                &mut replay_filtered,
+                &mut seen_turns,
+            );
+        }
+        current_turn.push(message);
+    }
+    append_replay_filtered_turn(current_turn, &mut replay_filtered, &mut seen_turns);
+
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    replay_filtered
+        .into_iter()
+        .map(|message| {
             let fingerprint = message_dedupe_key(&message);
             let occurrence = occurrences.entry(fingerprint.clone()).or_default();
             let id = if *occurrence == 0 {
@@ -3339,6 +3539,7 @@ fn finalize_messages(
                 id,
                 role: message.role,
                 is_user_prompt: Some(message.is_user_prompt),
+                is_api_error: message.is_api_error.then_some(true),
                 source_turn_id: message.source_turn_id,
                 content: message.content,
                 parts: message.parts,
@@ -3401,6 +3602,7 @@ fn to_preview(source: &str, conversation: &ParsedConversation) -> ExternalSessio
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
         message_count: conversation.message_count,
+        source_bytes: conversation.source_bytes,
     }
 }
 
@@ -5243,6 +5445,7 @@ fn is_context_only_prompt(text: &str) -> bool {
         || normalized.starts_with("<local-command-caveat")
         || normalized.starts_with("<local-command-name")
         || normalized.starts_with("<local-command-stdout")
+        || normalized.starts_with("<command-name")
         || normalized.starts_with("<task-notification>")
 }
 
@@ -5300,6 +5503,7 @@ mod tests {
                 id: format!("{id}:0"),
                 role: "user".to_string(),
                 is_user_prompt: None,
+                is_api_error: None,
                 source_turn_id: None,
                 content: "inspect this image".to_string(),
                 parts: vec![
@@ -5541,11 +5745,22 @@ mod tests {
                     "commandMode": "task-notification"
                 }
             }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "attachment",
+                "uuid": "notification-uuid",
+                "sessionId": "attachment-session",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": "<task-notification>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>",
+                    "commandMode": "task-notification"
+                }
+            }),
         ]);
 
         let pieces = parse_claude_file(&path);
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].messages.len(), 4);
+        assert_eq!(pieces[0].messages.len(), 5);
         assert_eq!(pieces[0].messages[0].role, "system");
         assert_eq!(
             pieces[0].messages[0].source_message_id.as_deref(),
@@ -5584,6 +5799,13 @@ mod tests {
         assert!(matches!(
             &pieces[0].messages[3].parts[0],
             ImportedTranscriptPart::Text { text } if text == "sent while the tool was running"
+        ));
+        assert_eq!(pieces[0].messages[4].role, "system");
+        assert!(!pieces[0].messages[4].is_user_prompt);
+        assert_eq!(pieces[0].messages[4].source_turn_id, None);
+        assert!(matches!(
+            &pieces[0].messages[4].parts[0],
+            ImportedTranscriptPart::Text { text } if text.starts_with("<task-notification>")
         ));
 
         let directory = test_store_directory("claude-top-level-attachments");
@@ -5632,15 +5854,92 @@ mod tests {
                 "isSidechain": true,
                 "message": { "content": "sidechain context" }
             }),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "user",
+                "uuid": "command-uuid",
+                "sessionId": "meta-session",
+                "message": {
+                    "content": "<command-name>/review</command-name>\n<command-message>review</command-message>"
+                }
+            }),
         ]);
 
         let pieces = parse_claude_file(&path);
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].messages.len(), 2);
+        assert_eq!(pieces[0].messages.len(), 3);
         assert!(pieces[0]
             .messages
             .iter()
             .all(|message| message.role == "system"));
+        assert!(pieces[0]
+            .messages
+            .iter()
+            .all(|message| !message.is_user_prompt));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn skips_claude_queue_and_mode_metadata_without_import_warnings() {
+        let records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "queue-operation",
+                "sessionId": "queue-session",
+                "operation": "enqueue"
+            }),
+            json!({
+                "type": "mode",
+                "mode": "normal",
+                "sessionId": "queue-session"
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "user",
+                "uuid": "user-message",
+                "sessionId": "queue-session",
+                "message": { "content": "real request" }
+            }),
+        ];
+        let expected_source_bytes = records
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
+        let mut warnings = Vec::new();
+        let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+
+        let pieces = parse_claude_file_with_options(&path, true, None, &mut warnings, &mut budget);
+
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].messages.len(), 1);
+        assert_eq!(pieces[0].messages[0].content, "real request");
+        assert_eq!(pieces[0].source_bytes, expected_source_bytes);
+        assert!(warnings.is_empty());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn preserves_claude_api_error_messages_as_non_reply_assistant_events() {
+        let path = write_test_jsonl(vec![json!({
+            "timestamp": "2026-07-13T00:00:00Z",
+            "type": "assistant",
+            "uuid": "api-error-uuid",
+            "sessionId": "api-error-session",
+            "isApiErrorMessage": true,
+            "message": { "content": "API Error: overloaded_error" }
+        })]);
+
+        let mut pieces = parse_claude_file(&path);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].messages.len(), 1);
+        assert_eq!(pieces[0].messages[0].role, "assistant");
+        assert!(!pieces[0].messages[0].is_user_prompt);
+        assert!(pieces[0].messages[0].is_api_error);
+        assert_eq!(pieces[0].messages[0].content, "API Error: overloaded_error");
+        let imported = finalize_messages("api-error-session", pieces.remove(0).messages);
+        assert_eq!(imported[0].role, "assistant");
+        assert_eq!(imported[0].is_api_error, Some(true));
         fs::remove_file(path).ok();
     }
 
@@ -5673,7 +5972,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_embedded_images_from_text_and_tool_input() {
+    fn preserves_data_url_examples_in_text_but_extracts_structured_tool_values() {
         let message = json!({
             "type": "message",
             "role": "user",
@@ -5693,12 +5992,9 @@ mod tests {
         assert!(matches!(
             &message_parts[0],
             ImportedTranscriptPart::Text { text }
-                if text == "before [Image data omitted] after"
+                if text == "before data:image/png;base64,aGVsbG8= after"
         ));
-        assert!(matches!(
-            message_parts[1],
-            ImportedTranscriptPart::Image { .. }
-        ));
+        assert_eq!(message_parts.len(), 1);
 
         let (_, _, call_parts) = extract_codex_message(&call).expect("tool call");
         assert!(matches!(
@@ -5710,6 +6006,76 @@ mod tests {
             call_parts[1],
             ImportedTranscriptPart::Image { .. }
         ));
+    }
+
+    #[test]
+    fn preserves_source_regex_and_truncated_data_url_text_without_attachment_warnings() {
+        let source_text = concat!(
+            "let url = format!(\"data:image/png;base64,{data}\");\n",
+            "let pattern = r\"data:image\\/[^;]+;base64,\";\n",
+            "preview=data:image/png;base64,abc...tokens truncated..."
+        );
+        let message = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": source_text }]
+        });
+        let mut warnings = Vec::new();
+
+        let (_, content, parts) =
+            extract_codex_message_with_warnings(&message, &mut warnings, "tool output")
+                .expect("message");
+
+        assert_eq!(content, source_text);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            ImportedTranscriptPart::Text { text } if text == source_text
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn preserves_mixed_and_truncated_data_url_text_in_custom_tool_records_without_warnings() {
+        let mixed = "prefix data:image/png;base64,aGVsbG8= suffix";
+        let truncated = "data:image/png;base64,abc...tokens truncated...";
+        let call = json!({
+            "type": "custom_tool_call",
+            "call_id": "custom-call",
+            "name": "inspect",
+            "input": {
+                "mixed": mixed,
+                "truncated": truncated
+            }
+        });
+        let output = json!({
+            "type": "custom_tool_call_output",
+            "call_id": "custom-call",
+            "output": {
+                "mixed": mixed,
+                "truncated": truncated
+            }
+        });
+        let mut warnings = Vec::new();
+
+        let (_, _, call_parts) =
+            extract_codex_message_with_warnings(&call, &mut warnings, "custom tool call")
+                .expect("custom tool call");
+        let (_, _, output_parts) =
+            extract_codex_message_with_warnings(&output, &mut warnings, "custom tool output")
+                .expect("custom tool output");
+
+        assert!(matches!(
+            &call_parts[..],
+            [ImportedTranscriptPart::ToolCall { input, .. }]
+                if input == &json!({ "mixed": mixed, "truncated": truncated })
+        ));
+        assert!(matches!(
+            &output_parts[..],
+            [ImportedTranscriptPart::ToolResult { output, .. }]
+                if output == &json!({ "mixed": mixed, "truncated": truncated })
+        ));
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -5864,6 +6230,9 @@ mod tests {
         assert!(is_context_only_prompt(
             "<codex_internal_context source=\"goal\">hidden</codex_internal_context>"
         ));
+        assert!(is_context_only_prompt(
+            "<command-name>/review</command-name>\n<command-message>review</command-message>"
+        ));
     }
 
     #[test]
@@ -5879,6 +6248,7 @@ mod tests {
         assert_eq!(message.content, "old message");
         assert!(message.parts.is_empty());
         assert_eq!(message.is_user_prompt, None);
+        assert_eq!(message.is_api_error, None);
         assert_eq!(message.source_turn_id, None);
     }
 
@@ -5889,6 +6259,7 @@ mod tests {
                 source_kind: CLAUDE_SOURCE,
                 role: "assistant".to_string(),
                 is_user_prompt: false,
+                is_api_error: false,
                 source_turn_id: None,
                 content: "second".to_string(),
                 parts: vec![ImportedTranscriptPart::Text {
@@ -5903,6 +6274,7 @@ mod tests {
                 source_kind: CLAUDE_SOURCE,
                 role: "user".to_string(),
                 is_user_prompt: true,
+                is_api_error: false,
                 source_turn_id: Some("first-turn".to_string()),
                 content: "first".to_string(),
                 parts: vec![ImportedTranscriptPart::Text {
@@ -5921,11 +6293,363 @@ mod tests {
     }
 
     #[test]
+    fn preserves_equal_non_user_messages_when_stable_source_ids_differ() {
+        let parsed = |role: &str, prompt: bool, turn: &str, text: &str, at: i64| ParsedMessage {
+            source_kind: CODEX_SOURCE,
+            role: role.to_string(),
+            is_user_prompt: prompt,
+            is_api_error: false,
+            source_turn_id: Some(turn.to_string()),
+            content: text.to_string(),
+            parts: vec![ImportedTranscriptPart::Text {
+                text: text.to_string(),
+            }],
+            timestamp: at,
+            source_message_id: Some(format!("{role}-{at}")),
+            source_path: "history.jsonl".to_string(),
+            line_number: at as usize,
+        };
+        let messages = vec![
+            parsed("system", false, "turn-a", "policy", 10),
+            parsed("system", false, "turn-a", "policy", 20),
+            parsed("assistant", false, "turn-a", "Done", 30),
+            parsed("assistant", false, "turn-a", "Done", 40),
+            parsed("assistant", false, "turn-b", "Done", 50),
+            parsed("user", true, "turn-c", "Retry", 60),
+            parsed("user", true, "turn-d", "Retry", 70),
+        ];
+
+        let result = finalize_messages("session", messages);
+        let count = |text: &str| {
+            result
+                .iter()
+                .filter(|message| message.content == text)
+                .count()
+        };
+        assert_eq!(count("policy"), 2);
+        assert_eq!(count("Done"), 3);
+        assert_eq!(count("Retry"), 2);
+    }
+
+    #[test]
+    fn deduplicates_a_replayed_stable_turn_without_deleting_legitimate_repeats() {
+        let parsed = |role: &str, prompt: bool, turn: &str, text: &str, at: i64| ParsedMessage {
+            source_kind: CLAUDE_SOURCE,
+            role: role.to_string(),
+            is_user_prompt: prompt,
+            is_api_error: false,
+            source_turn_id: Some(turn.to_string()),
+            content: text.to_string(),
+            parts: vec![ImportedTranscriptPart::Text {
+                text: text.to_string(),
+            }],
+            timestamp: at,
+            source_message_id: Some(format!("{turn}-{role}-{at}")),
+            source_path: "history.jsonl".to_string(),
+            line_number: at as usize,
+        };
+        let result = finalize_messages(
+            "session",
+            vec![
+                parsed("user", true, "turn-a", "Retry", 10),
+                parsed("assistant", false, "turn-a", "Done", 20),
+                parsed("user", true, "turn-a", "Retry", 30),
+                parsed("assistant", false, "turn-a", "Done", 40),
+                parsed("user", true, "turn-c", "Retry", 50),
+                parsed("assistant", false, "turn-c", "Done", 60),
+                parsed("user", true, "turn-d", "Retry", 70),
+                parsed("assistant", false, "turn-d", "Different", 80),
+            ],
+        );
+
+        let count = |text: &str| {
+            result
+                .iter()
+                .filter(|message| message.content == text)
+                .count()
+        };
+        assert_eq!(count("Retry"), 3);
+        assert_eq!(count("Done"), 2);
+        assert_eq!(count("Different"), 1);
+    }
+
+    #[test]
+    fn preserves_changed_tool_payloads_that_reuse_a_source_message_id() {
+        let parsed = |tool_call_id: &str, path: &str, timestamp: i64| ParsedMessage {
+            source_kind: CLAUDE_SOURCE,
+            role: "assistant".to_string(),
+            is_user_prompt: false,
+            is_api_error: false,
+            source_turn_id: Some("turn-a".to_string()),
+            content: "[Tool call: Read]".to_string(),
+            parts: vec![ImportedTranscriptPart::ToolCall {
+                tool_call_id: Some(tool_call_id.to_string()),
+                name: "Read".to_string(),
+                input: json!({"path": path}),
+            }],
+            timestamp,
+            source_message_id: Some("same-source-message".to_string()),
+            source_path: "history.jsonl".to_string(),
+            line_number: timestamp as usize,
+        };
+
+        let result = finalize_messages(
+            "session",
+            vec![parsed("call-1", "a", 10), parsed("call-2", "b", 20)],
+        );
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(
+            &result[0].parts[0],
+            ImportedTranscriptPart::ToolCall { tool_call_id, input, .. }
+                if tool_call_id.as_deref() == Some("call-1") && input == &json!({"path": "a"})
+        ));
+        assert!(matches!(
+            &result[1].parts[0],
+            ImportedTranscriptPart::ToolCall { tool_call_id, input, .. }
+                if tool_call_id.as_deref() == Some("call-2") && input == &json!({"path": "b"})
+        ));
+    }
+
+    #[test]
+    fn preserves_equal_timestamp_free_messages_without_reliable_replay_evidence() {
+        let parsed =
+            |role: &str, prompt: bool, source_id: &str, line_number: usize| ParsedMessage {
+                source_kind: CLAUDE_SOURCE,
+                role: role.to_string(),
+                is_user_prompt: prompt,
+                is_api_error: false,
+                source_turn_id: Some("turn-a".to_string()),
+                content: if prompt { "Retry" } else { "Same answer" }.to_string(),
+                parts: vec![ImportedTranscriptPart::Text {
+                    text: if prompt { "Retry" } else { "Same answer" }.to_string(),
+                }],
+                timestamp: 0,
+                source_message_id: Some(source_id.to_string()),
+                source_path: "history.jsonl".to_string(),
+                line_number,
+            };
+        let result = finalize_messages(
+            "session",
+            vec![
+                parsed("user", true, "user", 1),
+                parsed("assistant", false, "answer-a", 2),
+                parsed("assistant", false, "answer-b", 3),
+            ],
+        );
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "Same answer")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn deduplicates_tool_rich_replays_only_for_the_same_stable_turn() {
+        let tool_turn = |prefix: &str, turn: &str, tool_call_id: &str, at: i64| {
+            vec![
+                ParsedMessage {
+                    source_kind: CLAUDE_SOURCE,
+                    role: "user".to_string(),
+                    is_user_prompt: true,
+                    is_api_error: false,
+                    source_turn_id: Some(turn.to_string()),
+                    content: "Read the file".to_string(),
+                    parts: vec![ImportedTranscriptPart::Text {
+                        text: "Read the file".to_string(),
+                    }],
+                    timestamp: at,
+                    source_message_id: Some(format!("{prefix}-user")),
+                    source_path: "history.jsonl".to_string(),
+                    line_number: at as usize,
+                },
+                ParsedMessage {
+                    source_kind: CLAUDE_SOURCE,
+                    role: "assistant".to_string(),
+                    is_user_prompt: false,
+                    is_api_error: false,
+                    source_turn_id: Some(turn.to_string()),
+                    content: "[Tool call: Read]".to_string(),
+                    parts: vec![ImportedTranscriptPart::ToolCall {
+                        tool_call_id: Some(tool_call_id.to_string()),
+                        name: "Read".to_string(),
+                        input: json!({"path": "a"}),
+                    }],
+                    timestamp: at + 1,
+                    source_message_id: Some(format!("{prefix}-call")),
+                    source_path: "history.jsonl".to_string(),
+                    line_number: (at + 1) as usize,
+                },
+                ParsedMessage {
+                    source_kind: CLAUDE_SOURCE,
+                    role: "tool".to_string(),
+                    is_user_prompt: false,
+                    is_api_error: false,
+                    source_turn_id: Some(turn.to_string()),
+                    content: "[Tool result]".to_string(),
+                    parts: vec![ImportedTranscriptPart::ToolResult {
+                        tool_call_id: Some(tool_call_id.to_string()),
+                        output: json!("done"),
+                        is_error: false,
+                    }],
+                    timestamp: at + 2,
+                    source_message_id: Some(format!("{prefix}-result")),
+                    source_path: "history.jsonl".to_string(),
+                    line_number: (at + 2) as usize,
+                },
+            ]
+        };
+        let result = finalize_messages(
+            "session",
+            [
+                tool_turn("original", "turn-a", "call-1", 10),
+                tool_turn("replay", "turn-a", "call-1", 20),
+                tool_turn("legitimate", "turn-b", "call-2", 30),
+            ]
+            .concat(),
+        );
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.is_user_prompt == Some(true))
+                .count(),
+            2
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "[Tool call: Read]")
+                .count(),
+            2
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "[Tool result]")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn preserves_equal_untimestamped_replies_that_cannot_be_assigned_to_a_turn() {
+        let parsed = |role: &str, prompt: bool, text: &str, timestamp: i64, line_number: usize| {
+            ParsedMessage {
+                source_kind: CLAUDE_SOURCE,
+                role: role.to_string(),
+                is_user_prompt: prompt,
+                is_api_error: false,
+                source_turn_id: None,
+                content: text.to_string(),
+                parts: vec![ImportedTranscriptPart::Text {
+                    text: text.to_string(),
+                }],
+                timestamp,
+                source_message_id: prompt.then(|| format!("prompt-{line_number}")),
+                source_path: "history.jsonl".to_string(),
+                line_number,
+            }
+        };
+        let result = finalize_messages(
+            "session",
+            vec![
+                parsed("user", true, "First", 10, 1),
+                parsed("assistant", false, "Same reply", 0, 2),
+                parsed("user", true, "Second", 20, 3),
+                parsed("assistant", false, "Same reply", 0, 4),
+            ],
+        );
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "Same reply")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn keeps_distinct_tool_calls_while_deduplicating_replayed_thinking() {
+        let parsed = |source_id: &str,
+                      timestamp: i64,
+                      content: &str,
+                      parts: Vec<ImportedTranscriptPart>| ParsedMessage {
+            source_kind: CLAUDE_SOURCE,
+            role: "assistant".to_string(),
+            is_user_prompt: false,
+            is_api_error: false,
+            source_turn_id: Some("turn-a".to_string()),
+            content: content.to_string(),
+            parts,
+            timestamp,
+            source_message_id: Some(source_id.to_string()),
+            source_path: "history.jsonl".to_string(),
+            line_number: timestamp as usize,
+        };
+        let messages = vec![
+            parsed(
+                "thinking-1",
+                10,
+                "[thinking]",
+                vec![ImportedTranscriptPart::Event {
+                    kind: "thinking".to_string(),
+                    data: Value::Null,
+                }],
+            ),
+            parsed(
+                "thinking-1",
+                20,
+                "[thinking]",
+                vec![ImportedTranscriptPart::Event {
+                    kind: "thinking".to_string(),
+                    data: Value::Null,
+                }],
+            ),
+            parsed(
+                "tool-1",
+                30,
+                "[Tool call: Read]",
+                vec![ImportedTranscriptPart::ToolCall {
+                    tool_call_id: Some("call-1".to_string()),
+                    name: "Read".to_string(),
+                    input: json!({"path": "a"}),
+                }],
+            ),
+            parsed(
+                "tool-2",
+                40,
+                "[Tool call: Read]",
+                vec![ImportedTranscriptPart::ToolCall {
+                    tool_call_id: Some("call-2".to_string()),
+                    name: "Read".to_string(),
+                    input: json!({"path": "a"}),
+                }],
+            ),
+        ];
+
+        let result = finalize_messages("session", messages);
+        let count = |text: &str| {
+            result
+                .iter()
+                .filter(|message| message.content == text)
+                .count()
+        };
+        assert_eq!(count("[thinking]"), 1);
+        assert_eq!(count("[Tool call: Read]"), 2);
+    }
+
+    #[test]
     fn stable_message_ids_do_not_shift_after_middle_insertion() {
         let parsed = |content: &str, timestamp: i64| ParsedMessage {
             source_kind: CODEX_SOURCE,
             role: "assistant".to_string(),
             is_user_prompt: false,
+            is_api_error: false,
             source_turn_id: None,
             content: content.to_string(),
             parts: vec![ImportedTranscriptPart::Text {
@@ -6006,29 +6730,39 @@ mod tests {
     }
 
     #[test]
-    fn separates_codex_messages_when_session_metadata_changes() {
-        let path = write_test_jsonl(vec![
+    fn keeps_codex_file_owned_by_its_first_rollout_metadata() {
+        let records = vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "session_meta",
-                "payload": { "session_id": "first", "id": "first-rollout", "cwd": "C:/one" }
+                "payload": {
+                    "id": "owner-rollout",
+                    "session_id": "ancestor-session",
+                    "thread_source": "user",
+                    "cwd": "C:/owner"
+                }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:01Z",
                 "type": "response_item",
-                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "first request" }] }
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "owner request" }] }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:02Z",
                 "type": "session_meta",
-                "payload": { "session_id": "second", "id": "second-rollout", "cwd": "C:/two" }
+                "payload": { "session_id": "ancestor-session", "id": "ancestor-rollout", "cwd": "C:/ancestor" }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:03Z",
                 "type": "response_item",
-                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "second answer" }] }
+                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "owner answer" }] }
             }),
-        ]);
+        ];
+        let expected_source_bytes = records
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
 
         let pieces = parse_codex_file_with_options(
             &path,
@@ -6037,13 +6771,152 @@ mod tests {
             &mut Vec::new(),
             &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
         );
-        assert_eq!(pieces.len(), 2);
-        assert_eq!(pieces[0].native_session_id, "first");
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].native_session_id, "owner-rollout");
+        assert_eq!(pieces[0].rollout_id.as_deref(), Some("owner-rollout"));
+        assert_eq!(pieces[0].project_path.as_deref(), Some("C:/owner"));
+        assert_eq!(pieces[0].source_bytes, expected_source_bytes);
+        assert_eq!(pieces[0].messages.len(), 2);
+        assert_eq!(pieces[0].messages[0].content, "owner request");
+        assert_eq!(pieces[0].messages[1].content, "owner answer");
+
+        let selected_ancestor = HashSet::from(["ancestor-rollout".to_string()]);
+        assert!(parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_ancestor),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_empty());
+
+        let preview = parse_codex_preview_file(
+            &path,
+            "fallback".to_string(),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .expect("owner preview");
+        assert_eq!(preview.native_session_id, "owner-rollout");
+        assert_eq!(preview.rollout_id.as_deref(), Some("owner-rollout"));
+        assert_eq!(preview.project_path.as_deref(), Some("C:/owner"));
+        assert_eq!(preview.source_bytes, expected_source_bytes);
+        assert_eq!(preview.preview_messages.len(), 2);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn selected_codex_import_only_charges_bytes_consumed_from_unselected_files() {
+        let directory = test_store_directory("selected-codex-read-budget");
+        let unselected_path = directory.join("unselected.jsonl");
+        let selected_path = directory.join("selected.jsonl");
+        let unselected_meta = json!({
+            "timestamp": "2026-07-13T00:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "unselected", "session_id": "unselected" }
+        })
+        .to_string();
+        let unselected_contents = format!("{unselected_meta}\n{}", "x".repeat(2048));
+        fs::write(&unselected_path, &unselected_contents).expect("unselected Codex history");
+
+        let selected_contents = [
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "session_meta",
+                "payload": { "id": "selected", "session_id": "selected" }
+            })
+            .to_string(),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "selected request" }]
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&selected_path, &selected_contents).expect("selected Codex history");
+
+        let limits = HistoryScanLimits {
+            max_file_bytes: 4096,
+            max_total_bytes: 1024,
+            ..HISTORY_SCAN_LIMITS
+        };
+        assert!(unselected_contents.len() as u64 > limits.max_total_bytes);
+        let selected_ids = HashSet::from(["selected".to_string()]);
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+
+        assert!(parse_codex_file_with_options(
+            &unselected_path,
+            "unselected-fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        )
+        .is_empty());
+        assert_eq!(budget.total_bytes, unselected_meta.len() as u64 + 1);
+        assert!(!budget.incomplete);
+
+        let pieces = parse_codex_file_with_options(
+            &selected_path,
+            "selected-fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        );
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].native_session_id, "selected");
         assert_eq!(pieces[0].messages.len(), 1);
-        assert_eq!(pieces[0].messages[0].content, "first request");
-        assert_eq!(pieces[1].native_session_id, "second");
-        assert_eq!(pieces[1].messages.len(), 1);
-        assert_eq!(pieces[1].messages[0].content, "second answer");
+        assert_eq!(
+            budget.total_bytes,
+            unselected_meta.len() as u64 + 1 + selected_contents.len() as u64
+        );
+        assert!(!budget.incomplete);
+        assert!(warnings.is_empty());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn selected_codex_import_accepts_legacy_session_id_only_owner() {
+        let path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "legacy-owner", "cwd": "C:/legacy" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "legacy request" }]
+                }
+            }),
+        ]);
+        let selected_ids = HashSet::from(["legacy-owner".to_string()]);
+        let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+        let mut warnings = Vec::new();
+
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        );
+
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].native_session_id, "legacy-owner");
+        assert_eq!(pieces[0].rollout_id, None);
+        assert_eq!(pieces[0].project_path.as_deref(), Some("C:/legacy"));
+        assert_eq!(pieces[0].messages.len(), 1);
+        assert!(!budget.incomplete);
+        assert!(warnings.is_empty());
         fs::remove_file(path).ok();
     }
 
@@ -6088,12 +6961,16 @@ mod tests {
     }
 
     #[test]
-    fn skips_subagent_metadata_without_discarding_later_user_session() {
+    fn skips_entire_codex_subagent_file_with_embedded_parent_snapshot() {
         let path = write_test_jsonl(vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "session_meta",
-                "payload": { "session_id": "child", "source": { "subagent": { "other": "test" } } }
+                "payload": {
+                    "id": "child-rollout",
+                    "session_id": "parent-rollout",
+                    "source": { "subagent": { "other": "test" } }
+                }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:01Z",
@@ -6103,7 +6980,7 @@ mod tests {
             json!({
                 "timestamp": "2026-07-13T00:00:02Z",
                 "type": "session_meta",
-                "payload": { "session_id": "parent", "thread_source": "user" }
+                "payload": { "session_id": "parent-rollout", "id": "parent-rollout", "thread_source": "user" }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:03Z",
@@ -6112,17 +6989,36 @@ mod tests {
             }),
         ]);
 
-        let piece = parse_codex_file(&path, "fallback".to_string())
-            .expect("later user session should be parsed");
-        assert_eq!(piece.native_session_id, "parent");
-        assert_eq!(piece.messages.len(), 1);
-        assert_eq!(piece.messages[0].content, "real request");
+        assert!(parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            None,
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_empty());
+        assert!(parse_codex_preview_file(
+            &path,
+            "fallback".to_string(),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_none());
+        let selected_parent = HashSet::from(["parent-rollout".to_string()]);
+        assert!(parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_parent),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_empty());
         fs::remove_file(path).ok();
     }
 
     #[test]
     fn preview_parser_keeps_only_lightweight_codex_message_metadata() {
-        let path = write_test_jsonl(vec![
+        let records = vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "session_meta",
@@ -6140,7 +7036,12 @@ mod tests {
                     ]
                 }
             }),
-        ]);
+        ];
+        let expected_source_bytes = records
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
         let mut warnings = Vec::new();
 
         let piece = parse_codex_preview_file(
@@ -6155,6 +7056,179 @@ mod tests {
         assert_eq!(
             piece.preview_messages[0].user_text.as_deref(),
             Some("inspect this")
+        );
+        assert_eq!(piece.source_bytes, expected_source_bytes);
+        let conversation = assemble_codex_conversations(vec![piece], &HashMap::new(), false)
+            .into_iter()
+            .next()
+            .expect("assembled preview");
+        let preview = to_preview(CODEX_SOURCE, &conversation);
+        assert_eq!(preview.source_bytes, expected_source_bytes);
+        assert_eq!(
+            serde_json::to_value(preview).expect("serialized preview")["sourceBytes"],
+            expected_source_bytes
+        );
+        assert!(warnings.is_empty());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn codex_preview_counts_event_only_pieces_for_visible_sessions() {
+        let visible_records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "shared", "cwd": "C:/one" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "visible request" }]
+                }
+            }),
+        ];
+        let duplicate_records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "session_meta",
+                "payload": { "session_id": "shared", "cwd": "C:/one" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "token_count", "info": { "total_token_usage": 10 } }
+            }),
+        ];
+        let empty_records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:04Z",
+                "type": "session_meta",
+                "payload": { "session_id": "empty", "cwd": "C:/two" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:05Z",
+                "type": "event_msg",
+                "payload": { "type": "token_count", "info": { "total_token_usage": 20 } }
+            }),
+        ];
+        let expected_source_bytes = visible_records
+            .iter()
+            .chain(&duplicate_records)
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let visible_path = write_test_jsonl(visible_records);
+        let duplicate_path = write_test_jsonl(duplicate_records);
+        let empty_path = write_test_jsonl(empty_records);
+        let mut warnings = Vec::new();
+        let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+
+        let pieces = [
+            (&visible_path, "visible-fallback"),
+            (&duplicate_path, "duplicate-fallback"),
+            (&empty_path, "empty-fallback"),
+        ]
+        .into_iter()
+        .map(|(path, fallback_id)| {
+            parse_codex_preview_file(path, fallback_id.to_string(), &mut warnings, &mut budget)
+                .expect("session metadata should produce a preview piece")
+        })
+        .collect::<Vec<_>>();
+
+        let conversations = assemble_codex_conversations(pieces, &HashMap::new(), false);
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].native_session_id, "shared");
+        assert_eq!(conversations[0].message_count, 1);
+        assert_eq!(conversations[0].source_bytes, expected_source_bytes);
+        assert!(warnings.is_empty());
+
+        fs::remove_file(visible_path).ok();
+        fs::remove_file(duplicate_path).ok();
+        fs::remove_file(empty_path).ok();
+    }
+
+    #[test]
+    fn claude_preview_reports_per_session_source_bytes_and_ignores_internal_queue_prompts() {
+        let internal_prompt = "<task-notification><status>completed</status></task-notification>";
+        let records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "queue-operation",
+                "sessionId": "alpha"
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "user",
+                "sessionId": "alpha",
+                "message": { "content": "alpha request" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "attachment",
+                "sessionId": "beta",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": internal_prompt,
+                    "commandMode": "task-notification"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "user",
+                "sessionId": "beta",
+                "message": {
+                    "content": "<command-name>/review</command-name>\n<command-message>review</command-message>"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:04Z",
+                "type": "assistant",
+                "sessionId": "beta",
+                "message": { "content": "background complete" }
+            }),
+        ];
+        let expected_alpha_bytes = records[..2]
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let expected_beta_bytes = records[2..]
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
+        let mut warnings = Vec::new();
+
+        let pieces = parse_claude_preview_file(
+            &path,
+            &mut warnings,
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        );
+        let beta_piece = pieces
+            .iter()
+            .find(|piece| piece.native_session_id == "beta")
+            .expect("beta preview piece");
+        assert_eq!(beta_piece.first_user_text, None);
+        assert!(beta_piece
+            .preview_messages
+            .iter()
+            .all(|message| message.user_text.is_none()));
+
+        let previews = assemble_claude_conversations(pieces, false)
+            .into_iter()
+            .map(|conversation| {
+                let preview = to_preview(CLAUDE_SOURCE, &conversation);
+                (preview.native_session_id.clone(), preview)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(previews["alpha"].source_bytes, expected_alpha_bytes);
+        assert_eq!(previews["beta"].source_bytes, expected_beta_bytes);
+        assert_eq!(previews["beta"].title, "Untitled conversation");
+        assert_eq!(
+            serde_json::to_value(&previews["beta"]).expect("serialized preview")["sourceBytes"]
+                .as_u64(),
+            Some(expected_beta_bytes)
         );
         assert!(warnings.is_empty());
         fs::remove_file(path).ok();
@@ -6215,11 +7289,13 @@ mod tests {
             .expect("first line");
         assert_eq!(first.0, b"12345678");
         assert!(first.1);
+        assert_eq!(first.2, 10);
         let second = read_bounded_physical_line(&mut input, 8)
             .expect("read following line")
             .expect("second line");
         assert_eq!(second.0, b"ok");
         assert!(!second.1);
+        assert_eq!(second.2, 3);
     }
 
     #[test]
@@ -6252,19 +7328,17 @@ mod tests {
         );
         assert!(warnings.iter().any(|warning| warning.contains("overlong")));
         assert!(warnings.iter().any(|warning| warning.contains("non-UTF-8")));
+        assert_eq!(budget.total_bytes, 15);
         fs::remove_dir_all(directory).ok();
     }
 
     #[test]
-    fn jsonl_file_total_and_record_limits_skip_with_warnings() {
+    fn jsonl_file_and_record_limits_skip_with_warnings() {
         let directory = test_store_directory("jsonl-scan-limits");
         let first = directory.join("first.jsonl");
-        let second = directory.join("second.jsonl");
         fs::write(&first, b"{}\n{}\n").expect("first JSONL fixture");
-        fs::write(&second, b"{}\n").expect("second JSONL fixture");
         let limits = HistoryScanLimits {
             max_file_bytes: 6,
-            max_total_bytes: 8,
             max_records: 1,
             ..HISTORY_SCAN_LIMITS
         };
@@ -6291,12 +7365,8 @@ mod tests {
             &mut budget,
         )
         .is_none());
-        assert!(
-            open_bounded_jsonl_reader(&second, "test history", &mut warnings, &mut budget,)
-                .is_none()
-        );
+        assert_eq!(budget.total_bytes, 3);
         assert!(warnings.iter().any(|warning| warning.contains("records")));
-        assert!(warnings.iter().any(|warning| warning.contains("bytes")));
 
         let oversized = directory.join("oversized.jsonl");
         fs::write(&oversized, b"1234567").expect("oversized JSONL fixture");
@@ -6311,6 +7381,51 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("file limit")));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn selected_codex_actual_read_limit_returns_no_partial_piece() {
+        let metadata = json!({
+            "timestamp": "2026-07-13T00:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "selected", "session_id": "selected" }
+        })
+        .to_string();
+        let message = json!({
+            "timestamp": "2026-07-13T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "must not be partial" }]
+            }
+        })
+        .to_string();
+        let directory = test_store_directory("selected-codex-total-limit");
+        let path = directory.join("selected.jsonl");
+        fs::write(&path, format!("{metadata}\n{message}")).expect("selected Codex history");
+        let metadata_bytes = metadata.len() as u64 + 1;
+        let limits = HistoryScanLimits {
+            max_total_bytes: metadata_bytes,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let selected_ids = HashSet::from(["selected".to_string()]);
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        );
+
+        assert!(pieces.is_empty());
+        assert!(budget.incomplete);
+        assert_eq!(budget.total_bytes, metadata_bytes);
+        assert!(warnings.iter().any(|warning| warning.contains("bytes")));
         fs::remove_dir_all(directory).ok();
     }
 
@@ -7637,6 +8752,7 @@ mod tests {
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "user",
+                "uuid": "first-user",
                 "sessionId": "first",
                 "cwd": "C:/one",
                 "message": { "content": "first request" }
@@ -7649,13 +8765,24 @@ mod tests {
                 "message": { "content": [{ "type": "text", "text": "second answer" }] }
             }),
         ]);
-        let second_path = write_test_jsonl(vec![json!({
-            "timestamp": "2026-07-13T00:00:02Z",
-            "type": "assistant",
-            "sessionId": "first",
-            "cwd": "C:/one",
-            "message": { "content": [{ "type": "text", "text": "first answer" }] }
-        })]);
+        let second_path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "assistant",
+                "uuid": "first-answer",
+                "sessionId": "first",
+                "cwd": "C:/one",
+                "message": { "content": [{ "type": "text", "text": "first answer" }] }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "assistant",
+                "uuid": "first-answer",
+                "sessionId": "first",
+                "cwd": "C:/one",
+                "message": { "content": [{ "type": "text", "text": "first answer" }] }
+            }),
+        ]);
 
         let mut pieces = parse_claude_file(&first_path);
         pieces.extend(parse_claude_file(&second_path));
@@ -7666,6 +8793,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         assert_eq!(by_id["first"].messages.len(), 2);
+        assert_eq!(by_id["first"].message_count, 2);
         assert_eq!(by_id["first"].messages[1].content, "first answer");
         assert_eq!(by_id["second"].messages[0].content, "second answer");
         fs::remove_file(first_path).ok();

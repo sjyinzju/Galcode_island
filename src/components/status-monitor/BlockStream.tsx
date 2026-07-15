@@ -18,10 +18,16 @@ import remarkGfm from "remark-gfm";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useActiveTabActions, useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
-import { isTauri } from "../../lib/bridge";
+import { invoke, isTauri } from "../../lib/bridge";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useUiStore, type ActiveMatch } from "../../stores/useUiStore";
 import type { CliBlock, CliBlockAttachment } from "../../types/blocks";
+import {
+  SafeMarkdownLink,
+  localFilePathFromHref,
+  requestOpenLocalFile,
+  safeMarkdownUrlTransform,
+} from "../SafeMarkdownLink";
 import { countOccurrences, highlightText } from "./highlight";
 import { ErrorDiagnosisCard } from "./ErrorDiagnosisCard";
 import {
@@ -94,14 +100,12 @@ const MD_COMPONENTS: Parameters<typeof ReactMarkdown>[0]["components"] = {
     </pre>
   ),
   a: ({ href, children }) => (
-    <a
+    <SafeMarkdownLink
       href={href}
-      target="_blank"
-      rel="noreferrer noopener"
       className="break-all text-sky-600 underline hover:text-sky-700 dark:text-sky-400 dark:hover:text-sky-300"
     >
       {children}
-    </a>
+    </SafeMarkdownLink>
   ),
   img: ({ src, alt }) => src ? (
     <ImportedImage
@@ -139,7 +143,11 @@ const MD_COMPONENTS: Parameters<typeof ReactMarkdown>[0]["components"] = {
 export function MarkdownText({ content, className }: { content: string; className?: string }): JSX.Element {
   return (
     <div className={`min-w-0 text-xs leading-relaxed [overflow-wrap:anywhere] ${className ?? ""}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={MD_COMPONENTS}
+        urlTransform={safeMarkdownUrlTransform}
+      >
         {content}
       </ReactMarkdown>
     </div>
@@ -312,20 +320,22 @@ function UserPromptBlock({
 
 export function AttachmentRow({ attachment }: { attachment: CliBlockAttachment }): JSX.Element {
   const [openError, setOpenError] = useState(false);
-  const source = attachment.localPath ?? attachment.url;
-  const browserRemoteUrl = !isTauri &&
-      !attachment.localPath &&
-      /^https?:\/\//i.test(attachment.url ?? "")
-    ? attachment.url
+  const localPath = localFilePathFromHref(attachment.localPath ?? attachment.url);
+  const remoteUrl = !attachment.localPath && /^https?:\/\//i.test(attachment.url ?? "")
+    ? attachment.url ?? null
     : null;
+  const browserRemoteUrl = !isTauri ? remoteUrl : null;
+  const desktopSource = localPath ?? remoteUrl;
 
   const handleOpen = async (): Promise<void> => {
-    if (!source) return;
+    if (!desktopSource) return;
     setOpenError(false);
     try {
-      const opener = await import("@tauri-apps/plugin-opener");
-      if (attachment.localPath) await opener.openPath(attachment.localPath);
-      else await opener.openUrl(source);
+      if (localPath) await requestOpenLocalFile(localPath, invoke);
+      else {
+        const opener = await import("@tauri-apps/plugin-opener");
+        await opener.openUrl(desktopSource);
+      }
     } catch {
       setOpenError(true);
     }
@@ -364,7 +374,7 @@ export function AttachmentRow({ attachment }: { attachment: CliBlockAttachment }
         >
           打开
         </a>
-      ) : isTauri && source ? (
+      ) : isTauri && desktopSource ? (
         <button
           type="button"
           onClick={() => void handleOpen()}
@@ -422,12 +432,63 @@ function ImageBlock({ block }: { block: CliBlock }): JSX.Element | null {
   );
 }
 
+export function CollapsibleBlockContent({
+  label,
+  expanded,
+  onToggle,
+  children,
+}: {
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <div className="min-w-0 rounded-md border border-zinc-300/50 bg-zinc-100/45 px-2.5 py-1.5 text-zinc-600 dark:border-zinc-700/60 dark:bg-zinc-800/35 dark:text-zinc-300">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={onToggle}
+        className="flex min-h-7 w-full items-center gap-2 text-left text-[10px] font-medium text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-zinc-400"
+      >
+        <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+        <span>{expanded ? "收起" : "展开"}</span>
+      </button>
+      {expanded ? <div className="mt-1 min-w-0">{children}</div> : null}
+    </div>
+  );
+}
+
+function CollapsibleBlock({
+  label,
+  forceExpanded,
+  children,
+}: {
+  label: string;
+  forceExpanded: boolean;
+  children: React.ReactNode;
+}): JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const visible = forceExpanded || expanded;
+  return (
+    <CollapsibleBlockContent
+      label={label}
+      expanded={visible}
+      onToggle={() => setExpanded((current) => !current)}
+    >
+      {children}
+    </CollapsibleBlockContent>
+  );
+}
+
 function TextBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
   const content = block.content?.trim();
   if (!content && !block.attachments?.length) return null;
   const accent =
     block.tone === "file" ? "text-sky-700 dark:text-sky-300" : "text-zinc-800 dark:text-zinc-100";
   const isInternalContext = block.sourceRole === "developer" || block.sourceRole === "system";
+  const collapsedLabel = block.collapsedLabel ?? (isInternalContext ? "内部上下文" : null);
   const text = content
     ? hl.query.trim()
       ? (
@@ -438,13 +499,12 @@ function TextBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
       : <MarkdownText content={content} className={accent} />
     : null;
 
-  if (isInternalContext) {
+  if (collapsedLabel) {
     return (
-      <div className="min-w-0 rounded-md border border-zinc-300/50 bg-zinc-100/45 px-2.5 py-2 text-zinc-600 dark:border-zinc-700/60 dark:bg-zinc-800/35 dark:text-zinc-300">
-        <div className="mb-1 text-[10px] font-medium text-zinc-500 dark:text-zinc-400">内部上下文</div>
+      <CollapsibleBlock label={collapsedLabel} forceExpanded={hl.activeMatch?.blockId === block.id}>
         {text}
         <BlockAttachments attachments={block.attachments} />
-      </div>
+      </CollapsibleBlock>
     );
   }
 
@@ -923,6 +983,18 @@ function FileBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
 function StatusLine({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
   const msg = block.message?.trim();
   if (!msg) return null;
+  if (block.collapsedLabel) {
+    return (
+      <CollapsibleBlock
+        label={block.collapsedLabel}
+        forceExpanded={hl.activeMatch?.blockId === block.id}
+      >
+        <div className="break-words text-[11px] italic text-zinc-500 [overflow-wrap:anywhere] dark:text-zinc-400">
+          {highlightText(msg, hl.query, block.id, "message", hl.activeMatch)}
+        </div>
+      </CollapsibleBlock>
+    );
+  }
   return (
     <div className="break-words text-[11px] italic text-zinc-500 [overflow-wrap:anywhere] dark:text-zinc-400">
       {highlightText(msg, hl.query, block.id, "message", hl.activeMatch)}

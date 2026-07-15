@@ -8,7 +8,9 @@ import {
   ImportedImage,
 } from "../status-monitor/ImportedImage";
 import { invoke } from "../../lib/bridge";
+import { SafeMarkdownLink, safeMarkdownUrlTransform } from "../SafeMarkdownLink";
 import {
+  dedupeImportedConversationMessages,
   formatImportedThinking,
   isActualUserPromptMessage,
   isOpaqueThinkingEvent,
@@ -36,6 +38,14 @@ const DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
 const INITIAL_TRANSCRIPT_COUNT = 80;
 const TRANSCRIPT_BATCH_SIZE = 100;
 const TRANSCRIPT_MARKDOWN_COMPONENTS: Parameters<typeof ReactMarkdown>[0]["components"] = {
+  a: ({ href, children }) => (
+    <SafeMarkdownLink
+      href={href}
+      className="break-all text-sky-600 underline hover:text-sky-700 dark:text-sky-400 dark:hover:text-sky-300"
+    >
+      {children}
+    </SafeMarkdownLink>
+  ),
   img: ({ src, alt }) => src ? (
     <ImportedImage
       source={src}
@@ -78,9 +88,8 @@ export function transcriptVirtualItemKey(
   return messages[index]?.id ?? "load-more";
 }
 
-function taskNotificationSummary(message: ImportedTranscriptMessage): string | null {
+export function taskNotificationSummary(message: ImportedTranscriptMessage): string | null {
   const content = message.content.trim();
-  if (message.isUserPrompt === true) return null;
   if (!content.startsWith("<task-notification>")) return null;
   return content.match(/<summary>([\s\S]*?)<\/summary>/i)?.[1]?.trim() || "后台任务状态已更新";
 }
@@ -127,10 +136,32 @@ function DeferredValueDetails({
   );
 }
 
+export function DeferredTranscriptContent({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  return (
+    <details onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary className="min-h-9 cursor-pointer py-2 text-[11px] font-medium text-zinc-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-zinc-300">
+        {label}
+      </summary>
+      {open ? <div className="pb-1">{children}</div> : null}
+    </details>
+  );
+}
+
 export function TranscriptPart({ part }: { part: ImportedTranscriptPart }): JSX.Element {
   if (part.type === "text") {
     return (
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={TRANSCRIPT_MARKDOWN_COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={TRANSCRIPT_MARKDOWN_COMPONENTS}
+        urlTransform={safeMarkdownUrlTransform}
+      >
         {part.text}
       </ReactMarkdown>
     );
@@ -152,7 +183,11 @@ export function TranscriptPart({ part }: { part: ImportedTranscriptPart }): JSX.
           思考过程
         </summary>
         <div className="mt-2 text-zinc-600 dark:text-zinc-300">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={TRANSCRIPT_MARKDOWN_COMPONENTS}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={TRANSCRIPT_MARKDOWN_COMPONENTS}
+            urlTransform={safeMarkdownUrlTransform}
+          >
             {formatImportedThinking(part.text)}
           </ReactMarkdown>
         </div>
@@ -185,7 +220,6 @@ export function TranscriptPart({ part }: { part: ImportedTranscriptPart }): JSX.
           <a
             href={part.dataUrl}
             download={name}
-            target="_blank"
             rel="noreferrer noopener"
             className="flex min-h-9 shrink-0 items-center rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
           >
@@ -198,14 +232,12 @@ export function TranscriptPart({ part }: { part: ImportedTranscriptPart }): JSX.
             className="flex min-h-9 shrink-0 items-center rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60 dark:text-sky-300"
           />
         ) : source ? (
-          <a
+          <SafeMarkdownLink
             href={source}
-            target="_blank"
-            rel="noreferrer noopener"
             className="flex min-h-9 shrink-0 items-center rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
           >
             打开
-          </a>
+          </SafeMarkdownLink>
         ) : (
           <span className="text-[9px] text-zinc-400">仅元数据</span>
         )}
@@ -317,11 +349,15 @@ export function ImportedConversationDialog({
     };
   }, [onClose]);
 
-  const visibleMessages = useMemo(
-    () => conversation?.messages.slice(0, renderCount) ?? [],
-    [conversation, renderCount],
+  const displayMessages = useMemo(
+    () => conversation ? dedupeImportedConversationMessages(conversation.messages) : [],
+    [conversation],
   );
-  const totalMessages = conversation?.messages.length ?? 0;
+  const visibleMessages = useMemo(
+    () => displayMessages.slice(0, renderCount),
+    [displayMessages, renderCount],
+  );
+  const totalMessages = displayMessages.length;
   const transcriptVirtualizer = useVirtualizer({
     count: conversation
       ? transcriptVirtualItemCount(visibleMessages.length, totalMessages)
@@ -336,7 +372,7 @@ export function ImportedConversationDialog({
     if (!conversation) return;
     const next = claimTranscriptRenderBatch(
       renderCount,
-      conversation.messages.length,
+      totalMessages,
       renderBatchPendingRef,
     );
     if (next !== null) setRenderCount(next);
@@ -375,7 +411,7 @@ export function ImportedConversationDialog({
             </div>
             {conversation && (
               <p className="mt-1 truncate text-[11px] text-zinc-500 dark:text-zinc-400">
-                {conversation.projectPath ?? "未选择项目"} · {conversation.messages.length} 条消息 · {formatDate(conversation.updatedAt)}
+                {conversation.projectPath ?? "未选择项目"} · {totalMessages} 条消息 · {formatDate(conversation.updatedAt)}
               </p>
             )}
           </div>
@@ -434,7 +470,7 @@ export function ImportedConversationDialog({
                         onClick={loadNextBatch}
                         className="min-h-11 rounded-md px-4 text-[11px] font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
                       >
-                        加载更多（已显示 {renderCount}/{conversation.messages.length}）
+                        加载更多（已显示 {renderCount}/{totalMessages}）
                       </button>
                     </div>
                   );
@@ -448,9 +484,26 @@ export function ImportedConversationDialog({
                 );
                 const isContext = !isUser && !isTool &&
                   ["user", "developer", "system"].includes(message.role);
+                const collapsedLabel = message.isApiError === true ||
+                    /^API Error(?:\s*:|$)/i.test(message.content.trim())
+                  ? "API 错误"
+                  : isContext
+                    ? "内部上下文"
+                    : null;
                 const parts = message.parts?.length
                   ? message.parts
                   : [{ type: "text", text: message.content } satisfies ImportedTranscriptPart];
+                const messageContent = (
+                  <div className="external-conversation-markdown flex flex-col gap-2 break-words">
+                    {notification ? (
+                      <div className="whitespace-pre-wrap text-[12px] text-zinc-600 dark:text-zinc-300">
+                        {notification}
+                      </div>
+                    ) : parts.map((part, index) => (
+                        <TranscriptPart key={`${message.id}:${index}`} part={part} />
+                      ))}
+                  </div>
+                );
                 return (
                   <div
                     key={message.id}
@@ -477,15 +530,13 @@ export function ImportedConversationDialog({
                             {formatDate(message.timestamp)}
                           </time>
                         </div>
-                        <div className="external-conversation-markdown flex flex-col gap-2 break-words">
-                          {notification ? (
-                            <div className="whitespace-pre-wrap text-[12px] text-zinc-600 dark:text-zinc-300">
-                              {notification}
-                            </div>
-                          ) : parts.map((part, index) => (
-                              <TranscriptPart key={`${message.id}:${index}`} part={part} />
-                            ))}
-                        </div>
+                        {collapsedLabel
+                          ? (
+                              <DeferredTranscriptContent label={collapsedLabel}>
+                                {messageContent}
+                              </DeferredTranscriptContent>
+                            )
+                          : messageContent}
                       </div>
                     </article>
                   </div>

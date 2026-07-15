@@ -23,9 +23,86 @@ type LoadState =
 
 type ImportState =
   | { kind: "idle" }
-  | { kind: "importing" }
+  | {
+      kind: "importing";
+      completedBatches: number;
+      totalBatches: number;
+      importedCount: number;
+    }
   | { kind: "done"; message: string; warnings: string[] }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string; warnings: string[] };
+
+export const IMPORT_BATCH_TARGET_BYTES = 480 * 1024 * 1024;
+export const IMPORT_HARD_LIMIT_BYTES = 512 * 1024 * 1024;
+
+export interface ImportBatch {
+  source: ExternalHistorySource;
+  sourceBytes: number;
+  selections: ExternalSessionRef[];
+}
+
+function normalizedSourceBytes(session: ExternalSessionPreview): number | null {
+  const sourceBytes: unknown = session.sourceBytes;
+  if (typeof sourceBytes !== "number" || !Number.isFinite(sourceBytes)) return null;
+  const normalized = Math.floor(sourceBytes);
+  return normalized > 0 ? normalized : null;
+}
+
+export function sessionImportBlockReason(session: ExternalSessionPreview): string | null {
+  const sourceBytes = normalizedSourceBytes(session);
+  return sourceBytes !== null && sourceBytes > IMPORT_HARD_LIMIT_BYTES
+    ? "超过 512 MiB 上限，无法导入"
+    : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isImportedConversationSummary(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string"
+    && (value.source === "codex" || value.source === "claude-code")
+    && typeof value.nativeSessionId === "string"
+    && typeof value.title === "string"
+    && (value.projectPath === null || typeof value.projectPath === "string")
+    && typeof value.createdAt === "number"
+    && Number.isFinite(value.createdAt)
+    && typeof value.updatedAt === "number"
+    && Number.isFinite(value.updatedAt)
+    && typeof value.importedAt === "number"
+    && Number.isFinite(value.importedAt)
+    && typeof value.messageCount === "number"
+    && Number.isFinite(value.messageCount);
+}
+
+export function validateImportResult(value: unknown): ImportExternalSessionsResult {
+  if (
+    !isRecord(value)
+    || !Array.isArray(value.imported)
+    || !value.imported.every(isImportedConversationSummary)
+    || !Array.isArray(value.skipped)
+    || !value.skipped.every((item) => typeof item === "string")
+    || !Array.isArray(value.warnings)
+    || !value.warnings.every((item) => typeof item === "string")
+  ) {
+    throw new Error("导入服务返回了无效结果");
+  }
+  return value as unknown as ImportExternalSessionsResult;
+}
+
+export function notifyImportedSafely(
+  onImported: (result: ImportExternalSessionsResult) => void,
+  result: ImportExternalSessionsResult,
+): string | null {
+  if (result.imported.length === 0) return null;
+  try {
+    onImported(result);
+    return null;
+  } catch (error) {
+    return `已导入的对话无法刷新到历史列表：${String(error)}`;
+  }
+}
 
 export function dialogFocusTarget<T>(
   focusable: readonly T[],
@@ -41,16 +118,128 @@ export function dialogFocusTarget<T>(
   return null;
 }
 
-export function summarizeImportResult(result: ImportExternalSessionsResult): {
+export function planImportBatches(
+  sessions: readonly ExternalSessionPreview[],
+  selected: ReadonlySet<string>,
+  targetBytes = IMPORT_BATCH_TARGET_BYTES,
+): ImportBatch[] {
+  const batches: ImportBatch[] = [];
+  const safeTarget = Math.max(1, Math.floor(targetBytes));
+
+  for (const source of ["codex", "claude-code"] as const) {
+    let current: ImportBatch | null = null;
+    for (const session of sessions) {
+      if (session.source !== source || !selected.has(externalSessionKey(session))) continue;
+      if (sessionImportBlockReason(session)) continue;
+      const sourceBytes = normalizedSourceBytes(session);
+      const selection = {
+        source: session.source,
+        nativeSessionId: session.nativeSessionId,
+      };
+      if (sourceBytes === null) {
+        if (current?.selections.length) batches.push(current);
+        current = null;
+        batches.push({ source, sourceBytes: 0, selections: [selection] });
+        continue;
+      }
+      if (current && current.selections.length > 0 && current.sourceBytes + sourceBytes > safeTarget) {
+        batches.push(current);
+        current = null;
+      }
+      current ??= { source, sourceBytes: 0, selections: [] };
+      current.sourceBytes += sourceBytes;
+      current.selections.push(selection);
+    }
+    if (current?.selections.length) batches.push(current);
+  }
+
+  return batches;
+}
+
+export function aggregateImportResults(
+  results: readonly ImportExternalSessionsResult[],
+  additionalWarnings: readonly string[] = [],
+): ImportExternalSessionsResult {
+  const imported: ImportExternalSessionsResult["imported"] = [];
+  const skipped: string[] = [];
+  const warnings: string[] = [];
+  const importedKeys = new Set<string>();
+  const skippedValues = new Set<string>();
+  const warningValues = new Set<string>();
+
+  for (const result of results) {
+    for (const conversation of result.imported) {
+      const key = externalSessionKey(conversation);
+      if (importedKeys.has(key)) continue;
+      importedKeys.add(key);
+      imported.push(conversation);
+    }
+    for (const value of result.skipped) {
+      if (skippedValues.has(value)) continue;
+      skippedValues.add(value);
+      skipped.push(value);
+    }
+    for (const value of result.warnings) {
+      if (warningValues.has(value)) continue;
+      warningValues.add(value);
+      warnings.push(value);
+    }
+  }
+  for (const value of additionalWarnings) {
+    if (warningValues.has(value)) continue;
+    warningValues.add(value);
+    warnings.push(value);
+  }
+
+  return { imported, skipped, warnings };
+}
+
+export function remainingSelectedSessionKeys(
+  selected: ReadonlySet<string>,
+  result: ImportExternalSessionsResult,
+): Set<string> {
+  const importedKeys = new Set(result.imported.map(externalSessionKey));
+  return new Set([...selected].filter((key) => !importedKeys.has(key)));
+}
+
+export function summarizeImportResult(
+  result: ImportExternalSessionsResult,
+  remainingCount?: number,
+): {
+  kind: "done" | "error";
   message: string;
   warnings: string[];
 } {
-  const skippedText = result.skipped.length > 0 ? `，跳过 ${result.skipped.length} 条` : "";
+  const retainedCount = remainingCount ?? result.skipped.length;
+  const importLimitExceeded = result.warnings.some((warning) =>
+    /complete import (?:byte )?limit/i.test(warning)
+  );
+  if (result.imported.length === 0) {
+    if (importLimitExceeded) {
+      return {
+        kind: "error",
+        message: "未导入任何对话，历史记录体积已变化，请重新打开导入窗口后重试",
+        warnings: result.warnings,
+      };
+    }
+    const retainedText = retainedCount > 0 ? `，${retainedCount} 个对话已保留，可重试` : "，请重试";
+    return {
+      kind: "error",
+      message: `未导入任何对话${retainedText}`,
+      warnings: result.warnings,
+    };
+  }
+  const retainedText = retainedCount > 0
+    ? importLimitExceeded
+      ? "，剩余记录体积已变化，请重新打开导入窗口后重试"
+      : `，${retainedCount} 个未完成，已保留可重试`
+    : "";
   const warningText = result.warnings.length > 0
     ? `，${result.warnings.length} 条记录需要注意`
     : "";
   return {
-    message: `已导入 ${result.imported.length} 个完整对话${skippedText}${warningText}`,
+    kind: retainedCount > 0 ? "error" : "done",
+    message: `已导入 ${result.imported.length} 个完整对话${retainedText}${warningText}`,
     warnings: result.warnings,
   };
 }
@@ -143,10 +332,15 @@ export function ExternalHistoryImportDialog({
     () => (source === "all" ? sessions : sessions.filter((session) => session.source === source)),
     [sessions, source],
   );
-  const allVisibleSelected = visibleSessions.length > 0
-    && visibleSessions.every((session) => selected.has(externalSessionKey(session)));
+  const selectableVisibleSessions = useMemo(
+    () => visibleSessions.filter((session) => !sessionImportBlockReason(session)),
+    [visibleSessions],
+  );
+  const allVisibleSelected = selectableVisibleSessions.length > 0
+    && selectableVisibleSessions.every((session) => selected.has(externalSessionKey(session)));
 
   const toggleSession = (session: ExternalSessionPreview): void => {
+    if (sessionImportBlockReason(session)) return;
     const key = externalSessionKey(session);
     setSelected((current) => {
       const next = new Set(current);
@@ -160,30 +354,87 @@ export function ExternalHistoryImportDialog({
     setSelected((current) => {
       const next = new Set(current);
       if (allVisibleSelected) {
-        for (const session of visibleSessions) next.delete(externalSessionKey(session));
+        for (const session of selectableVisibleSessions) next.delete(externalSessionKey(session));
       } else {
-        for (const session of visibleSessions) next.add(externalSessionKey(session));
+        for (const session of selectableVisibleSessions) next.add(externalSessionKey(session));
       }
       return next;
     });
   };
 
   const importSelected = async (): Promise<void> => {
-    if (selected.size === 0 || importState.kind === "importing") return;
-    const selections: ExternalSessionRef[] = sessions
-      .filter((session) => selected.has(externalSessionKey(session)))
-      .map((session) => ({
-        source: session.source,
-        nativeSessionId: session.nativeSessionId,
-      }));
-    setImportState({ kind: "importing" });
+    if (selected.size === 0 || importInProgressRef.current) return;
+    const batches = planImportBatches(sessions, selected);
+    if (batches.length === 0) return;
+    const attemptedKeys = new Set(
+      batches.flatMap((batch) => batch.selections.map(externalSessionKey)),
+    );
+    const results: ImportExternalSessionsResult[] = [];
+    const failedBatchWarnings: string[] = [];
+    let result: ImportExternalSessionsResult = { imported: [], skipped: [], warnings: [] };
+    let flowErrorMessage: string | null = null;
+    importInProgressRef.current = true;
+    setImportState({
+      kind: "importing",
+      completedBatches: 0,
+      totalBatches: batches.length,
+      importedCount: 0,
+    });
+
     try {
-      const result = await invoke<ImportExternalSessionsResult>("import_external_sessions", { selections });
-      onImported(result);
-      setImportState({ kind: "done", ...summarizeImportResult(result) });
-      setSelected(new Set());
+      for (const [index, batch] of batches.entries()) {
+        try {
+          const value = await invoke<unknown>("import_external_sessions", {
+            selections: batch.selections,
+          });
+          results.push(validateImportResult(value));
+        } catch (error) {
+          failedBatchWarnings.push(
+            `${sourceLabel(batch.source)} 第 ${index + 1}/${batches.length} 批导入失败：${String(error)}`,
+          );
+        }
+        const progress = aggregateImportResults(results);
+        setImportState({
+          kind: "importing",
+          completedBatches: index + 1,
+          totalBatches: batches.length,
+          importedCount: progress.imported.length,
+        });
+      }
+
+      result = aggregateImportResults(results, failedBatchWarnings);
+      const callbackWarning = notifyImportedSafely(onImported, result);
+      if (callbackWarning) {
+        result = aggregateImportResults([result], [callbackWarning]);
+        flowErrorMessage = "对话已保存，但历史列表刷新失败";
+      }
     } catch (error) {
-      setImportState({ kind: "error", message: String(error) });
+      result = aggregateImportResults(results, [
+        ...failedBatchWarnings,
+        `导入流程异常：${String(error)}`,
+      ]);
+      const callbackWarning = notifyImportedSafely(onImported, result);
+      if (callbackWarning) {
+        result = aggregateImportResults([result], [callbackWarning]);
+      }
+      flowErrorMessage = result.imported.length > 0
+        ? "部分对话已保存，但导入流程异常"
+        : "导入流程异常，请重试";
+    } finally {
+      setSelected((current) => remainingSelectedSessionKeys(current, result));
+      const importedAttemptKeys = new Set(
+        result.imported.map(externalSessionKey).filter((key) => attemptedKeys.has(key)),
+      );
+      const remainingCount = attemptedKeys.size - importedAttemptKeys.size;
+      const summary = summarizeImportResult(result, remainingCount);
+      importInProgressRef.current = false;
+      setImportState(flowErrorMessage
+        ? {
+            kind: "error",
+            message: `${summary.message}，${flowErrorMessage}`,
+            warnings: result.warnings,
+          }
+        : summary);
     }
   };
 
@@ -241,11 +492,12 @@ export function ExternalHistoryImportDialog({
                   key={value}
                   type="button"
                   onClick={() => setSource(value)}
+                  disabled={importState.kind === "importing"}
                   className={`rounded-full px-3 py-1 text-[11px] font-medium transition-colors ${
                     source === value
                       ? "bg-sky-500 text-white shadow-sm shadow-sky-400/25"
                       : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-white/5 dark:text-zinc-300 dark:hover:bg-white/10"
-                  }`}
+                  } disabled:opacity-45`}
                 >
                   {label}
                 </button>
@@ -253,7 +505,7 @@ export function ExternalHistoryImportDialog({
               <button
                 type="button"
                 onClick={toggleAllVisible}
-                disabled={visibleSessions.length === 0}
+                disabled={selectableVisibleSessions.length === 0 || importState.kind === "importing"}
                 className="ml-auto rounded-md border border-black/10 bg-white/60 px-2.5 py-1 text-[11px] text-zinc-600 transition-colors hover:bg-zinc-100 disabled:opacity-40 dark:border-white/10 dark:bg-white/5 dark:text-zinc-300 dark:hover:bg-white/10"
               >
                 {allVisibleSelected ? "取消全选" : "一键全选"}
@@ -269,21 +521,25 @@ export function ExternalHistoryImportDialog({
                 <div className="flex flex-col gap-1.5">
                   {visibleSessions.map((session) => {
                     const key = externalSessionKey(session);
-                    const checked = selected.has(key);
+                    const blockedReason = sessionImportBlockReason(session);
+                    const checked = !blockedReason && selected.has(key);
                     const imported = importedIds.has(`external:${session.source}:${session.nativeSessionId}`);
                     return (
                       <label
                         key={key}
-                        className={`flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-2.5 transition-colors ${
-                          checked
+                        className={`flex items-start gap-3 rounded-xl border px-3 py-2.5 transition-colors ${
+                          blockedReason
+                            ? "cursor-not-allowed border-black/5 bg-zinc-100/60 opacity-65 dark:border-white/5 dark:bg-white/[0.02]"
+                            : checked
                             ? "border-sky-400/50 bg-sky-400/10"
-                            : "border-black/5 bg-white/50 hover:bg-zinc-50 dark:border-white/5 dark:bg-white/[0.03] dark:hover:bg-white/[0.06]"
+                            : "cursor-pointer border-black/5 bg-white/50 hover:bg-zinc-50 dark:border-white/5 dark:bg-white/[0.03] dark:hover:bg-white/[0.06]"
                         }`}
                       >
                         <input
                           type="checkbox"
                           checked={checked}
                           onChange={() => toggleSession(session)}
+                          disabled={Boolean(blockedReason) || importState.kind === "importing"}
                           className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-sky-500"
                         />
                         <div className="min-w-0 flex-1">
@@ -304,6 +560,11 @@ export function ExternalHistoryImportDialog({
                             <span>{basename(session.projectPath)}</span>
                             <span>{session.messageCount} 条消息</span>
                             <span>{formatDate(session.updatedAt)}</span>
+                            {blockedReason && (
+                              <span className="font-medium text-rose-600 dark:text-rose-300">
+                                {blockedReason}
+                              </span>
+                            )}
                           </div>
                         </div>
                       </label>
@@ -315,7 +576,7 @@ export function ExternalHistoryImportDialog({
           </>
         )}
 
-        {importState.kind === "done" && importState.warnings.length > 0 && (
+        {(importState.kind === "done" || importState.kind === "error") && importState.warnings.length > 0 && (
           <details className="border-t border-amber-400/25 bg-amber-50/80 px-5 py-2 text-[11px] text-amber-800 dark:bg-amber-400/10 dark:text-amber-200">
             <summary className="cursor-pointer font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60">
               查看 {importState.warnings.length} 条导入警告
@@ -337,7 +598,7 @@ export function ExternalHistoryImportDialog({
                 : "text-zinc-500 dark:text-zinc-400"
           }`}>
             {importState.kind === "importing"
-              ? "正在复制完整对话..."
+              ? `正在分批导入 ${importState.completedBatches}/${importState.totalBatches}，已导入 ${importState.importedCount} 个对话...`
               : importState.kind === "done" || importState.kind === "error"
                 ? importState.message
                 : `已选择 ${selected.size} 个对话`}

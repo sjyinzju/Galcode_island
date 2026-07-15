@@ -79,7 +79,7 @@ fn assert_codex_rich_migration(case: usize) {
                 "type": "session_meta",
                 "payload": {
                     "session_id": session_id,
-                    "id": format!("rollout-{case:03}"),
+                    "id": session_id,
                     "thread_source": "user",
                     "cwd": format!("C:/codex/{case:03}")
                 }
