@@ -10,6 +10,7 @@
 )]
 
 mod agent;
+mod external_history;
 mod ipc;
 mod lan;
 mod llm;
