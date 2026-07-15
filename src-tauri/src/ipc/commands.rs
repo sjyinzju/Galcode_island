@@ -3,6 +3,10 @@ use crate::agent::codex::{self as codex_agent, CodexModelsResult, CodexStatus, C
 use crate::agent::manager::{self, LaunchResult};
 use crate::agent::opencode::{self as opencode_agent, OpencodeStatus};
 use crate::agent::runtime::{RuntimeState, DEFAULT_RUN_ID};
+use crate::external_history::{
+    self, ExternalSessionPreview, ExternalSessionRef, ImportExternalSessionsResult,
+    ImportedConversation, ImportedConversationSummary,
+};
 use crate::AppState;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -62,6 +66,68 @@ pub fn list_sessions(state: State<Arc<AppState>>) -> Result<Vec<SessionSummary>,
     // 按最近创建（elapsed 越小越新）排在前面
     summaries.sort_by_key(|s| s.created_at_ms);
     Ok(summaries)
+}
+
+/// Scan the local Codex and Claude Code folders without modifying either source.
+#[tauri::command]
+pub async fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
+    tauri::async_runtime::spawn_blocking(external_history::scan_external_sessions)
+        .await
+        .map_err(|error| format!("External history scan task failed: {error}"))?
+}
+
+/// Copy selected external transcripts into Galcode's own app-data file.
+#[tauri::command]
+pub async fn import_external_sessions(
+    app: AppHandle,
+    selections: Vec<ExternalSessionRef>,
+) -> Result<ImportExternalSessionsResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::import_external_sessions(&app, selections)
+    })
+    .await
+    .map_err(|error| format!("External history import task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn list_imported_conversations(
+    app: AppHandle,
+) -> Result<Vec<ImportedConversationSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::list_imported_conversations(&app)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation list task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn load_imported_conversation(
+    app: AppHandle,
+    id: String,
+) -> Result<ImportedConversation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::load_imported_conversation(&app, &id)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation load task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn load_imported_asset(app: AppHandle, asset_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::load_imported_asset(&app, &asset_id)
+    })
+    .await
+    .map_err(|error| format!("Imported asset load task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn remove_imported_conversation(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::remove_imported_conversation(&app, &id)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation removal task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -146,6 +212,18 @@ pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> 
         parent,
         entries,
     })
+}
+
+#[tauri::command]
+pub fn validate_directory(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(path.trim());
+    if !target.exists() {
+        return Err(format!("Directory does not exist: {}", target.display()));
+    }
+    if !target.is_dir() {
+        return Err(format!("Path is not a directory: {}", target.display()));
+    }
+    Ok(())
 }
 
 /// 项目 / 用户 / 插件级斜杠命令元数据。

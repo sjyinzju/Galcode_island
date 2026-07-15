@@ -42,6 +42,7 @@ tiny_http = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
+fs2 = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
