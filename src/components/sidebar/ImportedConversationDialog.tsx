@@ -85,7 +85,8 @@ export function transcriptVirtualItemKey(
   messages: ReadonlyArray<Pick<ImportedTranscriptMessage, "id">>,
   index: number,
 ): string {
-  return messages[index]?.id ?? "load-more";
+  const message = messages[index];
+  return message ? `${message.id}:${index}` : "load-more";
 }
 
 export function taskNotificationSummary(message: ImportedTranscriptMessage): string | null {
@@ -476,6 +477,10 @@ export function ImportedConversationDialog({
                   );
                 }
                 const isUser = isActualUserPromptMessage(message);
+                const virtualKey = transcriptVirtualItemKey(
+                  visibleMessages,
+                  virtualItem.index,
+                );
                 const notification = taskNotificationSummary(message);
                 const isTool = Boolean(
                   notification ||
@@ -500,13 +505,13 @@ export function ImportedConversationDialog({
                         {notification}
                       </div>
                     ) : parts.map((part, index) => (
-                        <TranscriptPart key={`${message.id}:${index}`} part={part} />
+                      <TranscriptPart key={`${virtualKey}:${index}`} part={part} />
                       ))}
                   </div>
                 );
                 return (
                   <div
-                    key={message.id}
+                    key={virtualKey}
                     ref={transcriptVirtualizer.measureElement}
                     data-index={virtualItem.index}
                     className="absolute left-0 top-0 w-full pb-4"

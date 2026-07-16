@@ -43,6 +43,19 @@ export function shouldShowConversationStatus(
     Boolean(importedConversationId && !hasFullImportedHistory);
 }
 
+export type ImportedHistoryControlState = "ready" | "loading" | "error";
+
+export function importedHistoryControlState(
+  importedConversationId: string | null,
+  hasFullImportedHistory: boolean,
+  importedHistoryError: string | null,
+): ImportedHistoryControlState {
+  if (canContinueImportedConversation(importedConversationId, hasFullImportedHistory)) {
+    return "ready";
+  }
+  return importedHistoryError ? "error" : "loading";
+}
+
 export function MainView(): JSX.Element {
   const activeTabId = useActiveTabId();
   const petEnabled = useSettingsStore((s) => s.petEnabled);
@@ -50,6 +63,7 @@ export function MainView(): JSX.Element {
   const mode = useActiveTabField("mode");
   const importedConversationId = useActiveTabField("importedConversationId");
   const hasFullImportedHistory = useActiveTabField("hasFullImportedHistory");
+  const importedHistoryError = useActiveTabField("importedHistoryError");
   const cliBlockCount = useTabsStore((state) => {
     const tab = state.activeTabId ? state.tabs[state.activeTabId] : null;
     return tab?.cliBlocks.length ?? 0;
@@ -62,10 +76,22 @@ export function MainView(): JSX.Element {
     importedConversationId,
     hasFullImportedHistory,
   );
-  const canContinueConversation = canContinueImportedConversation(
+  const historyControlState = importedHistoryControlState(
     importedConversationId,
     hasFullImportedHistory,
+    importedHistoryError,
   );
+  const canContinueConversation = historyControlState === "ready";
+  const retryImportedHistory = (): void => {
+    if (!activeTabId) return;
+    const state = useTabsStore.getState();
+    const tab = state.tabs[activeTabId];
+    if (!tab?.importedConversationId || tab.hasFullImportedHistory) return;
+    state.updateTab(activeTabId, {
+      importedHistoryError: null,
+      importedHistoryRevision: tab.importedHistoryRevision + 1,
+    });
+  };
   // 没有活动 tab → 走全局概览（替代旧 WelcomeView 整屏画面）；
   // 此时下方的 InputBubble / RunningBubble / ResultCard 都不渲染，
   // 用户通过 Overview 内置的"选择项目目录"按钮启动第一个 tab。
@@ -164,11 +190,28 @@ export function MainView(): JSX.Element {
         </div>
       ) : (
         <div
-          role="status"
+          role={historyControlState === "error" ? "alert" : "status"}
           aria-live="polite"
-          className="flex min-h-16 w-full shrink-0 items-center justify-center rounded-xl border border-sky-400/20 bg-sky-400/[0.06] px-4 py-3 text-center text-sm text-zinc-600 dark:border-sky-300/15 dark:text-zinc-300"
+          className={`flex min-h-16 w-full shrink-0 items-center justify-center rounded-xl border px-4 py-3 text-center text-sm ${
+            historyControlState === "error"
+              ? "border-rose-300/50 bg-rose-50/70 text-rose-700 dark:border-rose-300/20 dark:bg-rose-400/10 dark:text-rose-200"
+              : "border-sky-400/20 bg-sky-400/[0.06] text-zinc-600 dark:border-sky-300/15 dark:text-zinc-300"
+          }`}
         >
-          正在加载完整历史，加载完成后即可继续对话…
+          {historyControlState === "error" ? (
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <span>{importedHistoryError}</span>
+              <button
+                type="button"
+                onClick={retryImportedHistory}
+                className="min-h-10 rounded-lg border border-rose-400/40 px-3 py-2 font-medium transition-colors hover:bg-rose-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+              >
+                重新加载
+              </button>
+            </div>
+          ) : (
+            "正在加载完整历史，加载完成后即可继续对话…"
+          )}
         </div>
       ))}
     </motion.section>

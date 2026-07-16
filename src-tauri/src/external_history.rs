@@ -30,6 +30,7 @@ const STORE_LOCK_FILE: &str = "imported-conversations.lock";
 const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ASSET_FILE_BYTES: usize = ((MAX_ATTACHMENT_BYTES + 2) / 3) * 4 + 1024;
 const MAX_IMPORT_WARNINGS: usize = 100;
+const MIN_MIXED_EMBEDDED_MEDIA_BYTES: usize = 1024;
 const JSONL_READ_BUFFER_BYTES: usize = 8 * 1024;
 const IMPORTED_STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -749,14 +750,19 @@ struct ClaudeAccumulator {
 struct ScanOutput {
     conversations: Vec<(String, ParsedConversation)>,
     warnings: Vec<String>,
+    incomplete: bool,
 }
 
 pub fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
     let mut previews = Vec::new();
-    for (source, conversation) in scan_source(CODEX_SOURCE, false, None)?.conversations {
+    let codex = scan_source(CODEX_SOURCE, false, None)?;
+    reject_incomplete_preview(CODEX_SOURCE, &codex)?;
+    for (source, conversation) in codex.conversations {
         previews.push(to_preview(&source, &conversation));
     }
-    for (source, conversation) in scan_source(CLAUDE_SOURCE, false, None)?.conversations {
+    let claude = scan_source(CLAUDE_SOURCE, false, None)?;
+    reject_incomplete_preview(CLAUDE_SOURCE, &claude)?;
+    for (source, conversation) in claude.conversations {
         previews.push(to_preview(&source, &conversation));
     }
     previews.sort_by(|a, b| {
@@ -765,6 +771,20 @@ pub fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
             .then_with(|| a.title.cmp(&b.title))
     });
     Ok(previews)
+}
+
+fn reject_incomplete_preview(source: &str, scan: &ScanOutput) -> Result<(), String> {
+    if !scan.incomplete {
+        return Ok(());
+    }
+    let source_label = if source == CODEX_SOURCE {
+        "Codex"
+    } else {
+        "Claude Code"
+    };
+    Err(format!(
+        "{source_label} 历史记录过多、文件过大或包含超长记录，扫描已达到安全限制。请先归档不需要导入的历史后重试。"
+    ))
 }
 
 pub fn import_external_sessions(
@@ -890,20 +910,30 @@ fn scan_source(
 ) -> Result<ScanOutput, String> {
     let mut warnings = Vec::new();
     match source {
-        CODEX_SOURCE => Ok(ScanOutput {
-            conversations: scan_codex(include_messages, selected_ids, &mut warnings)
-                .into_iter()
-                .map(|conversation| (CODEX_SOURCE.to_string(), conversation))
-                .collect(),
-            warnings,
-        }),
-        CLAUDE_SOURCE => Ok(ScanOutput {
-            conversations: scan_claude(include_messages, selected_ids, &mut warnings)
-                .into_iter()
-                .map(|conversation| (CLAUDE_SOURCE.to_string(), conversation))
-                .collect(),
-            warnings,
-        }),
+        CODEX_SOURCE => {
+            let (conversations, incomplete) =
+                scan_codex(include_messages, selected_ids, &mut warnings);
+            Ok(ScanOutput {
+                conversations: conversations
+                    .into_iter()
+                    .map(|conversation| (CODEX_SOURCE.to_string(), conversation))
+                    .collect(),
+                warnings,
+                incomplete,
+            })
+        }
+        CLAUDE_SOURCE => {
+            let (conversations, incomplete) =
+                scan_claude(include_messages, selected_ids, &mut warnings);
+            Ok(ScanOutput {
+                conversations: conversations
+                    .into_iter()
+                    .map(|conversation| (CLAUDE_SOURCE.to_string(), conversation))
+                    .collect(),
+                warnings,
+                incomplete,
+            })
+        }
         _ => Err(format!("Unsupported external history source: {source}")),
     }
 }
@@ -912,12 +942,12 @@ fn scan_codex(
     include_messages: bool,
     selected_ids: Option<&HashSet<String>>,
     warnings: &mut Vec<String>,
-) -> Vec<ParsedConversation> {
+) -> (Vec<ParsedConversation>, bool) {
     let Some(codex_root) = crate::agent::binary::codex_home_dir() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     if !codex_root.exists() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
@@ -957,18 +987,20 @@ fn scan_codex(
     }
 
     if include_messages && budget.incomplete {
-        return Vec::new();
+        return (Vec::new(), true);
     }
     let index = read_codex_index(
         &codex_root.join("session_index.jsonl"),
         warnings,
         &mut budget,
     );
-    if include_messages && budget.incomplete {
+    let incomplete = budget.incomplete;
+    let conversations = if include_messages && incomplete {
         Vec::new()
     } else {
         assemble_codex_conversations(pieces, &index, include_messages)
-    }
+    };
+    (conversations, incomplete)
 }
 
 fn assemble_codex_conversations(
@@ -1013,7 +1045,7 @@ fn assemble_codex_conversations(
         }
         if include_messages {
             for message in piece.messages {
-                let dedupe_key = message_dedupe_key(&message);
+                let dedupe_key = assembly_message_dedupe_key(&message);
                 if !entry.seen_messages.insert(dedupe_key) {
                     continue;
                 }
@@ -1084,9 +1116,9 @@ fn scan_claude(
     include_messages: bool,
     selected_ids: Option<&HashSet<String>>,
     warnings: &mut Vec<String>,
-) -> Vec<ParsedConversation> {
+) -> (Vec<ParsedConversation>, bool) {
     let Some(config_dir) = crate::agent::claude::claude_config_dir() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let projects_root = config_dir.join("projects");
     let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
@@ -1109,9 +1141,13 @@ fn scan_claude(
         }
     }
     if include_messages && budget.incomplete {
-        return Vec::new();
+        return (Vec::new(), true);
     }
-    assemble_claude_conversations(pieces, include_messages)
+    let incomplete = budget.incomplete;
+    (
+        assemble_claude_conversations(pieces, include_messages),
+        incomplete,
+    )
 }
 
 fn assemble_claude_conversations(
@@ -1147,7 +1183,7 @@ fn assemble_claude_conversations(
         replace_with_earliest(&mut entry.first_user_text, piece.first_user_text);
         if include_messages {
             for message in piece.messages {
-                let dedupe_key = message_dedupe_key(&message);
+                let dedupe_key = assembly_message_dedupe_key(&message);
                 if !entry.seen_messages.insert(dedupe_key) {
                     continue;
                 }
@@ -3031,33 +3067,89 @@ fn is_valid_media_type(media_type: &str) -> bool {
 fn sanitize_embedded_data_urls(
     text: &str,
     media: &mut Vec<ImportedTranscriptPart>,
-    _warnings: &mut Vec<String>,
-    _context: &str,
+    warnings: &mut Vec<String>,
+    context: &str,
 ) -> String {
     let candidate = text.trim();
-    if !candidate.starts_with("data:") {
-        return text.to_string();
+    if let Some((media_type, payload)) = parse_base64_data_url(candidate) {
+        if validate_base64_payload(payload).is_ok() {
+            let part = validated_media_part(candidate, media_type, None, None);
+            let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
+                "[Image data omitted]"
+            } else {
+                "[Attachment data omitted]"
+            };
+            push_media_part_unique(media, part);
+            let start = text.find(candidate).unwrap_or(0);
+            return format!(
+                "{}{}{}",
+                &text[..start],
+                placeholder,
+                &text[start + candidate.len()..]
+            );
+        }
     }
-    let Some((media_type, payload)) = parse_base64_data_url(candidate) else {
-        return text.to_string();
-    };
-    if validate_base64_payload(payload).is_err() {
-        return text.to_string();
+
+    let mut result = String::with_capacity(text.len());
+    let mut offset = 0;
+    while let Some(relative_start) = text[offset..].find("data:") {
+        let start = offset + relative_start;
+        result.push_str(&text[offset..start]);
+        let after_marker = start + "data:".len();
+        let next_marker = text[after_marker..]
+            .find("data:")
+            .map(|relative| after_marker + relative);
+        let header_end = next_marker.unwrap_or(text.len());
+        let Some(relative_comma) = text[after_marker..header_end].find(',') else {
+            result.push_str("data:");
+            offset = after_marker;
+            if next_marker.is_none() {
+                result.push_str(&text[offset..]);
+                return result;
+            }
+            continue;
+        };
+        let comma = after_marker + relative_comma;
+        let header = &text[start..=comma];
+        if !header.to_ascii_lowercase().contains(";base64,") {
+            result.push_str("data:");
+            offset = start + "data:".len();
+            continue;
+        }
+        let payload_start = comma + 1;
+        let payload_len = text[payload_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+            .count();
+        let end = payload_start + payload_len;
+        let embedded = &text[start..end];
+        let replacement = parse_base64_data_url(embedded).and_then(|(media_type, payload)| {
+            match validate_base64_payload(payload) {
+                Ok(decoded_bytes) if decoded_bytes >= MIN_MIXED_EMBEDDED_MEDIA_BYTES => {
+                    let part = validated_media_part(embedded, media_type, None, None);
+                    let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
+                        "[Image data omitted]"
+                    } else {
+                        "[Attachment data omitted]"
+                    };
+                    push_media_part_unique(media, part);
+                    Some(placeholder)
+                }
+                Err("payload exceeds size limit") => {
+                    push_warning(
+                        warnings,
+                        format!("{context}: embedded attachment data exceeds the size limit"),
+                    );
+                    Some("[Invalid attachment data omitted]")
+                }
+                _ => None,
+            }
+        });
+        result.push_str(replacement.unwrap_or(embedded));
+        offset = end.max(payload_start);
     }
-    let part = validated_media_part(candidate, media_type, None, None);
-    let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
-        "[Image data omitted]"
-    } else {
-        "[Attachment data omitted]"
-    };
-    push_media_part_unique(media, part);
-    let start = text.find(candidate).unwrap_or(0);
-    format!(
-        "{}{}{}",
-        &text[..start],
-        placeholder,
-        &text[start + candidate.len()..]
-    )
+    result.push_str(&text[offset..]);
+    result
 }
 
 fn push_media_part_unique(media: &mut Vec<ImportedTranscriptPart>, part: ImportedTranscriptPart) {
@@ -3179,6 +3271,17 @@ fn message_dedupe_key(message: &ParsedMessage) -> String {
                 &message.parts,
             )
         })
+}
+
+fn assembly_message_dedupe_key(message: &ParsedMessage) -> String {
+    let stable_key = message_dedupe_key(message);
+    if message.source_message_id.is_none() {
+        return stable_key;
+    }
+    format!(
+        "{stable_key}:{}",
+        hex::encode(replayed_message_fingerprint(message))
+    )
 }
 
 fn message_part_kind(parts: &[ImportedTranscriptPart]) -> &'static str {
@@ -6009,6 +6112,66 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_preview_scan_returns_a_visible_error() {
+        let scan = ScanOutput {
+            conversations: Vec::new(),
+            warnings: vec!["History scan byte limit was exceeded".to_string()],
+            incomplete: true,
+        };
+
+        let error = reject_incomplete_preview(CODEX_SOURCE, &scan)
+            .expect_err("incomplete preview scans must not look successful");
+        assert!(error.contains("Codex"));
+        assert!(error.contains("安全限制"));
+    }
+
+    #[test]
+    fn extracts_large_complete_data_urls_embedded_in_mixed_text() {
+        let payload = "A".repeat(4096);
+        let expected_data_url = format!("data:image/png;base64,{payload}");
+        let text = format!("before {expected_data_url} after");
+        let mut media = Vec::new();
+        let mut warnings = Vec::new();
+
+        let sanitized =
+            sanitize_embedded_data_urls(&text, &mut media, &mut warnings, "mixed tool value");
+
+        assert_eq!(sanitized, "before [Image data omitted] after");
+        assert_eq!(media.len(), 1);
+        assert!(matches!(
+            &media[0],
+            ImportedTranscriptPart::Image { data_url, .. }
+                if data_url.as_deref() == Some(expected_data_url.as_str())
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn skips_many_plain_data_prefixes_before_a_large_embedded_data_url() {
+        let payload = "A".repeat(4096);
+        let expected_data_url = format!("data:image/png;base64,{payload}");
+        let prefixes = "plain data: marker ".repeat(4096);
+        let text = format!("{prefixes}{expected_data_url} after");
+        let mut media = Vec::new();
+        let mut warnings = Vec::new();
+
+        let sanitized =
+            sanitize_embedded_data_urls(&text, &mut media, &mut warnings, "mixed tool value");
+
+        assert_eq!(
+            sanitized,
+            format!("{prefixes}[Image data omitted] after")
+        );
+        assert_eq!(media.len(), 1);
+        assert!(matches!(
+            &media[0],
+            ImportedTranscriptPart::Image { data_url, .. }
+                if data_url.as_deref() == Some(expected_data_url.as_str())
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn preserves_source_regex_and_truncated_data_url_text_without_attachment_warnings() {
         let source_text = concat!(
             "let url = format!(\"data:image/png;base64,{data}\");\n",
@@ -6409,6 +6572,44 @@ mod tests {
             ImportedTranscriptPart::ToolCall { tool_call_id, input, .. }
                 if tool_call_id.as_deref() == Some("call-2") && input == &json!({"path": "b"})
         ));
+    }
+
+    #[test]
+    fn codex_assembly_preserves_changed_tool_payloads_that_reuse_a_source_message_id() {
+        let parsed = |tool_call_id: &str, path: &str, timestamp: i64| ParsedMessage {
+            source_kind: CODEX_SOURCE,
+            role: "assistant".to_string(),
+            is_user_prompt: false,
+            is_api_error: false,
+            source_turn_id: Some("turn-a".to_string()),
+            content: "[Tool call: inspect]".to_string(),
+            parts: vec![ImportedTranscriptPart::ToolCall {
+                tool_call_id: Some(tool_call_id.to_string()),
+                name: "inspect".to_string(),
+                input: json!({"path": path}),
+            }],
+            timestamp,
+            source_message_id: Some("same-source-message".to_string()),
+            source_path: "history.jsonl".to_string(),
+            line_number: timestamp as usize,
+        };
+        let conversations = assemble_codex_conversations(
+            vec![CodexPiece {
+                native_session_id: "session".to_string(),
+                rollout_id: None,
+                project_path: None,
+                created_at: 10,
+                updated_at: 20,
+                source_bytes: 0,
+                messages: vec![parsed("call-1", "a", 10), parsed("call-2", "b", 20)],
+                preview_messages: Vec::new(),
+            }],
+            &HashMap::new(),
+            true,
+        );
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].messages.len(), 2);
     }
 
     #[test]
@@ -8698,9 +8899,10 @@ mod tests {
         let restore = RestoreEnv(std::env::var_os("CODEX_HOME"));
         std::env::set_var("CODEX_HOME", &directory);
 
-        let conversations = scan_codex(false, None, &mut Vec::new());
+        let (conversations, incomplete) = scan_codex(false, None, &mut Vec::new());
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].native_session_id, "custom-home-session");
+        assert!(!incomplete);
 
         drop(restore);
         fs::remove_dir_all(directory).ok();
@@ -8738,9 +8940,10 @@ mod tests {
         let restore = RestoreEnv(std::env::var_os("CLAUDE_CONFIG_DIR"));
         std::env::set_var("CLAUDE_CONFIG_DIR", &directory);
 
-        let conversations = scan_claude(false, None, &mut Vec::new());
+        let (conversations, incomplete) = scan_claude(false, None, &mut Vec::new());
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].native_session_id, "custom-config-session");
+        assert!(!incomplete);
 
         drop(restore);
         fs::remove_dir_all(directory).ok();

@@ -211,6 +211,7 @@ function readableThinkingEventText(part: ImportedTranscriptPart): string | null 
 interface ImportedBlockContext {
   conversationId: string;
   message: ImportedTranscriptMessage;
+  messageKey: string;
   turnId: string;
 }
 
@@ -232,14 +233,14 @@ function withImportedSource(block: CliBlock, context: ImportedBlockContext): Cli
 function taskNotificationBlock(
   context: ImportedBlockContext,
 ): CliBlock | null {
-  const { conversationId, message } = context;
+  const { conversationId, message, messageKey } = context;
   const content = message.content.trim();
   if (!content.startsWith("<task-notification>")) return null;
   const status = content.match(/<status>([\s\S]*?)<\/status>/i)?.[1]?.trim();
   const summary = content.match(/<summary>([\s\S]*?)<\/summary>/i)?.[1]?.trim();
   const detailValue = summary || "Background task update";
   return withImportedSource({
-    id: `imported-${conversationId}-${message.id}-task-notification`,
+    id: `imported-${conversationId}-${messageKey}-task-notification`,
     type: "tool",
     tool: "Task notification",
     detail: formatImportedValuePreview(detailValue),
@@ -312,8 +313,8 @@ function partToBlock(
   part: ImportedTranscriptPart,
   index: number,
 ): CliBlock {
-  const { conversationId, message } = context;
-  const id = `imported-${conversationId}-${message.id}-${index}`;
+  const { conversationId, message, messageKey } = context;
+  const id = `imported-${conversationId}-${messageKey}-${index}`;
   let block: CliBlock;
   switch (part.type) {
     case "text":
@@ -389,7 +390,7 @@ function partToBlock(
 }
 
 function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
-  const { conversationId, message } = context;
+  const { conversationId, message, messageKey } = context;
   const taskNotification = taskNotificationBlock(context);
   if (taskNotification) return [taskNotification];
 
@@ -398,7 +399,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
     : message.content.trim().match(INTERRUPTED_MESSAGE_PATTERN)?.[0];
   if (interruptedMessage) {
     return [withImportedSource({
-      id: `imported-${conversationId}-${message.id}-interrupted`,
+      id: `imported-${conversationId}-${messageKey}-interrupted`,
       type: "status",
       message: interruptedMessage.slice(1, -1),
     }, context)];
@@ -438,7 +439,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
       return parts.flatMap((part, index) => {
         if (index === firstPromptPartIndex) {
           return [withImportedSource({
-            id: `imported-${conversationId}-${message.id}-${index}`,
+            id: `imported-${conversationId}-${messageKey}-${index}`,
             type: "user-prompt" as const,
             content: promptContent || message.content,
             images: images.length > 0 ? images : undefined,
@@ -458,7 +459,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
     const projectedContent = parts.map(legacyPartContent).join("\n\n").trim();
     if (!parts.some((part) => part.type === "text") && content && content !== projectedContent) {
       blocks.unshift(withImportedSource(
-        messageTextBlock(`imported-${conversationId}-${message.id}-content`, message, content),
+        messageTextBlock(`imported-${conversationId}-${messageKey}-content`, message, content),
         context,
       ));
     }
@@ -467,7 +468,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
   if (!message.content.trim()) return [];
   return [
     withImportedSource(
-      messageTextBlock(`imported-${conversationId}-${message.id}`, message, message.content),
+      messageTextBlock(`imported-${conversationId}-${messageKey}`, message, message.content),
       context,
     ),
   ];
@@ -475,6 +476,17 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
 
 function sourceMessageIdentity(message: ImportedTranscriptMessage): string {
   return `${message.id}\0${message.role}`;
+}
+
+function claimImportedMessageKey(messageId: string, used: Set<string>): string {
+  let candidate = messageId;
+  let occurrence = 1;
+  while (used.has(candidate)) {
+    occurrence += 1;
+    candidate = `${messageId}~${occurrence}`;
+  }
+  used.add(candidate);
+  return candidate;
 }
 
 function sameJsonValue(left: unknown, right: unknown): boolean {
@@ -667,6 +679,7 @@ export function importedConversationToTabInit(
   let lastUserPrompt: string | null = null;
   let turn = 0;
   let currentTurnId = `${conversation.id}:turn:0`;
+  const usedMessageKeys = new Set<string>();
 
   for (const message of dedupeImportedConversationMessages(conversation.messages)) {
     const isUserPrompt = isActualUserPromptMessage(message);
@@ -680,6 +693,7 @@ export function importedConversationToTabInit(
     blocks.push(...messageToBlocks({
       conversationId: conversation.id,
       message,
+      messageKey: claimImportedMessageKey(message.id, usedMessageKeys),
       turnId: currentTurnId,
     }));
   }

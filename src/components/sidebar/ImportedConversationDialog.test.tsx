@@ -36,9 +36,16 @@ describe("ImportedConversationDialog", () => {
     ];
 
     expect(transcriptVirtualItemCount(messages.length, 4_174)).toBe(3);
-    expect(transcriptVirtualItemKey(messages, 0)).toBe("message-1");
+    expect(transcriptVirtualItemKey(messages, 0)).toBe("message-1:0");
     expect(transcriptVirtualItemKey(messages, 2)).toBe("load-more");
     expect(transcriptVirtualItemCount(4_174, 4_174)).toBe(4_174);
+  });
+
+  it("keeps virtual item keys unique when source message ids are reused", () => {
+    const messages = [{ id: "reused" }, { id: "reused" }];
+
+    expect(transcriptVirtualItemKey(messages, 0)).toBe("reused:0");
+    expect(transcriptVirtualItemKey(messages, 1)).toBe("reused:1");
   });
 
   it("uses the safe lazy image renderer in transcript parts", () => {

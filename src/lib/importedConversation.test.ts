@@ -662,7 +662,10 @@ describe("importedConversationToTabInit", () => {
       }],
     }));
 
-    expect(result.cliBlocks.filter((block) => block.type === "tool")).toHaveLength(2);
+    const toolBlocks = result.cliBlocks.filter((block) => block.type === "tool");
+    expect(toolBlocks).toHaveLength(2);
+    expect(new Set(toolBlocks.map((block) => block.id)).size).toBe(2);
+    expect(toolBlocks.every((block) => block.sourceMessageId === "same-tool-message")).toBe(true);
   });
 
   it("preserves equal timestamp-free messages without reliable replay evidence", () => {
