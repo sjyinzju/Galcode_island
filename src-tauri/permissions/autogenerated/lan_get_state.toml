@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lan-get-state"
+description = "Enables the lan_get_state command without any pre-configured scope."
+commands.allow = ["lan_get_state"]
+
+[[permission]]
+identifier = "deny-lan-get-state"
+description = "Denies the lan_get_state command without any pre-configured scope."
+commands.deny = ["lan_get_state"]

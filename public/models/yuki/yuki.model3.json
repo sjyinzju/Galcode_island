@@ -1,0 +1,84 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "yuki.moc3",
+    "Textures": [
+      "texture_00.webp"
+    ],
+    "Physics": "yuki.physics3.json",
+    "DisplayInfo": "yuki.cdi3.json",
+    "Motions": {
+      "hello": [
+        {
+          "File": "hello.motion3.json",
+          "FadeInTime": 0,
+          "FadeOutTime": 0.3
+        }
+      ],
+      "waspace": [
+        {
+          "File": "waspace.motion3.json"
+        }
+      ],
+      "hide": [
+        {
+          "File": "hide.motion3.json"
+        }
+      ],
+      "CurtainIn": [
+        {
+          "File": "curtain-in.motion3.json"
+        }
+      ],
+      "CurtainOut": [
+        {
+          "File": "curtain-out.motion3.json"
+        }
+      ],
+      "DuckIn": [
+        {
+          "File": "dusk-in.motion3.json"
+        }
+      ],
+      "DuckOut": [
+        {
+          "File": "dusk-out.motion3.json"
+        }
+      ]
+    }
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": []
+    },
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": []
+    }
+  ],
+  "HitAreas": [
+    {
+      "Id": "HitAreaYuki",
+      "Name": "Yuki"
+    },
+    {
+      "Id": "HitAreaBook",
+      "Name": "Book"
+    },
+    {
+      "Id": "HitAreaBadge",
+      "Name": "Badge"
+    },
+    {
+      "Id": "HitAreaHead",
+      "Name": "Head"
+    },
+    {
+      "Id": "HitAreaMune",
+      "Name": "Mune"
+    }
+  ]
+}

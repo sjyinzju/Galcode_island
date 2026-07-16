@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remove-imported-conversation"
+description = "Enables the remove_imported_conversation command without any pre-configured scope."
+commands.allow = ["remove_imported_conversation"]
+
+[[permission]]
+identifier = "deny-remove-imported-conversation"
+description = "Denies the remove_imported_conversation command without any pre-configured scope."
+commands.deny = ["remove_imported_conversation"]

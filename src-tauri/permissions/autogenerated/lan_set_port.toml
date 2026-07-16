@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lan-set-port"
+description = "Enables the lan_set_port command without any pre-configured scope."
+commands.allow = ["lan_set_port"]
+
+[[permission]]
+identifier = "deny-lan-set-port"
+description = "Denies the lan_set_port command without any pre-configured scope."
+commands.deny = ["lan_set_port"]

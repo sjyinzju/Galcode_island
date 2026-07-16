@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pet-configure"
+description = "Enables the pet_configure command without any pre-configured scope."
+commands.allow = ["pet_configure"]
+
+[[permission]]
+identifier = "deny-pet-configure"
+description = "Denies the pet_configure command without any pre-configured scope."
+commands.deny = ["pet_configure"]

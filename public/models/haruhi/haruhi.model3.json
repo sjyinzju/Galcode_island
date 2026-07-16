@@ -1,0 +1,139 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "haruhi.moc3",
+    "Textures": [
+      "haruhi.1024/texture_00.webp"
+    ],
+    "Physics": "haruhi.physics3.json",
+    "DisplayInfo": "haruhi.cdi3.json",
+    "Motions": {
+      "hello": [
+        {
+          "File": "hello.motion3.json",
+          "FadeInTime": 0,
+          "FadeOutTime": 0
+        }
+      ],
+      "hide": [
+        {
+          "File": "hide.motion3.json"
+        }
+      ],
+      "Smile0": [
+        {
+          "File": "smile-0.motion3.json"
+        }
+      ],
+      "Smile1": [
+        {
+          "File": "smile-1.motion3.json",
+          "FadeInTime": 0.2,
+          "FadeOutTime": 0.2
+        }
+      ],
+      "Smile2": [
+        {
+          "File": "smile-2.motion3.json"
+        }
+      ],
+      "Smile3": [
+        {
+          "File": "smile-3.motion3.json"
+        }
+      ],
+      "Smile4": [
+        {
+          "File": "smile-4.motion3.json",
+          "FadeInTime": 0.2,
+          "FadeOutTime": 0
+        }
+      ],
+      "Smile5": [
+        {
+          "File": "smile-5.motion3.json"
+        }
+      ],
+      "Smile6": [
+        {
+          "File": "smile-6.motion3.json"
+        }
+      ],
+      "BlackboardIn": [
+        {
+          "File": "blackboard-in.motion3.json",
+          "FadeInTime": 0
+        }
+      ],
+      "BlackboardOut": [
+        {
+          "File": "blackboard-out.motion3.json",
+          "FadeInTime": 0
+        }
+      ],
+      "DuckIn": [
+        {
+          "File": "duck-in.motion3.json"
+        }
+      ],
+      "DuckOut": [
+        {
+          "File": "duck-out.motion3.json"
+        }
+      ]
+    }
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": [
+        "ParamEyeLOpen",
+        "ParamEyeROpen"
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": []
+    }
+  ],
+  "HitAreas": [
+    {
+      "Id": "HitAreaEye",
+      "Name": "Eye"
+    },
+    {
+      "Id": "HitAreaMouth",
+      "Name": "Mouth"
+    },
+    {
+      "Id": "HitAreaPyramid",
+      "Name": "Pyramid"
+    },
+    {
+      "Id": "HitAreaHaruhi",
+      "Name": "Haruhi"
+    },
+    {
+      "Id": "HitAreaHead",
+      "Name": "Head"
+    },
+    {
+      "Id": "HitAreaMune",
+      "Name": "Mune"
+    },
+    {
+      "Id": "HitAreaRibon",
+      "Name": "Ribon"
+    },
+    {
+      "Id": "HitAreaRHand",
+      "Name": "Rhand"
+    },
+    {
+      "Id": "HitAreaLHand",
+      "Name": "Lhand"
+    }
+  ]
+}

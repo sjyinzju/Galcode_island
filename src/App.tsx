@@ -9,6 +9,8 @@ import { InPageSearch } from "./components/InPageSearch";
 import { WindowsTopBar } from "./components/WindowsTopBar";
 import { useUiStore } from "./stores/useUiStore";
 import { useAgentIPC } from "./hooks/useAgentIPC";
+import { useDesktopPetCoordinator } from "./hooks/useDesktopPetCoordinator";
+import { useDesktopPetInputForwarder } from "./hooks/useDesktopPetInputForwarder";
 import { useCliStream } from "./hooks/useCliStream";
 import { useInPageSearchHotkey } from "./hooks/useInPageSearchHotkey";
 import { useLanProjectsSync } from "./hooks/useLanProjectsSync";
@@ -60,6 +62,8 @@ function App(): JSX.Element {
   useThemeHotkey();
   useChatHotkeys();
   useAgentIPC();
+  useDesktopPetCoordinator();
+  useDesktopPetInputForwarder();
   useCliStream();
   usePermissionRequests();
   useTabsReattach();

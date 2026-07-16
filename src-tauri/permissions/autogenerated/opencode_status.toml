@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-status"
+description = "Enables the opencode_status command without any pre-configured scope."
+commands.allow = ["opencode_status"]
+
+[[permission]]
+identifier = "deny-opencode-status"
+description = "Denies the opencode_status command without any pre-configured scope."
+commands.deny = ["opencode_status"]

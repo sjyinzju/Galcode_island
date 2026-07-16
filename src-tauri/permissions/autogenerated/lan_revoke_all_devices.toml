@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lan-revoke-all-devices"
+description = "Enables the lan_revoke_all_devices command without any pre-configured scope."
+commands.allow = ["lan_revoke_all_devices"]
+
+[[permission]]
+identifier = "deny-lan-revoke-all-devices"
+description = "Denies the lan_revoke_all_devices command without any pre-configured scope."
+commands.deny = ["lan_revoke_all_devices"]
