@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-codex-models"
+description = "Enables the codex_models command without any pre-configured scope."
+commands.allow = ["codex_models"]
+
+[[permission]]
+identifier = "deny-codex-models"
+description = "Denies the codex_models command without any pre-configured scope."
+commands.deny = ["codex_models"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-claude-send-prompt"
+description = "Enables the claude_send_prompt command without any pre-configured scope."
+commands.allow = ["claude_send_prompt"]
+
+[[permission]]
+identifier = "deny-claude-send-prompt"
+description = "Denies the claude_send_prompt command without any pre-configured scope."
+commands.deny = ["claude_send_prompt"]

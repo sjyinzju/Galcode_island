@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lan-get-storage"
+description = "Enables the lan_get_storage command without any pre-configured scope."
+commands.allow = ["lan_get_storage"]
+
+[[permission]]
+identifier = "deny-lan-get-storage"
+description = "Denies the lan_get_storage command without any pre-configured scope."
+commands.deny = ["lan_get_storage"]

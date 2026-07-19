@@ -10,11 +10,16 @@
 )]
 
 mod agent;
+#[cfg(test)]
+mod app_command_names;
 mod external_history;
 mod ipc;
 mod lan;
 mod llm;
 mod permission_mcp;
+mod pet_global_input;
+mod pet_state;
+mod pet_window;
 mod session;
 mod window_utils;
 
@@ -38,6 +43,9 @@ use ipc::git::{
     git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
     git_list_branches, git_log, git_pull, git_push, git_pushed_commits, git_remote_url,
     git_show_commit_files, git_show_file_diff, git_stage, git_status, git_unstage,
+};
+use pet_window::{
+    pet_action, pet_configure, pet_input, pet_ready, pet_update_snapshot, set_pet_click_through,
 };
 use std::sync::Arc;
 
@@ -82,10 +90,13 @@ pub fn run() {
         .manage(Arc::new(AppState::new()))
         .manage(Arc::new(agent::runtime::RuntimeState::default()))
         .manage(Arc::new(lan::LanRuntimeState::default()))
+        .manage(Arc::new(pet_state::PetRuntimeState::default()))
+        .manage(Arc::new(pet_global_input::PetGlobalInputMonitor::default()))
         .setup(|app| {
             let handle = app.handle().clone();
             let state = app.state::<Arc<AppState>>();
             session::cleanup::spawn_idle_cleanup_loop(handle.clone(), Arc::clone(&state));
+            pet_window::spawn_visibility_guard(handle.clone());
 
             // 启动时清理上一轮崩溃 / 强退留下的 opencode/codex/claude 孤儿子进程，
             // 避免端口被占用或重复消耗 token。
@@ -201,9 +212,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if window.label() == pet_window::PET_WINDOW_LABEL {
+                pet_window::handle_window_event(window, event);
+            } else if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -284,6 +299,13 @@ pub fn run() {
             git_checkout_branch,
             git_remote_url,
             git_pushed_commits,
+            // Desktop pet bridge (fixed main/pet callers, not exposed over LAN)
+            pet_configure,
+            pet_update_snapshot,
+            pet_input,
+            pet_ready,
+            pet_action,
+            set_pet_click_through,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -292,10 +314,12 @@ pub fn run() {
             // 桌面宠物的关窗 = 隐藏（on_window_event 已 prevent_close），不会走到这里；
             // 真退出只可能由 tray 菜单的 app.exit(0) 或 ⌘Q 触发。
             tauri::RunEvent::ExitRequested { api: _, .. } => {
+                pet_window::stop_global_input(app_handle);
                 agent::manager::shutdown_runtime_clients(app_handle);
             }
             // RunEvent::Exit 在退出最后一刻再触发一次，作兜底（清理函数幂等）。
             tauri::RunEvent::Exit => {
+                pet_window::stop_global_input(app_handle);
                 agent::manager::shutdown_runtime_clients(app_handle);
             }
             _ => {}

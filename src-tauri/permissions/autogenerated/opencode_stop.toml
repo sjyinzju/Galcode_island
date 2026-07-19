@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-stop"
+description = "Enables the opencode_stop command without any pre-configured scope."
+commands.allow = ["opencode_stop"]
+
+[[permission]]
+identifier = "deny-opencode-stop"
+description = "Denies the opencode_stop command without any pre-configured scope."
+commands.deny = ["opencode_stop"]

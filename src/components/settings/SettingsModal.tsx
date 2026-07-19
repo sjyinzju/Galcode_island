@@ -8,6 +8,7 @@ import {
 } from "../../stores/useSettingsStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { AgentBackendsSection } from "./AgentBackendsSection";
+import { DesktopPetSettingsSection } from "./DesktopPetSettingsSection";
 import { LanAccessPanel } from "./LanAccessPanel";
 // 自定义桌宠图片相关配置已迁移到「个性化」弹窗（侧栏一级入口），
 // 因为这块功能独立且使用频率明显高于其它"配置一次"类项。
@@ -345,6 +346,10 @@ export function SettingsModal(): JSX.Element {
                     </div>
                   </div>
                 </section>
+
+                <hr className="border-black/5 dark:border-white/5" />
+
+                <DesktopPetSettingsSection />
 
                 <hr className="border-black/5 dark:border-white/5" />
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-discard"
+description = "Enables the git_discard command without any pre-configured scope."
+commands.allow = ["git_discard"]
+
+[[permission]]
+identifier = "deny-git-discard"
+description = "Denies the git_discard command without any pre-configured scope."
+commands.deny = ["git_discard"]
