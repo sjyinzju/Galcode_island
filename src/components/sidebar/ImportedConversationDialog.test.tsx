@@ -1,9 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
+  DeferredTranscriptContent,
   TranscriptPart,
   claimTranscriptRenderBatch,
   nextTranscriptRenderCount,
+  taskNotificationSummary,
   transcriptVirtualItemCount,
   transcriptVirtualItemKey,
 } from "./ImportedConversationDialog";
@@ -34,9 +36,16 @@ describe("ImportedConversationDialog", () => {
     ];
 
     expect(transcriptVirtualItemCount(messages.length, 4_174)).toBe(3);
-    expect(transcriptVirtualItemKey(messages, 0)).toBe("message-1");
+    expect(transcriptVirtualItemKey(messages, 0)).toBe("message-1:0");
     expect(transcriptVirtualItemKey(messages, 2)).toBe("load-more");
     expect(transcriptVirtualItemCount(4_174, 4_174)).toBe(4_174);
+  });
+
+  it("keeps virtual item keys unique when source message ids are reused", () => {
+    const messages = [{ id: "reused" }, { id: "reused" }];
+
+    expect(transcriptVirtualItemKey(messages, 0)).toBe("reused:0");
+    expect(transcriptVirtualItemKey(messages, 1)).toBe("reused:1");
   });
 
   it("uses the safe lazy image renderer in transcript parts", () => {
@@ -59,5 +68,80 @@ describe("ImportedConversationDialog", () => {
 
     expect(html).toContain("加载远程图片");
     expect(html).not.toContain('<img src="https://tracker.example/pixel.png"');
+  });
+
+  it("does not turn local markdown files into empty navigating links", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptPart
+        part={{ type: "text", text: "[Open PDF](C:/Users/test/report.pdf)" }}
+      />,
+    );
+
+    expect(html).toContain("Open PDF");
+    expect(html).toContain("仅桌面端可打开");
+    expect(html).not.toContain('href=""');
+    expect(html).not.toContain("<a ");
+  });
+
+  it("does not navigate the webview for a local attachment URL", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptPart
+        part={{
+          type: "attachment",
+          name: "report.pdf",
+          mediaType: "application/pdf",
+          dataUrl: null,
+          url: String.raw`C:\Users\test\report.pdf`,
+        }}
+      />,
+    );
+
+    expect(html).toContain("仅桌面端可打开");
+    expect(html).not.toContain('href=""');
+    expect(html).not.toContain("<a ");
+  });
+
+  it("downloads inline PDF data without opening a new webview", () => {
+    const html = renderToStaticMarkup(
+      <TranscriptPart
+        part={{
+          type: "attachment",
+          name: "report.pdf",
+          mediaType: "application/pdf",
+          dataUrl: "data:application/pdf;base64,JVBERi0=",
+          url: null,
+        }}
+      />,
+    );
+
+    expect(html).toContain('download="report.pdf"');
+    expect(html).not.toContain('target="_blank"');
+  });
+
+  it("does not mount imported internal context before expansion", () => {
+    const html = renderToStaticMarkup(
+      <DeferredTranscriptContent label="内部上下文">
+        <span>secret system prompt</span>
+      </DeferredTranscriptContent>,
+    );
+
+    expect(html).toContain("内部上下文");
+    expect(html).not.toContain("secret system prompt");
+  });
+
+  it("summarizes a legacy task notification despite its stale user flag", () => {
+    expect(taskNotificationSummary({
+      id: "legacy-task-notification",
+      role: "user",
+      isUserPrompt: true,
+      sourceTurnId: "incorrect-legacy-turn",
+      content: [
+        "<task-notification>",
+        "<status>completed</status>",
+        "<summary>Background command completed</summary>",
+        "</task-notification>",
+      ].join("\n"),
+      timestamp: 100,
+    })).toBe("Background command completed");
   });
 });

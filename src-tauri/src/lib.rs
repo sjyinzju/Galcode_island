@@ -10,11 +10,16 @@
 )]
 
 mod agent;
+#[cfg(test)]
+mod app_command_names;
 mod external_history;
 mod ipc;
 mod lan;
 mod llm;
 mod permission_mcp;
+mod pet_global_input;
+mod pet_state;
+mod pet_window;
 mod session;
 mod window_utils;
 
@@ -23,21 +28,24 @@ use tauri::Manager;
 use ipc::commands::{
     claude_login_open, claude_models, claude_run_in_terminal, claude_send_prompt, claude_status,
     claude_verify, codex_login_open, codex_models, codex_send_prompt, codex_status, codex_verify,
-    finalize_pending, get_session_logs, import_external_sessions, lan_clear_password, lan_get_state, lan_get_storage,
-    lan_list_storage, lan_remove_storage, lan_revoke_all_devices, lan_set_enabled,
-    lan_set_password, lan_set_port, lan_set_storage, lan_sync_projects, list_directory, list_imported_conversations,
-    list_llm_models, list_project_slash_commands, list_sessions, opencode_create_session,
-    opencode_list_providers, opencode_login_open, opencode_send_prompt, opencode_set_auth,
-    opencode_start, opencode_status, opencode_stop, respond_permission,
-    respond_permission_decision, remove_imported_conversation, scan_external_sessions, select_project_folder, set_click_through, start_agent,
-    stop_agent, translate_only, update_backend_preferences, update_llm_settings,
-    generate_welcome_speech, generate_poke_speech, load_imported_conversation,
-    load_imported_asset, validate_directory,
+    finalize_pending, generate_poke_speech, generate_welcome_speech, get_session_logs,
+    import_external_sessions, lan_clear_password, lan_get_state, lan_get_storage, lan_list_storage,
+    lan_remove_storage, lan_revoke_all_devices, lan_set_enabled, lan_set_password, lan_set_port,
+    lan_set_storage, lan_sync_projects, list_directory, list_imported_conversations,
+    list_llm_models, list_project_slash_commands, list_sessions, load_imported_asset,
+    load_imported_conversation, open_local_file, opencode_create_session, opencode_list_providers,
+    opencode_login_open, opencode_send_prompt, opencode_set_auth, opencode_start, opencode_status,
+    opencode_stop, remove_imported_conversation, respond_permission, respond_permission_decision,
+    scan_external_sessions, select_project_folder, set_click_through, start_agent, stop_agent,
+    translate_only, update_backend_preferences, update_llm_settings, validate_directory,
 };
 use ipc::git::{
     git_checkout_branch, git_commit, git_diff, git_discard, git_generate_commit_message,
     git_list_branches, git_log, git_pull, git_push, git_pushed_commits, git_remote_url,
     git_show_commit_files, git_show_file_diff, git_stage, git_status, git_unstage,
+};
+use pet_window::{
+    pet_action, pet_configure, pet_input, pet_ready, pet_update_snapshot, set_pet_click_through,
 };
 use std::sync::Arc;
 
@@ -82,10 +90,13 @@ pub fn run() {
         .manage(Arc::new(AppState::new()))
         .manage(Arc::new(agent::runtime::RuntimeState::default()))
         .manage(Arc::new(lan::LanRuntimeState::default()))
+        .manage(Arc::new(pet_state::PetRuntimeState::default()))
+        .manage(Arc::new(pet_global_input::PetGlobalInputMonitor::default()))
         .setup(|app| {
             let handle = app.handle().clone();
             let state = app.state::<Arc<AppState>>();
             session::cleanup::spawn_idle_cleanup_loop(handle.clone(), Arc::clone(&state));
+            pet_window::spawn_visibility_guard(handle.clone());
 
             // 启动时清理上一轮崩溃 / 强退留下的 opencode/codex/claude 孤儿子进程，
             // 避免端口被占用或重复消耗 token。
@@ -210,9 +221,13 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            if window.label() == pet_window::PET_WINDOW_LABEL {
+                pet_window::handle_window_event(window, event);
+            } else if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -232,6 +247,7 @@ pub fn run() {
             list_imported_conversations,
             load_imported_conversation,
             load_imported_asset,
+            open_local_file,
             remove_imported_conversation,
             finalize_pending,
             translate_only,
@@ -292,6 +308,13 @@ pub fn run() {
             git_checkout_branch,
             git_remote_url,
             git_pushed_commits,
+            // Desktop pet bridge (fixed main/pet callers, not exposed over LAN)
+            pet_configure,
+            pet_update_snapshot,
+            pet_input,
+            pet_ready,
+            pet_action,
+            set_pet_click_through,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -300,10 +323,12 @@ pub fn run() {
             // 桌面宠物的关窗 = 隐藏（on_window_event 已 prevent_close），不会走到这里；
             // 真退出只可能由 tray 菜单的 app.exit(0) 或 ⌘Q 触发。
             tauri::RunEvent::ExitRequested { api: _, .. } => {
+                pet_window::stop_global_input(app_handle);
                 agent::manager::shutdown_runtime_clients(app_handle);
             }
             // RunEvent::Exit 在退出最后一刻再触发一次，作兜底（清理函数幂等）。
             tauri::RunEvent::Exit => {
+                pet_window::stop_global_input(app_handle);
                 agent::manager::shutdown_runtime_clients(app_handle);
             }
             _ => {}

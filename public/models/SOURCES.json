@@ -1,0 +1,324 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "scripts/extract-harupet-models.mjs",
+  "ownershipBasis": "Organization-owned character models, as stated by the project owner.",
+  "exclusion": "Executable bundles and their embedded Cubism Core/runtime are not included.",
+  "launcher": {
+    "url": "https://cdn.harucdn.com/harupet.user.js",
+    "file": ".tmp/harupet-source/harupet.user.js",
+    "bytes": 3721,
+    "sha256": "59aef309e8f214908cc379878b7a9f7104c67918c1054f36a46166a62513f15f"
+  },
+  "models": [
+    {
+      "character": "haruhi",
+      "url": "https://cdn.harucdn.com/model_haruhi.js",
+      "bundleFile": ".tmp/harupet-source/model_haruhi.js",
+      "bundleBytes": 1454104,
+      "bundleSha256": "adeca5fdce41e31b3c2a1333cb217365c0fc54b8fba5b81c6710bf1e6628f53d",
+      "decodedBytes": 424574,
+      "excludedPlaceholderBytes": 458,
+      "files": [
+        {
+          "path": "haruhi/haruhi.model3.json",
+          "bytes": 2448,
+          "sha256": "512fc893c6ee90e644c6f5ff036c8ac83657cdbf5b813da9f6efad055682cbea"
+        },
+        {
+          "path": "haruhi/haruhi.moc3",
+          "bytes": 127424,
+          "sha256": "7ce78a2754be3466f01639cd285ce61c10e1fe55620358d2fbaf6096d5e255ba"
+        },
+        {
+          "path": "haruhi/haruhi.1024/texture_00.webp",
+          "bytes": 261600,
+          "sha256": "b351c9f6795bb3d99e4a1ee793f8969219e382fb1428b97f176e506bd324909d",
+          "texture": {
+            "width": 1024,
+            "height": 512
+          }
+        },
+        {
+          "path": "haruhi/haruhi.physics3.json",
+          "bytes": 2986,
+          "sha256": "045c854b63553920ffd394c562816aa79888d4646c8cf964c75e00825739088a"
+        },
+        {
+          "path": "haruhi/haruhi.cdi3.json",
+          "bytes": 6307,
+          "sha256": "09d44046dcaf8377e89e69b847aced12d66a387061d09c07d503d3f49c27a6d7"
+        },
+        {
+          "path": "haruhi/hello.motion3.json",
+          "bytes": 1710,
+          "sha256": "e51daec083f2540123d2b6eb6c52cb601a2ff00c6f91eac7b56132c2e2430c30"
+        },
+        {
+          "path": "haruhi/hide.motion3.json",
+          "bytes": 1674,
+          "sha256": "1b01a6233347c107a8efcd744fc63e2c9a0c6255ee0e58c160205bb7a4a28e68"
+        },
+        {
+          "path": "haruhi/smile-0.motion3.json",
+          "bytes": 2390,
+          "sha256": "55a4c49993d8e24f7928a5404ba068858a25dccefc609f05f7f3da38a1d15992"
+        },
+        {
+          "path": "haruhi/smile-1.motion3.json",
+          "bytes": 1526,
+          "sha256": "0b049f9e484f68c3e687c238b143b5870c1a8d6bcb16cb5502880f5ad4d030ef"
+        },
+        {
+          "path": "haruhi/smile-2.motion3.json",
+          "bytes": 6599,
+          "sha256": "1f4f77dabd98013ce76259b6912850ad44a9810741e946c62add3d8f9e77a53d"
+        },
+        {
+          "path": "haruhi/smile-3.motion3.json",
+          "bytes": 2776,
+          "sha256": "7ca0d44ae05a769a922c2e6fb7b0d6d649727373a044fdeb13cc04b9413bfe73"
+        },
+        {
+          "path": "haruhi/smile-4.motion3.json",
+          "bytes": 2461,
+          "sha256": "bc16ef1998a875e561618f9ff85569cc441bea6ce4f09c6e1214c5c90c3ea7a4"
+        },
+        {
+          "path": "haruhi/smile-5.motion3.json",
+          "bytes": 2749,
+          "sha256": "4a758c3387d0d3ce6de967a83c9add1045895952cd158e15021392c8591a47ff"
+        },
+        {
+          "path": "haruhi/smile-6.motion3.json",
+          "bytes": 2032,
+          "sha256": "bf77451001e604124979af3990e8569bb573519ef3f6fe940fffde8faff85b26"
+        },
+        {
+          "path": "haruhi/blackboard-in.motion3.json",
+          "bytes": 650,
+          "sha256": "e31f29c3283b1b22100df87a74e09205a463cfa97e8979ec18a8e28701b80f52"
+        },
+        {
+          "path": "haruhi/blackboard-out.motion3.json",
+          "bytes": 636,
+          "sha256": "9180d1481b36e5df34d43e74b1cfaad9c33afceb943f9312060d3ba24a232fbb"
+        },
+        {
+          "path": "haruhi/duck-in.motion3.json",
+          "bytes": 298,
+          "sha256": "ab7ee0f842fe0eb77d8f243c9c36d2b7eacd110137bb59e9b7fa86dc06c92c21"
+        },
+        {
+          "path": "haruhi/duck-out.motion3.json",
+          "bytes": 298,
+          "sha256": "d6b3c2fb44804343b4f5edd46a839b5f9d0e1b143334726cea8a7dc0fb879d0e"
+        }
+      ]
+    },
+    {
+      "character": "mikuru",
+      "url": "https://cdn.harucdn.com/model_mikuru.js",
+      "bundleFile": ".tmp/harupet-source/model_mikuru.js",
+      "bundleBytes": 2340238,
+      "bundleSha256": "61f29a9b67c51269168e34d5d8f7808c7c86ee5cfe89e70dfc2ca5a71ef704cf",
+      "decodedBytes": 1102868,
+      "excludedPlaceholderBytes": 458,
+      "files": [
+        {
+          "path": "mikuru/mikuru.model3.json",
+          "bytes": 2619,
+          "sha256": "96ead6221a5ee3ea1c642d0336f555295c3276c723834665705ac4d3a90b88bb"
+        },
+        {
+          "path": "mikuru/1096.moc3",
+          "bytes": 145600,
+          "sha256": "681cce9532c989c213ffab059982456343e5ea8a91275cbc25c314c3f9cb2041"
+        },
+        {
+          "path": "mikuru/1096.2048/texture_00.webp",
+          "bytes": 923326,
+          "sha256": "d47122b0c2cd27290acc64d20586af4d4205dfae9191223a034cd319bf7bff90",
+          "texture": {
+            "width": 2048,
+            "height": 2048
+          }
+        },
+        {
+          "path": "mikuru/1096.physics3.json",
+          "bytes": 7090,
+          "sha256": "4ef7923387bcfeeac7bd81e4b7218b9f927d19145b7ba55a301099d2bcb8f10c"
+        },
+        {
+          "path": "mikuru/1096.cdi3.json",
+          "bytes": 7515,
+          "sha256": "acac886fc6a86ff6122f1fc8b8214fe51a0c8653daa2d7e14fdedc698d0e746c"
+        },
+        {
+          "path": "mikuru/smile00.motion3.json",
+          "bytes": 1054,
+          "sha256": "a15512dc5e80e987f3a573ad4032afe93da661037a479ba1500cf9c5e0ff2335"
+        },
+        {
+          "path": "mikuru/smile01.motion3.json",
+          "bytes": 1339,
+          "sha256": "ac59a76afd8bf0e0d320f94d762c3baaef86265f410e7d35f9342979489afcf5"
+        },
+        {
+          "path": "mikuru/smile02.motion3.json",
+          "bytes": 2799,
+          "sha256": "39aaec07c7bfabfccfb2537dd94466087678f02cf729d29d9606edbeacee4c07"
+        },
+        {
+          "path": "mikuru/smile03.motion3.json",
+          "bytes": 1496,
+          "sha256": "f683a7af4fb0fc5e5a07570f0fa252de1280656bdf0dd084f917f4588d0f1b64"
+        },
+        {
+          "path": "mikuru/smile04.motion3.json",
+          "bytes": 1456,
+          "sha256": "3c879e6b06637164e428260e4555b24a6686ea4871ddcb40557805934d55fd65"
+        },
+        {
+          "path": "mikuru/smile05.motion3.json",
+          "bytes": 2030,
+          "sha256": "400f3f8b536f91002985f609961db5a75a2eeed1c9a96bc550beb11f9c3ddf90"
+        },
+        {
+          "path": "mikuru/smile06.motion3.json",
+          "bytes": 2084,
+          "sha256": "384ce6fcb859a39e0c77029ae1f2df05e599ff9407a045e179fafdfbf5148ed0"
+        },
+        {
+          "path": "mikuru/hello.motion3.json",
+          "bytes": 1899,
+          "sha256": "319ad63ecd07fc3c800ef41f91514ae330168c8290c3d508fb95ad44abaea175"
+        },
+        {
+          "path": "mikuru/leave.motion3.json",
+          "bytes": 2067,
+          "sha256": "515666985904e294966018b1686b130ab53a22d0562b031809946a6a04d33b89"
+        },
+        {
+          "path": "mikuru/pad-in.motion3.json",
+          "bytes": 297,
+          "sha256": "07affb1814d31adfc5779f39c6f7ae41b93066ec1232c3bf317d56aa230c1319"
+        },
+        {
+          "path": "mikuru/pad-out.motion3.json",
+          "bytes": 297,
+          "sha256": "368789fd1ce0d933390281d30be319505ad9da0fcd56df975437f4872046a1ef"
+        },
+        {
+          "path": "mikuru/casement-in.motion3.json",
+          "bytes": 266,
+          "sha256": "a7ab8b8e6fa21f368b53ed758b32e46351d82b3a218831c1cc061e66036c5b06"
+        },
+        {
+          "path": "mikuru/casement-out.motion3.json",
+          "bytes": 266,
+          "sha256": "35f4fdb84965d0480a8b7da42b65f20c8544223369bf71ee00a595a4f40ca3f1"
+        },
+        {
+          "path": "mikuru/duck-in.motion3.json",
+          "bytes": 262,
+          "sha256": "c95a4247423dcb83e39d3afb2f2261cc34a89c14ad68a61ae04d311587d75d0e"
+        },
+        {
+          "path": "mikuru/duck-out.motion3.json",
+          "bytes": 262,
+          "sha256": "bfd32bcd68aa533105fe43eab7db66dcc03fb02fb56dbf78d1844eabdff7c687"
+        },
+        {
+          "path": "mikuru/casement.motion3.json",
+          "bytes": 335,
+          "sha256": "ac5d194b50047eccb429ad1fbad29f0026429e9fb8ae782c1979b9ff192e2021"
+        },
+        {
+          "path": "mikuru/duck.motion3.json",
+          "bytes": 335,
+          "sha256": "54febdccb533d40ea477159b39765e9f147524df488e7fd2a96451679d1b5117"
+        },
+        {
+          "path": "mikuru/default.motion3.json",
+          "bytes": 335,
+          "sha256": "ec7162ce2f86b03d487ac58caebf408cc3fefa8c7724c0a6f35dfcaa9e657947"
+        }
+      ]
+    },
+    {
+      "character": "yuki",
+      "url": "https://cdn.harucdn.com/model_yuki.js",
+      "bundleFile": ".tmp/harupet-source/model_yuki.js",
+      "bundleBytes": 1392236,
+      "bundleSha256": "db6551ea69d889cf1c7d16fdd3372536126511e6bd739a7d34b28fbec197af2a",
+      "decodedBytes": 380653,
+      "excludedPlaceholderBytes": 458,
+      "files": [
+        {
+          "path": "yuki/yuki.model3.json",
+          "bytes": 1409,
+          "sha256": "c2ae3a9298be429e90421b8e1158e4255b5e2bff586eafc8530b6262a7fba847"
+        },
+        {
+          "path": "yuki/yuki.moc3",
+          "bytes": 83584,
+          "sha256": "349ca262fb8e0ec9283cfca2e40f51e8f0bf399c0a571c9fa6b8dcb19756bf22"
+        },
+        {
+          "path": "yuki/texture_00.webp",
+          "bytes": 284344,
+          "sha256": "6a084cbb8bd91d8005594fdf9a31dc812892c82a3c5cd500a4fee3de8b29af15",
+          "texture": {
+            "width": 1024,
+            "height": 1024
+          }
+        },
+        {
+          "path": "yuki/yuki.physics3.json",
+          "bytes": 1470,
+          "sha256": "5c2cd8f1b08f5510f0145a9d75abbb8623fa4dbc4453cd08393cff49484d29fc"
+        },
+        {
+          "path": "yuki/yuki.cdi3.json",
+          "bytes": 3400,
+          "sha256": "f866ab6ac95efd8fef52bbdd467dea939950c67d36de17bb3a08ca541c3eb46c"
+        },
+        {
+          "path": "yuki/hello.motion3.json",
+          "bytes": 1239,
+          "sha256": "9cea6e7d32efd74c70c43c9449469d1bf2646bfc3df0c6bb47f70b778aafa2f7"
+        },
+        {
+          "path": "yuki/waspace.motion3.json",
+          "bytes": 2402,
+          "sha256": "40fa6dd6b340a024f830656c2911a947c6663137f1e04c2f4d154009d42814c1"
+        },
+        {
+          "path": "yuki/hide.motion3.json",
+          "bytes": 1244,
+          "sha256": "307383b6feb372f678f949af4286fd733283656f1c68104ee855279d66a92711"
+        },
+        {
+          "path": "yuki/curtain-in.motion3.json",
+          "bytes": 929,
+          "sha256": "733dadfd0387739f8a30f8e16ef710846e17b67d9b10c6855f02d4f16f8fdeda"
+        },
+        {
+          "path": "yuki/curtain-out.motion3.json",
+          "bytes": 979,
+          "sha256": "4d33fd4a818e77c99af986c6e883c1597bc0e873f452f3c42d1dc1d0d18a1e3d"
+        },
+        {
+          "path": "yuki/dusk-in.motion3.json",
+          "bytes": 302,
+          "sha256": "8cc15cdebef48da1ccadaff13dbb475371fbfe408ca7fc1e3e30c9acae98e77a"
+        },
+        {
+          "path": "yuki/dusk-out.motion3.json",
+          "bytes": 302,
+          "sha256": "137f79dc7c8321f2251b4fc29f4e51d295bff1078591bc60a7401904123bdfec"
+        }
+      ]
+    }
+  ]
+}

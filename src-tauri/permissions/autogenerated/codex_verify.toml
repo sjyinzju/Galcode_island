@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-codex-verify"
+description = "Enables the codex_verify command without any pre-configured scope."
+commands.allow = ["codex_verify"]
+
+[[permission]]
+identifier = "deny-codex-verify"
+description = "Denies the codex_verify command without any pre-configured scope."
+commands.deny = ["codex_verify"]

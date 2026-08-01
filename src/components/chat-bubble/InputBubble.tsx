@@ -1,8 +1,12 @@
 import { useState, useEffect, useRef, type KeyboardEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { invoke, isTauri, pickFiles, pickFolder } from "../../lib/bridge";
-import { buildImportedFallbackContext } from "../../lib/importedConversation";
+import {
+  buildImportedFallbackContext,
+  canContinueImportedConversation,
+} from "../../lib/importedConversation";
 import { resolveLaunchMessage } from "../../lib/chatLaunch";
+import { runExclusive } from "../../lib/runExclusive";
 import { useAppStore } from "../../stores/useAppStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { useSettingsStore } from "../../stores/useSettingsStore";
@@ -52,6 +56,7 @@ export function InputBubble(): JSX.Element {
   // 中文输入法 composition 期间不要把 Enter 当发送 — 双保险用 keydown.isComposing
   // + composition* 事件标记
   const isComposingRef = useRef(false);
+  const launchInFlightRef = useRef(false);
 
   useEffect(() => {
     setAttachmentPaths([]);
@@ -174,10 +179,14 @@ export function InputBubble(): JSX.Element {
     return () => clearInterval(intervalId);
   }, [greeting, agentStatus]);
 
-  const handleLaunch = async (): Promise<void> => {
+  const handleLaunch = (): Promise<void> => runExclusive(launchInFlightRef, async () => {
     const launchMessage = resolveLaunchMessage(task, attachmentPaths.length);
     if (!launchMessage || !activeTabId) return;
     const { visibleText, agentInput } = launchMessage;
+    if (!canContinueImportedConversation(
+      tab.importedConversationId,
+      tab.hasFullImportedHistory,
+    )) return;
     // 斜杠命令优先：能本地处理就不走 start_agent。
     // tryRunBuiltin 内部已 clear value 并返回 true；passthrough / 项目命令 /
     // 未知命令返回 false，落到下面的 start_agent 透传路径。
@@ -290,7 +299,7 @@ export function InputBubble(): JSX.Element {
         agentStatus: "error",
       });
     }
-  };
+  });
 
   return (
     <AnimatePresence>

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-generate-commit-message"
+description = "Enables the git_generate_commit_message command without any pre-configured scope."
+commands.allow = ["git_generate_commit_message"]
+
+[[permission]]
+identifier = "deny-git-generate-commit-message"
+description = "Denies the git_generate_commit_message command without any pre-configured scope."
+commands.deny = ["git_generate_commit_message"]

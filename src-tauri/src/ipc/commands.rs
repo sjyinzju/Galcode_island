@@ -10,9 +10,11 @@ use crate::external_history::{
 use crate::AppState;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,25 +92,115 @@ pub async fn import_external_sessions(
 }
 
 #[tauri::command]
-pub fn list_imported_conversations(
+pub async fn list_imported_conversations(
     app: AppHandle,
 ) -> Result<Vec<ImportedConversationSummary>, String> {
-    external_history::list_imported_conversations(&app)
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::list_imported_conversations(&app)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation list task failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn load_imported_conversation(app: AppHandle, id: String) -> Result<ImportedConversation, String> {
-    external_history::load_imported_conversation(&app, &id)
+pub async fn load_imported_conversation(
+    app: AppHandle,
+    id: String,
+) -> Result<ImportedConversation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::load_imported_conversation(&app, &id)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation load task failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn load_imported_asset(app: AppHandle, asset_id: String) -> Result<String, String> {
-    external_history::load_imported_asset(&app, &asset_id)
+pub async fn load_imported_asset(app: AppHandle, asset_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::load_imported_asset(&app, &asset_id)
+    })
+    .await
+    .map_err(|error| format!("Imported asset load task failed: {error}"))?
+}
+
+fn is_verbatim_local_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 7
+        && bytes.starts_with(b"\\\\?\\")
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && matches!(bytes[6], b'\\' | b'/')
+}
+
+fn validated_local_file_path(path: &str) -> Result<PathBuf, String> {
+    const SAFE_EXTENSIONS: &[&str] = &[
+        "bmp", "csv", "doc", "docx", "flac", "gif", "jpeg", "jpg", "json", "jsonl", "log", "m4a",
+        "markdown", "md", "mkv", "mov", "mp3", "mp4", "odp", "ods", "odt", "ogg", "pdf", "png",
+        "ppt", "pptx", "rtf", "toml", "tsv", "txt", "wav", "webm", "webp", "xls", "xlsx", "xml",
+        "yaml", "yml",
+    ];
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Local file path must not be empty".to_string());
+    }
+    if path.starts_with(r"\\") || path.starts_with("//") {
+        return Err("Remote and device file paths are not allowed".to_string());
+    }
+    let candidate = PathBuf::from(path);
+    if !candidate.is_absolute() {
+        return Err("Local file path must be absolute".to_string());
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve local file: {error}"))?;
+    let canonical_text = canonical.to_string_lossy();
+    if (canonical_text.starts_with(r"\\") && !is_verbatim_local_drive_path(&canonical_text))
+        || canonical_text.starts_with("//")
+    {
+        return Err("Remote and device file paths are not allowed".to_string());
+    }
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("Could not inspect local file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Local file path must point to a regular file".to_string());
+    }
+    let extension = canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "Local file type is not allowed".to_string())?;
+    if !SAFE_EXTENSIONS.contains(&extension.as_str()) {
+        return Err("Local file type is not allowed".to_string());
+    }
+    #[cfg(windows)]
+    if is_verbatim_local_drive_path(&canonical_text) {
+        return Ok(PathBuf::from(&canonical_text[4..]));
+    }
+    Ok(canonical)
+}
+
+/// Open an existing local file from the desktop webview.
+///
+/// This command is deliberately not exposed through the LAN dispatcher: a browser client must
+/// never be able to ask the host machine to open an arbitrary path.
+#[tauri::command]
+pub async fn open_local_file(app: AppHandle, path: String) -> Result<(), String> {
+    let path = tauri::async_runtime::spawn_blocking(move || validated_local_file_path(&path))
+        .await
+        .map_err(|error| format!("Local file validation task failed: {error}"))??;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|error| format!("Could not open local file: {error}"))
 }
 
 #[tauri::command]
-pub fn remove_imported_conversation(app: AppHandle, id: String) -> Result<(), String> {
-    external_history::remove_imported_conversation(&app, &id)
+pub async fn remove_imported_conversation(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::remove_imported_conversation(&app, &id)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation removal task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1557,4 +1649,36 @@ pub fn lan_remove_storage(
     }
     crate::lan::shared_storage::schedule_save(&app, lan.inner());
     Ok(())
+}
+
+#[cfg(test)]
+mod local_file_tests {
+    use super::validated_local_file_path;
+    use std::fs;
+
+    #[test]
+    fn validates_only_existing_absolute_regular_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "galcode-local-file-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let file = directory.join("report.pdf");
+        fs::write(&file, b"pdf").expect("create test file");
+        let executable = directory.join("run.exe");
+        fs::write(&executable, b"not executable").expect("create blocked file");
+
+        let validated =
+            validated_local_file_path(file.to_string_lossy().as_ref()).expect("valid file");
+        #[cfg(windows)]
+        assert_eq!(validated, file);
+        #[cfg(not(windows))]
+        assert_eq!(validated, file.canonicalize().expect("canonical file"));
+        assert!(validated_local_file_path("report.pdf").is_err());
+        assert!(validated_local_file_path(directory.to_string_lossy().as_ref()).is_err());
+        assert!(validated_local_file_path(executable.to_string_lossy().as_ref()).is_err());
+        assert!(validated_local_file_path(r"\\server\share\report.pdf").is_err());
+
+        fs::remove_dir_all(directory).ok();
+    }
 }

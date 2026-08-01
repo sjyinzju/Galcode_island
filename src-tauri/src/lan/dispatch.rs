@@ -352,19 +352,19 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
             Ok(Value::Null)
         }
         "list_imported_conversations" => {
-            to_value(commands::list_imported_conversations(app.clone())?)
+            to_value(commands::list_imported_conversations(app.clone()).await?)
         }
         "load_imported_conversation" => {
             let p: ImportedConversationArgs = parse(args)?;
-            to_value(commands::load_imported_conversation(app.clone(), p.id)?)
+            to_value(commands::load_imported_conversation(app.clone(), p.id).await?)
         }
         "load_imported_asset" => {
             let p: ImportedAssetArgs = parse(args)?;
-            to_value(commands::load_imported_asset(app.clone(), p.asset_id)?)
+            to_value(commands::load_imported_asset(app.clone(), p.asset_id).await?)
         }
         "remove_imported_conversation" => {
             let p: ImportedConversationArgs = parse(args)?;
-            commands::remove_imported_conversation(app.clone(), p.id)?;
+            commands::remove_imported_conversation(app.clone(), p.id).await?;
             Ok(Value::Null)
         }
         "list_sessions" => to_value(commands::list_sessions(app_state)?),

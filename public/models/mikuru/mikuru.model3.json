@@ -1,0 +1,144 @@
+{
+  "Version": 3,
+  "FileReferences": {
+    "Moc": "1096.moc3",
+    "Textures": [
+      "1096.2048/texture_00.webp"
+    ],
+    "Physics": "1096.physics3.json",
+    "DisplayInfo": "1096.cdi3.json",
+    "Motions": {
+      "Smile0": [
+        {
+          "File": "smile00.motion3.json"
+        }
+      ],
+      "Smile1": [
+        {
+          "File": "smile01.motion3.json",
+          "FadeInTime": 0.3
+        }
+      ],
+      "Smile2": [
+        {
+          "File": "smile02.motion3.json",
+          "FadeInTime": 0.6
+        }
+      ],
+      "Smile3": [
+        {
+          "File": "smile03.motion3.json",
+          "FadeInTime": 0.3
+        }
+      ],
+      "Smile4": [
+        {
+          "File": "smile04.motion3.json",
+          "FadeInTime": 0.3,
+          "FadeOutTime": 0.3
+        }
+      ],
+      "Smile5": [
+        {
+          "File": "smile05.motion3.json",
+          "FadeInTime": 0.3
+        }
+      ],
+      "Smile6": [
+        {
+          "File": "smile06.motion3.json",
+          "FadeInTime": 0.3
+        }
+      ],
+      "hello": [
+        {
+          "File": "hello.motion3.json",
+          "FadeOutTime": 0.2
+        }
+      ],
+      "leave": [
+        {
+          "File": "leave.motion3.json",
+          "FadeOutTime": 0.2
+        }
+      ],
+      "pad-in": [
+        {
+          "File": "pad-in.motion3.json"
+        }
+      ],
+      "pad-out": [
+        {
+          "File": "pad-out.motion3.json"
+        }
+      ],
+      "casement-in": [
+        {
+          "File": "casement-in.motion3.json"
+        }
+      ],
+      "casement-out": [
+        {
+          "File": "casement-out.motion3.json"
+        }
+      ],
+      "duck-in": [
+        {
+          "File": "duck-in.motion3.json"
+        }
+      ],
+      "duck-out": [
+        {
+          "File": "duck-out.motion3.json"
+        }
+      ],
+      "casement": [
+        {
+          "File": "casement.motion3.json",
+          "FadeInTime": 1.8
+        }
+      ],
+      "duck": [
+        {
+          "File": "duck.motion3.json",
+          "FadeInTime": 1.8
+        }
+      ],
+      "default": [
+        {
+          "File": "default.motion3.json",
+          "FadeInTime": 1.8
+        }
+      ]
+    }
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Ids": [
+        "ParamEyeLOpen",
+        "ParamEyeROpen"
+      ]
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Ids": []
+    }
+  ],
+  "HitAreas": [
+    {
+      "Id": "HitAreaHead",
+      "Name": "Head"
+    },
+    {
+      "Id": "HitAreaPad",
+      "Name": "Pad"
+    },
+    {
+      "Id": "HitAreaMune",
+      "Name": "Mune"
+    }
+  ]
+}

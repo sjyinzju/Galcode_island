@@ -9,6 +9,7 @@
     "prebuild": "npm run prepare:runtime",
     "build": "node scripts/run-tauri.mjs build",
     "build:web": "vite build",
+    "extract:harupet-models": "node scripts/extract-harupet-models.mjs",
     "preview": "vite preview",
     "tauri": "node scripts/run-tauri.mjs",
     "typecheck": "tsc -b --noEmit",

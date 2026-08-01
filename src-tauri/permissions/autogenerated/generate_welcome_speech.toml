@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-generate-welcome-speech"
+description = "Enables the generate_welcome_speech command without any pre-configured scope."
+commands.allow = ["generate_welcome_speech"]
+
+[[permission]]
+identifier = "deny-generate-welcome-speech"
+description = "Denies the generate_welcome_speech command without any pre-configured scope."
+commands.deny = ["generate_welcome_speech"]

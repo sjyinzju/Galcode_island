@@ -53,6 +53,30 @@ afterAll(() => {
 });
 
 describe("useTabsStore full imported history", () => {
+  it("invalidates full history only for imported tabs persisted before version 3", async () => {
+    const migrate = useTabsStore.persist.getOptions().migrate!;
+    const migrated = await migrate({
+      tabs: {
+        imported: {
+          importedConversationId: "external:codex:stale",
+          hasFullImportedHistory: true,
+        },
+        ordinary: {
+          importedConversationId: null,
+          hasFullImportedHistory: true,
+        },
+      },
+    }, 2) as {
+      tabs: Record<string, {
+        importedConversationId: string | null;
+        hasFullImportedHistory: boolean;
+      }>;
+    };
+
+    expect(migrated.tabs.imported?.hasFullImportedHistory).toBe(false);
+    expect(migrated.tabs.ordinary?.hasFullImportedHistory).toBe(true);
+  });
+
   it("keeps 305+ imported blocks through create, append, and upsert", () => {
     const importedBlocks: CliBlock[] = Array.from({ length: 305 }, (_, index) => ({
       id: `imported-${index}`,

@@ -1,7 +1,12 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { createSharedStorage, onStorageExternalChange } from "../lib/sharedStorage";
+import { normalizeDesktopPetSettings } from "../pet/protocol";
 import type { PermissionMode } from "../types/agent";
+import {
+  DEFAULT_DESKTOP_PET_SETTINGS,
+  type DesktopPetSettings,
+} from "../types/pet";
 
 export type BackendKey = "claude-code" | "codex" | "opencode";
 
@@ -131,6 +136,8 @@ interface SettingsState {
   /// 拟人化气泡（开场问候语 / 情绪反馈）也一并隐藏，问候语的 LLM 生成同样跳过。
   /// 个性化弹窗 / 预览对话框里的桌宠不受影响。
   petEnabled: boolean;
+  /// 独立原生桌宠窗口的设置。与上面的主面板 GIF 萌宠开关互不影响。
+  desktopPet: DesktopPetSettings;
   /// 缓存上次拉到的模型列表，避免每次 SettingsModal 打开都拉
   availableModels: string[];
   /// 桌宠图社区后端地址（如 https://community.example.com）。空字符串 = 未启用，
@@ -153,6 +160,7 @@ interface SettingsState {
   setThinking: (thinking: boolean) => void;
   setTranslateInput: (translateInput: boolean) => void;
   setPetEnabled: (petEnabled: boolean) => void;
+  setDesktopPetSettings: (patch: Partial<DesktopPetSettings>) => void;
   setAvailableModels: (models: string[]) => void;
   setCommunityBaseUrl: (url: string) => void;
   setBackendPref: (backend: BackendKey, field: keyof BackendPrefs, value: string) => void;
@@ -172,6 +180,7 @@ export const useSettingsStore = create<SettingsState>()(
       thinking: false,
       translateInput: false,
       petEnabled: true,
+      desktopPet: { ...DEFAULT_DESKTOP_PET_SETTINGS },
       availableModels: [],
       communityBaseUrl: "",
       backends: {
@@ -189,6 +198,13 @@ export const useSettingsStore = create<SettingsState>()(
       setThinking: (thinking) => set({ thinking }),
       setTranslateInput: (translateInput) => set({ translateInput }),
       setPetEnabled: (petEnabled) => set({ petEnabled }),
+      setDesktopPetSettings: (patch) =>
+        set((state) => {
+          const desktopPet = normalizeDesktopPetSettings({ ...state.desktopPet, ...patch });
+          return JSON.stringify(desktopPet) === JSON.stringify(state.desktopPet)
+            ? state
+            : { desktopPet };
+        }),
       setAvailableModels: (availableModels) => set({ availableModels }),
       setCommunityBaseUrl: (communityBaseUrl) => set({ communityBaseUrl }),
       setBackendPref: (backend, field, value) =>
@@ -222,7 +238,12 @@ export const useSettingsStore = create<SettingsState>()(
           codex: { ...emptyBackendPrefs(), ...(persisted.backends?.codex ?? {}) },
           opencode: { ...emptyBackendPrefs(), ...(persisted.backends?.opencode ?? {}) },
         };
-        return { ...currentState, ...persisted, backends: mergedBackends };
+        return {
+          ...currentState,
+          ...persisted,
+          desktopPet: normalizeDesktopPetSettings(persisted.desktopPet),
+          backends: mergedBackends,
+        };
       },
       partialize: (state) => ({
         systemPrompt: state.systemPrompt,
@@ -233,6 +254,7 @@ export const useSettingsStore = create<SettingsState>()(
         thinking: state.thinking,
         translateInput: state.translateInput,
         petEnabled: state.petEnabled,
+        desktopPet: state.desktopPet,
         availableModels: state.availableModels,
         communityBaseUrl: state.communityBaseUrl,
         backends: state.backends,

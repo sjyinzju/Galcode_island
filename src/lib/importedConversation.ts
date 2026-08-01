@@ -5,21 +5,34 @@ import type {
   ImportedTranscriptPart,
 } from "../types/externalHistory";
 
+export function canContinueImportedConversation(
+  importedConversationId: string | null,
+  hasFullImportedHistory: boolean,
+): boolean {
+  return !importedConversationId || hasFullImportedHistory;
+}
+
 const INTERRUPTED_MESSAGE_PATTERN =
   /^\[Request interrupted by user(?: for tool use)?\]$/i;
+const NEVER_USER_RUNTIME_PREFIXES = [
+  "<codex_internal_context",
+  "<turn_aborted",
+  "<subagent_notification",
+  "<local-command-caveat",
+  "<local-command-name",
+  "<local-command-stdout",
+  "<command-name",
+  "<command-message",
+  "<command-args",
+  "<task-notification>",
+] as const;
 const CONTEXT_ONLY_PREFIXES = [
   "# AGENTS.md",
   "# CLAUDE.md",
   "<recommended_plugins",
-  "<codex_internal_context",
-  "<turn_aborted",
-  "<subagent_notification",
   "<environment_context",
   "<permissions instructions",
-  "<local-command-caveat",
-  "<local-command-name",
-  "<local-command-stdout",
-  "<task-notification>",
+  ...NEVER_USER_RUNTIME_PREFIXES,
 ] as const;
 
 const OPAQUE_THINKING_KINDS = new Set(["thinking", "reasoning"]);
@@ -198,15 +211,20 @@ function readableThinkingEventText(part: ImportedTranscriptPart): string | null 
 interface ImportedBlockContext {
   conversationId: string;
   message: ImportedTranscriptMessage;
+  messageKey: string;
   turnId: string;
 }
 
 function withImportedSource(block: CliBlock, context: ImportedBlockContext): CliBlock {
+  const sourceRole = context.message.role === "user" &&
+      !isActualUserPromptMessage(context.message)
+    ? "system"
+    : context.message.role;
   return {
     ...block,
     sourceMessageId: context.message.id,
     sourceTimestamp: context.message.timestamp,
-    sourceRole: context.message.role,
+    sourceRole,
     sourceTurnId: context.turnId,
     importedConversationId: context.conversationId,
   };
@@ -215,15 +233,14 @@ function withImportedSource(block: CliBlock, context: ImportedBlockContext): Cli
 function taskNotificationBlock(
   context: ImportedBlockContext,
 ): CliBlock | null {
-  const { conversationId, message } = context;
+  const { conversationId, message, messageKey } = context;
   const content = message.content.trim();
-  if (message.isUserPrompt === true) return null;
   if (!content.startsWith("<task-notification>")) return null;
   const status = content.match(/<status>([\s\S]*?)<\/status>/i)?.[1]?.trim();
   const summary = content.match(/<summary>([\s\S]*?)<\/summary>/i)?.[1]?.trim();
   const detailValue = summary || "Background task update";
   return withImportedSource({
-    id: `imported-${conversationId}-${message.id}-task-notification`,
+    id: `imported-${conversationId}-${messageKey}-task-notification`,
     type: "tool",
     tool: "Task notification",
     detail: formatImportedValuePreview(detailValue),
@@ -233,9 +250,11 @@ function taskNotificationBlock(
 }
 
 export function isActualUserPromptMessage(message: ImportedTranscriptMessage): boolean {
+  const content = message.content.trimStart();
+  // Older imports persisted some runtime records as explicit user prompts.
+  if (NEVER_USER_RUNTIME_PREFIXES.some((prefix) => content.startsWith(prefix))) return false;
   if (typeof message.isUserPrompt === "boolean") return message.isUserPrompt;
   if (message.role !== "user") return false;
-  const content = message.content.trimStart();
   if (INTERRUPTED_MESSAGE_PATTERN.test(content.trim())) return false;
   if (CONTEXT_ONLY_PREFIXES.some((prefix) => content.startsWith(prefix))) return false;
   const parts = message.parts ?? [];
@@ -250,8 +269,25 @@ function messageTextBlock(
   content: string,
 ): CliBlock {
   if (isActualUserPromptMessage(message)) return { id, type: "user-prompt", content };
-  if (message.role === "assistant") return { id, type: "text", content };
-  return { id, type: "status", message: content };
+  const isApiError = message.isApiError === true || /^API Error(?:\s*:|$)/i.test(content.trim());
+  if (message.role === "assistant") {
+    return {
+      id,
+      type: "text",
+      content,
+      ...(isApiError ? { collapsedLabel: "API 错误", isApiError: true } : {}),
+    };
+  }
+  return {
+    id,
+    type: "status",
+    message: content,
+    ...(isApiError
+      ? { collapsedLabel: "API 错误", isApiError: true }
+      : message.role === "user" || message.role === "system" || message.role === "developer"
+      ? { collapsedLabel: "内部上下文" }
+      : {}),
+  };
 }
 
 function legacyPartContent(part: ImportedTranscriptPart): string {
@@ -277,8 +313,8 @@ function partToBlock(
   part: ImportedTranscriptPart,
   index: number,
 ): CliBlock {
-  const { conversationId, message } = context;
-  const id = `imported-${conversationId}-${message.id}-${index}`;
+  const { conversationId, message, messageKey } = context;
+  const id = `imported-${conversationId}-${messageKey}-${index}`;
   let block: CliBlock;
   switch (part.type) {
     case "text":
@@ -340,10 +376,13 @@ function partToBlock(
         };
         break;
       }
+      const isApiError = /(?:^|[._-])(?:api[_-]?)?error(?:$|[._-])/i.test(part.kind);
       block = {
         id,
         type: "status",
         message: `${part.kind}${part.data === null || part.data === undefined ? "" : `: ${compactEventValue(part.data)}`}`,
+        collapsedLabel: isApiError ? "API 错误" : part.kind,
+        ...(isApiError ? { isApiError: true } : {}),
       };
       break;
   }
@@ -351,7 +390,7 @@ function partToBlock(
 }
 
 function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
-  const { conversationId, message } = context;
+  const { conversationId, message, messageKey } = context;
   const taskNotification = taskNotificationBlock(context);
   if (taskNotification) return [taskNotification];
 
@@ -360,7 +399,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
     : message.content.trim().match(INTERRUPTED_MESSAGE_PATTERN)?.[0];
   if (interruptedMessage) {
     return [withImportedSource({
-      id: `imported-${conversationId}-${message.id}-interrupted`,
+      id: `imported-${conversationId}-${messageKey}-interrupted`,
       type: "status",
       message: interruptedMessage.slice(1, -1),
     }, context)];
@@ -400,7 +439,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
       return parts.flatMap((part, index) => {
         if (index === firstPromptPartIndex) {
           return [withImportedSource({
-            id: `imported-${conversationId}-${message.id}-${index}`,
+            id: `imported-${conversationId}-${messageKey}-${index}`,
             type: "user-prompt" as const,
             content: promptContent || message.content,
             images: images.length > 0 ? images : undefined,
@@ -420,7 +459,7 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
     const projectedContent = parts.map(legacyPartContent).join("\n\n").trim();
     if (!parts.some((part) => part.type === "text") && content && content !== projectedContent) {
       blocks.unshift(withImportedSource(
-        messageTextBlock(`imported-${conversationId}-${message.id}-content`, message, content),
+        messageTextBlock(`imported-${conversationId}-${messageKey}-content`, message, content),
         context,
       ));
     }
@@ -429,10 +468,207 @@ function messageToBlocks(context: ImportedBlockContext): CliBlock[] {
   if (!message.content.trim()) return [];
   return [
     withImportedSource(
-      messageTextBlock(`imported-${conversationId}-${message.id}`, message, message.content),
+      messageTextBlock(`imported-${conversationId}-${messageKey}`, message, message.content),
       context,
     ),
   ];
+}
+
+function sourceMessageIdentity(message: ImportedTranscriptMessage): string {
+  return `${message.id}\0${message.role}`;
+}
+
+function claimImportedMessageKey(messageId: string, used: Set<string>): string {
+  let candidate = messageId;
+  let occurrence = 1;
+  while (used.has(candidate)) {
+    occurrence += 1;
+    candidate = `${messageId}~${occurrence}`;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
+    return false;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
+      left.every((value, index) => sameJsonValue(value, right[index]));
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length && leftKeys.every((key) =>
+    Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+    sameJsonValue(leftRecord[key], rightRecord[key])
+  );
+}
+
+function sameMessageSemantics(
+  left: ImportedTranscriptMessage,
+  right: ImportedTranscriptMessage,
+): boolean {
+  return left.role === right.role &&
+    isActualUserPromptMessage(left) === isActualUserPromptMessage(right) &&
+    Boolean(left.isApiError) === Boolean(right.isApiError) &&
+    left.content === right.content &&
+    sameJsonValue(left.parts ?? [], right.parts ?? []);
+}
+
+interface ReplayMessageCount {
+  message: ImportedTranscriptMessage;
+  count: number;
+}
+
+interface ReplayTurnVariant {
+  prompt: ImportedTranscriptMessage;
+  messagesByBucket: Map<string, ReplayMessageCount[]>;
+}
+
+function replayMessageBucket(message: ImportedTranscriptMessage): string {
+  const parts = message.parts ?? [];
+  return [
+    message.role,
+    isActualUserPromptMessage(message) ? "1" : "0",
+    message.isApiError ? "1" : "0",
+    message.content,
+    parts.length.toString(),
+    parts.map((part) => part.type).join("\0"),
+  ].join("\0");
+}
+
+export function dedupeImportedConversationMessages(
+  messages: readonly ImportedTranscriptMessage[],
+): ImportedTranscriptMessage[] {
+  const maxSourceMessageVariants = 32;
+  const messageDeduped: ImportedTranscriptMessage[] = [];
+  let currentTurnId: string | null = null;
+  let seenNonUserIds = new Map<string, ImportedTranscriptMessage[]>();
+
+  for (const message of messages) {
+    const isUserPrompt = isActualUserPromptMessage(message);
+    if (isUserPrompt) {
+      currentTurnId = message.sourceTurnId?.trim() || null;
+      seenNonUserIds = new Map();
+      messageDeduped.push(message);
+      continue;
+    }
+    const explicitTurnId = message.sourceTurnId?.trim();
+    if (explicitTurnId && explicitTurnId !== currentTurnId) {
+      currentTurnId = explicitTurnId;
+      seenNonUserIds = new Map();
+    }
+    const sourceIdentity = sourceMessageIdentity(message);
+    const sourceCandidates = seenNonUserIds.get(sourceIdentity) ?? [];
+    if (sourceCandidates.some((candidate) => sameMessageSemantics(candidate, message))) continue;
+    if (sourceCandidates.length < maxSourceMessageVariants) {
+      sourceCandidates.push(message);
+      seenNonUserIds.set(sourceIdentity, sourceCandidates);
+    }
+    messageDeduped.push(message);
+  }
+
+  const result: ImportedTranscriptMessage[] = [];
+  const seenTurns = new Map<string, ReplayTurnVariant[]>();
+  const maxTurnVariantsPerSource = 32;
+  const maxMessageVariantsPerBucket = 32;
+  const maxTrackedVariants = 50_000;
+  let trackedTurnVariants = 0;
+  let trackedMessageVariants = 0;
+  let current: ImportedTranscriptMessage[] = [];
+
+  const findReplayMessage = (
+    variant: ReplayTurnVariant,
+    message: ImportedTranscriptMessage,
+    add: boolean,
+  ): ReplayMessageCount | null => {
+    const bucket = replayMessageBucket(message);
+    const candidates = variant.messagesByBucket.get(bucket) ?? [];
+    const existing = candidates.find((candidate) =>
+      sameMessageSemantics(candidate.message, message)
+    );
+    if (existing) return existing;
+    if (
+      !add ||
+      candidates.length >= maxMessageVariantsPerBucket ||
+      trackedMessageVariants >= maxTrackedVariants
+    ) {
+      return null;
+    }
+    const entry = { message, count: 0 };
+    candidates.push(entry);
+    variant.messagesByBucket.set(bucket, candidates);
+    trackedMessageVariants += 1;
+    return entry;
+  };
+
+  const appendTurn = (): void => {
+    if (current.length === 0) return;
+    const promptIndex = current.findIndex(isActualUserPromptMessage);
+    const prompt = promptIndex >= 0 ? current[promptIndex]! : null;
+    const sourceTurnId = prompt?.sourceTurnId?.trim() || null;
+    if (prompt && prompt.timestamp > 0 && sourceTurnId) {
+      const candidates = seenTurns.get(sourceTurnId) ?? [];
+      const replay = candidates.find((candidate) =>
+        sameMessageSemantics(candidate.prompt, prompt)
+      );
+      if (replay) {
+        result.push(...current.slice(0, promptIndex));
+        const observed = new Map<ReplayMessageCount, number>();
+        for (const message of current.slice(promptIndex + 1)) {
+          if (message.timestamp <= 0) {
+            result.push(message);
+            continue;
+          }
+          const entry = findReplayMessage(replay, message, true);
+          if (!entry) {
+            result.push(message);
+            continue;
+          }
+          const occurrence = (observed.get(entry) ?? 0) + 1;
+          observed.set(entry, occurrence);
+          if (occurrence > entry.count) result.push(message);
+        }
+        for (const [entry, count] of observed) {
+          entry.count = Math.max(entry.count, count);
+        }
+        current = [];
+        return;
+      }
+      if (
+        candidates.length < maxTurnVariantsPerSource &&
+        trackedTurnVariants < maxTrackedVariants
+      ) {
+        const variant: ReplayTurnVariant = {
+          prompt,
+          messagesByBucket: new Map(),
+        };
+        for (const message of current.slice(promptIndex + 1)) {
+          if (message.timestamp <= 0) continue;
+          const entry = findReplayMessage(variant, message, true);
+          if (entry) entry.count += 1;
+        }
+        candidates.push(variant);
+        seenTurns.set(sourceTurnId, candidates);
+        trackedTurnVariants += 1;
+      }
+    }
+    result.push(...current);
+    current = [];
+  };
+
+  for (const message of messageDeduped) {
+    if (isActualUserPromptMessage(message)) {
+      appendTurn();
+    }
+    current.push(message);
+  }
+  appendTurn();
+  return result;
 }
 
 export function importedConversationToTabInit(
@@ -443,9 +679,11 @@ export function importedConversationToTabInit(
   let lastUserPrompt: string | null = null;
   let turn = 0;
   let currentTurnId = `${conversation.id}:turn:0`;
+  const usedMessageKeys = new Set<string>();
 
-  for (const message of conversation.messages) {
-    if (isActualUserPromptMessage(message)) {
+  for (const message of dedupeImportedConversationMessages(conversation.messages)) {
+    const isUserPrompt = isActualUserPromptMessage(message);
+    if (isUserPrompt) {
       turn += 1;
       currentTurnId = message.sourceTurnId?.trim() || `${conversation.id}:turn:${turn}`;
       if (message.content.trim()) lastUserPrompt = message.content.trim();
@@ -455,6 +693,7 @@ export function importedConversationToTabInit(
     blocks.push(...messageToBlocks({
       conversationId: conversation.id,
       message,
+      messageKey: claimImportedMessageKey(message.id, usedMessageKeys),
       turnId: currentTurnId,
     }));
   }
@@ -569,6 +808,7 @@ function boundedNormalizedText(value: string | undefined, maxLength: number): st
 }
 
 function fallbackLine(block: CliBlock, maxLength: number): string | null {
+  if (block.isApiError) return null;
   if (block.type === "user-prompt") {
     const text = boundedNormalizedText(block.content, maxLength);
     const attachmentLines = [

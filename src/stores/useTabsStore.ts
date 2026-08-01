@@ -783,7 +783,7 @@ export const useTabsStore = create<TabsStoreState>()(
     }),
     {
       name: "galcode_tabs",
-      version: 2,
+      version: 3,
       // v1 → v2 迁移：把 permissionMode === "default" 改成 "acceptEdits"。
       //
       // 原因：Claude CLI 的 stream-json 非交互模式下，default mode 把所有工具
@@ -798,6 +798,18 @@ export const useTabsStore = create<TabsStoreState>()(
             const tab = state.tabs[id];
             if (tab && tab.permissionMode === "default") {
               tab.permissionMode = "acceptEdits";
+            }
+          }
+        }
+        if (version < 3 && state && typeof state === "object" && state.tabs) {
+          for (const id of Object.keys(state.tabs)) {
+            const tab = state.tabs[id];
+            if (
+              tab &&
+              typeof tab.importedConversationId === "string" &&
+              tab.importedConversationId.length > 0
+            ) {
+              tab.hasFullImportedHistory = false;
             }
           }
         }
