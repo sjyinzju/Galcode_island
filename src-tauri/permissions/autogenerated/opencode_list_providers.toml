@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-list-providers"
+description = "Enables the opencode_list_providers command without any pre-configured scope."
+commands.allow = ["opencode_list_providers"]
+
+[[permission]]
+identifier = "deny-opencode-list-providers"
+description = "Denies the opencode_list_providers command without any pre-configured scope."
+commands.deny = ["opencode_list_providers"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-send-prompt"
+description = "Enables the opencode_send_prompt command without any pre-configured scope."
+commands.allow = ["opencode_send_prompt"]
+
+[[permission]]
+identifier = "deny-opencode-send-prompt"
+description = "Denies the opencode_send_prompt command without any pre-configured scope."
+commands.deny = ["opencode_send_prompt"]

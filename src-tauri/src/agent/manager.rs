@@ -183,7 +183,6 @@ pub fn launch_claude_agent(
     // last_session_per_context 空了，前端持久化的 sessionId 能续上下文。
     resume_hint: Option<String>,
     imported_fallback_context: Option<String>,
-    attachment_paths: Vec<String>,
     // Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
     // None 时由 claude.rs 内部 fallback 到 acceptEdits（保留老行为）。
     permission_mode: Option<String>,
@@ -238,7 +237,6 @@ pub fn launch_claude_agent(
     let fallback_context = imported_fallback_context
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let attachment_paths_owned = attachment_paths;
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -430,7 +428,6 @@ pub fn launch_codex_agent(
     // 前端持久化的 tab.sessionId（codex 这里其实是 thread_id）hint：作 resume 候选。
     resume_hint: Option<String>,
     imported_fallback_context: Option<String>,
-    attachment_paths: Vec<String>,
     // 桌宠社区图自定义"人设 prompt"
     prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
@@ -483,7 +480,6 @@ pub fn launch_codex_agent(
     let fallback_context = imported_fallback_context
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let attachment_paths_owned = attachment_paths;
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -1491,44 +1487,6 @@ fn initial_imported_prompt(
     }
 }
 
-fn append_attachment_context(prompt: &str, attachment_paths: &[String]) -> String {
-    if attachment_paths.is_empty() {
-        return prompt.to_string();
-    }
-    let paths = attachment_paths
-        .iter()
-        .map(|path| format!("- {}", path.replace(['\r', '\n'], " ")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "{}\n\n<galcode_attachments>\nThe user attached these local files. Inspect them only as needed:\n{}\n</galcode_attachments>",
-        prompt, paths,
-    )
-}
-
-fn normalize_attachment_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
-    paths
-        .into_iter()
-        .filter(|path| !path.trim().is_empty())
-        .map(|path| {
-            let candidate = std::path::PathBuf::from(path.trim());
-            if !candidate.is_absolute() {
-                return Err(format!(
-                    "Attachment path must be absolute: {}",
-                    candidate.display()
-                ));
-            }
-            if !candidate.is_file() {
-                return Err(format!(
-                    "Attachment is unavailable: {}",
-                    candidate.display()
-                ));
-            }
-            Ok(candidate.to_string_lossy().into_owned())
-        })
-        .collect()
-}
-
 fn emit_resume_fallback(app: &AppHandle, run_id: &str, session_id: &str) {
     let _ = app.emit(
         "agent://resume-fallback",
@@ -1541,10 +1499,7 @@ fn emit_resume_fallback(app: &AppHandle, run_id: &str, session_id: &str) {
 
 #[cfg(test)]
 mod imported_resume_tests {
-    use super::{
-        append_attachment_context, compose_imported_fallback_prompt, initial_imported_prompt,
-        is_missing_resume_error,
-    };
+    use super::{compose_imported_fallback_prompt, initial_imported_prompt, is_missing_resume_error};
 
     #[test]
     fn retries_only_explicit_missing_or_invalid_resume_errors() {
@@ -1607,20 +1562,5 @@ mod imported_resume_tests {
             "Current request",
         );
         assert_eq!(prompt, "Current request");
-    }
-
-    #[test]
-    fn attachment_context_is_added_without_changing_the_visible_request() {
-        let prompt = append_attachment_context(
-            "Inspect the files",
-            &[
-                "C:\\work\\report.pdf".to_string(),
-                "C:\\work\\screen.png".to_string(),
-            ],
-        );
-        assert!(prompt.starts_with("Inspect the files"));
-        assert!(prompt.contains("C:\\work\\report.pdf"));
-        assert!(prompt.contains("C:\\work\\screen.png"));
-        assert!(prompt.contains("<galcode_attachments>"));
     }
 }

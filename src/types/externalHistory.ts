@@ -8,6 +8,7 @@ export interface ExternalSessionPreview {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
+  sourceBytes: number;
 }
 
 export interface ExternalSessionRef {
@@ -44,6 +45,8 @@ export interface ImportedTranscriptMessage {
   timestamp: number;
   /// Explicit semantic classification written by v4 imports; absent on legacy shards.
   isUserPrompt?: boolean;
+  /// Source explicitly classified this assistant record as an API failure, not a reply.
+  isApiError?: boolean;
   /// Stable source turn identity, including queued prompts sent during execution.
   sourceTurnId?: string | null;
 }

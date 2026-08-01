@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-pushed-commits"
+description = "Enables the git_pushed_commits command without any pre-configured scope."
+commands.allow = ["git_pushed_commits"]
+
+[[permission]]
+identifier = "deny-git-pushed-commits"
+description = "Denies the git_pushed_commits command without any pre-configured scope."
+commands.deny = ["git_pushed_commits"]

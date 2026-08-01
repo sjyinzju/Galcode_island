@@ -1,14 +1,15 @@
 use chrono::DateTime;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
 const CODEX_SOURCE: &str = "codex";
@@ -21,9 +22,455 @@ const STORE_ITEMS_DIRECTORY: &str = "items";
 const STORE_ASSETS_DIRECTORY: &str = "assets";
 const STORE_STAGING_DIRECTORY: &str = "imported-conversations.v4.tmp";
 const STORE_BACKUP_DIRECTORY: &str = "imported-conversations.v3.bak";
+const STORE_TRANSACTION_DIRECTORY: &str = "imported-conversations.transaction";
+const STORE_TRANSACTION_MANIFEST_FILE: &str = "manifest.json";
+const STORE_TRANSACTION_BACKUPS_DIRECTORY: &str = "backups";
+const STORE_TRANSACTION_OLD_INDEX_FILE: &str = "index.json";
+const STORE_LOCK_FILE: &str = "imported-conversations.lock";
 const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ASSET_FILE_BYTES: usize = ((MAX_ATTACHMENT_BYTES + 2) / 3) * 4 + 1024;
 const MAX_IMPORT_WARNINGS: usize = 100;
+const MIN_MIXED_EMBEDDED_MEDIA_BYTES: usize = 1024;
+const JSONL_READ_BUFFER_BYTES: usize = 8 * 1024;
+const IMPORTED_STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct HistoryScanLimits {
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_import_bytes: u64,
+    max_files: usize,
+    max_entries: usize,
+    max_records: usize,
+    max_line_bytes: usize,
+    max_directory_depth: usize,
+}
+
+const HISTORY_SCAN_LIMITS: HistoryScanLimits = HistoryScanLimits {
+    // Existing real-world histories can exceed 160 MiB and a single encoded
+    // 64 MiB attachment needs roughly 86 MiB before JSON overhead.
+    max_file_bytes: 512 * 1024 * 1024,
+    max_total_bytes: 1024 * 1024 * 1024,
+    max_import_bytes: 512 * 1024 * 1024,
+    max_files: 20_000,
+    max_entries: 100_000,
+    max_records: 5_000_000,
+    max_line_bytes: 96 * 1024 * 1024,
+    max_directory_depth: 32,
+};
+
+struct HistoryScanBudget {
+    limits: HistoryScanLimits,
+    discovered_files: usize,
+    visited_entries: usize,
+    opened_files: usize,
+    total_bytes: u64,
+    import_bytes: u64,
+    records: usize,
+    file_limit_warned: bool,
+    entry_limit_warned: bool,
+    total_limit_warned: bool,
+    record_limit_warned: bool,
+    depth_limit_warned: bool,
+    import_limit_exceeded: bool,
+    incomplete: bool,
+}
+
+impl HistoryScanBudget {
+    fn new(limits: HistoryScanLimits) -> Self {
+        Self {
+            limits,
+            discovered_files: 0,
+            visited_entries: 0,
+            opened_files: 0,
+            total_bytes: 0,
+            import_bytes: 0,
+            records: 0,
+            file_limit_warned: false,
+            entry_limit_warned: false,
+            total_limit_warned: false,
+            record_limit_warned: false,
+            depth_limit_warned: false,
+            import_limit_exceeded: false,
+            incomplete: false,
+        }
+    }
+
+    fn discover_file(&mut self, warnings: &mut Vec<String>) -> bool {
+        if self.discovered_files >= self.limits.max_files {
+            self.incomplete = true;
+            if !self.file_limit_warned {
+                self.file_limit_warned = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "History scan stopped after {} JSONL files",
+                        self.limits.max_files
+                    ),
+                );
+            }
+            return false;
+        }
+        self.discovered_files += 1;
+        true
+    }
+
+    fn visit_entry(&mut self, warnings: &mut Vec<String>) -> bool {
+        if self.visited_entries >= self.limits.max_entries {
+            self.incomplete = true;
+            if !self.entry_limit_warned {
+                self.entry_limit_warned = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "History scan stopped after {} filesystem entries",
+                        self.limits.max_entries
+                    ),
+                );
+            }
+            return false;
+        }
+        self.visited_entries += 1;
+        true
+    }
+
+    fn open_file(&mut self, warnings: &mut Vec<String>) -> bool {
+        if self.total_limit_warned {
+            return false;
+        }
+        if self.opened_files >= self.limits.max_files {
+            self.incomplete = true;
+            if !self.file_limit_warned {
+                self.file_limit_warned = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "History scan stopped after {} JSONL files",
+                        self.limits.max_files
+                    ),
+                );
+            }
+            return false;
+        }
+        self.opened_files += 1;
+        true
+    }
+
+    fn take_scan_bytes(&mut self, bytes: u64, warnings: &mut Vec<String>) -> bool {
+        let Some(total_bytes) = self.total_bytes.checked_add(bytes) else {
+            self.incomplete = true;
+            if !self.total_limit_warned {
+                self.total_limit_warned = true;
+                push_warning(warnings, "History scan byte limit was exceeded".to_string());
+            }
+            return false;
+        };
+        if total_bytes > self.limits.max_total_bytes {
+            self.incomplete = true;
+            if !self.total_limit_warned {
+                self.total_limit_warned = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "History scan stopped after {} bytes of JSONL data",
+                        self.limits.max_total_bytes
+                    ),
+                );
+            }
+            return false;
+        }
+        self.total_bytes = total_bytes;
+        true
+    }
+
+    fn take_record(&mut self, warnings: &mut Vec<String>) -> bool {
+        if self.records >= self.limits.max_records {
+            self.incomplete = true;
+            if !self.record_limit_warned {
+                self.record_limit_warned = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "History scan stopped after {} JSONL records",
+                        self.limits.max_records
+                    ),
+                );
+            }
+            return false;
+        }
+        self.records += 1;
+        true
+    }
+
+    fn take_import_bytes(&mut self, bytes: usize, warnings: &mut Vec<String>) -> bool {
+        if self.import_limit_exceeded {
+            return false;
+        }
+        let Some(total_bytes) = self.import_bytes.checked_add(bytes as u64) else {
+            self.import_limit_exceeded = true;
+            self.incomplete = true;
+            push_warning(
+                warnings,
+                "Selected history exceeds the complete import byte limit".to_string(),
+            );
+            return false;
+        };
+        if total_bytes > self.limits.max_import_bytes {
+            self.import_limit_exceeded = true;
+            self.incomplete = true;
+            push_warning(
+                warnings,
+                format!(
+                    "Selected history exceeds the {} byte complete import limit; no partial conversations were imported",
+                    self.limits.max_import_bytes
+                ),
+            );
+            return false;
+        }
+        self.import_bytes = total_bytes;
+        true
+    }
+}
+
+enum BoundedJsonlLine {
+    Text { number: usize, text: String },
+    TooLong { number: usize },
+    InvalidUtf8 { number: usize },
+}
+
+struct BoundedJsonlRead {
+    line: BoundedJsonlLine,
+    bytes_read: u64,
+}
+
+struct BoundedJsonlReader {
+    reader: BufReader<std::io::Take<File>>,
+    max_line_bytes: usize,
+    line_number: usize,
+}
+
+impl BoundedJsonlReader {
+    fn new(file: File, file_bytes: u64, max_line_bytes: usize) -> Self {
+        Self {
+            // Keep speculative read-ahead bounded when an unselected Codex
+            // file is rejected immediately after its ownership record.
+            reader: BufReader::with_capacity(JSONL_READ_BUFFER_BYTES, file.take(file_bytes)),
+            max_line_bytes,
+            line_number: 0,
+        }
+    }
+
+    fn next_line(&mut self) -> std::io::Result<Option<BoundedJsonlRead>> {
+        let Some((mut bytes, too_long, bytes_read)) =
+            read_bounded_physical_line(&mut self.reader, self.max_line_bytes)?
+        else {
+            return Ok(None);
+        };
+        self.line_number += 1;
+        if too_long {
+            return Ok(Some(BoundedJsonlRead {
+                line: BoundedJsonlLine::TooLong {
+                    number: self.line_number,
+                },
+                bytes_read,
+            }));
+        }
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        Ok(Some(BoundedJsonlRead {
+            line: match String::from_utf8(bytes) {
+                Ok(text) => BoundedJsonlLine::Text {
+                    number: self.line_number,
+                    text,
+                },
+                Err(_) => BoundedJsonlLine::InvalidUtf8 {
+                    number: self.line_number,
+                },
+            },
+            bytes_read,
+        }))
+    }
+}
+
+fn read_bounded_physical_line(
+    reader: &mut impl BufRead,
+    max_line_bytes: usize,
+) -> std::io::Result<Option<(Vec<u8>, bool, u64)>> {
+    let mut line = Vec::new();
+    let mut saw_bytes = false;
+    let mut too_long = false;
+    let mut bytes_read = 0u64;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if saw_bytes {
+                Ok(Some((line, too_long, bytes_read)))
+            } else {
+                Ok(None)
+            };
+        }
+        saw_bytes = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        bytes_read = bytes_read.saturating_add(consumed as u64);
+        let content = newline.map_or(available, |index| &available[..index]);
+        if !too_long {
+            let remaining = max_line_bytes.saturating_sub(line.len());
+            if content.len() <= remaining {
+                line.extend_from_slice(content);
+            } else {
+                line.extend_from_slice(&content[..remaining]);
+                too_long = true;
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some((line, too_long, bytes_read)));
+        }
+    }
+}
+
+fn open_bounded_jsonl_reader(
+    path: &Path,
+    label: &str,
+    warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
+) -> Option<BoundedJsonlReader> {
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            budget.incomplete = true;
+            push_warning(
+                warnings,
+                format!("Could not inspect {label} {}: {error}", path.display()),
+            );
+            return None;
+        }
+    };
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        budget.incomplete = true;
+        push_warning(
+            warnings,
+            format!("Skipped non-regular {label} {}", path.display()),
+        );
+        return None;
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            budget.incomplete = true;
+            push_warning(
+                warnings,
+                format!("Could not read {label} {}: {error}", path.display()),
+            );
+            return None;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            budget.incomplete = true;
+            push_warning(
+                warnings,
+                format!(
+                    "Could not inspect opened {label} {}: {error}",
+                    path.display()
+                ),
+            );
+            return None;
+        }
+    };
+    if !metadata.is_file() {
+        budget.incomplete = true;
+        push_warning(
+            warnings,
+            format!("Skipped non-regular {label} {}", path.display()),
+        );
+        return None;
+    }
+    if metadata.len() > budget.limits.max_file_bytes {
+        budget.incomplete = true;
+        push_warning(
+            warnings,
+            format!(
+                "Skipped {label} {} because it exceeds the {} byte file limit",
+                path.display(),
+                budget.limits.max_file_bytes
+            ),
+        );
+        return None;
+    }
+    if !budget.open_file(warnings) {
+        return None;
+    }
+    Some(BoundedJsonlReader::new(
+        file,
+        metadata.len(),
+        budget.limits.max_line_bytes,
+    ))
+}
+
+fn next_bounded_jsonl_line(
+    reader: &mut BoundedJsonlReader,
+    path: &Path,
+    label: &str,
+    warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
+) -> Option<(usize, String)> {
+    loop {
+        if !budget.take_record(warnings) {
+            return None;
+        }
+        let read = match reader.next_line() {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                // The record budget is claimed before the read so an absent
+                // trailing record must not consume it.
+                budget.records = budget.records.saturating_sub(1);
+                return None;
+            }
+            Err(error) => {
+                budget.incomplete = true;
+                push_warning(
+                    warnings,
+                    format!("Could not read {label} {}: {error}", path.display()),
+                );
+                return None;
+            }
+        };
+        if !budget.take_scan_bytes(read.bytes_read, warnings) {
+            return None;
+        }
+        match read.line {
+            BoundedJsonlLine::Text { number, text } => return Some((number, text)),
+            BoundedJsonlLine::TooLong { number } => {
+                budget.incomplete = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "Skipped overlong {label} line {}:{} (limit: {} bytes)",
+                        path.display(),
+                        number,
+                        budget.limits.max_line_bytes
+                    ),
+                );
+            }
+            BoundedJsonlLine::InvalidUtf8 { number } => {
+                budget.incomplete = true;
+                push_warning(
+                    warnings,
+                    format!(
+                        "Skipped non-UTF-8 {label} line {}:{}",
+                        path.display(),
+                        number
+                    ),
+                );
+            }
+        }
+    }
+}
 
 static IMPORTED_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -44,6 +491,7 @@ pub struct ExternalSessionPreview {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: usize,
+    pub source_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,6 +547,8 @@ pub struct ImportedTranscriptMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_user_prompt: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_api_error: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<String>,
     pub content: String,
     #[serde(default)]
@@ -120,7 +570,7 @@ pub struct ImportedConversation {
     pub messages: Vec<ImportedTranscriptMessage>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedConversationSummary {
     pub id: String,
@@ -154,6 +604,28 @@ struct ImportedConversationsIndex {
     conversations: Vec<ImportedConversationSummary>,
     #[serde(default)]
     asset_references: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asset_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ImportedStoreTransactionManifest {
+    #[serde(default)]
+    items: Vec<ImportedStoreTransactionItem>,
+    #[serde(default)]
+    old_index_sha256: Option<String>,
+    #[serde(default)]
+    new_index_sha256: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ImportedStoreTransactionItem {
+    id: String,
+    had_existing_file: bool,
+    #[serde(default)]
+    new_sha256: Option<String>,
 }
 
 #[derive(Clone)]
@@ -161,6 +633,7 @@ struct ParsedMessage {
     source_kind: &'static str,
     role: String,
     is_user_prompt: bool,
+    is_api_error: bool,
     source_turn_id: Option<String>,
     content: String,
     parts: Vec<ImportedTranscriptPart>,
@@ -177,6 +650,7 @@ struct ParsedConversation {
     created_at: i64,
     updated_at: i64,
     message_count: usize,
+    source_bytes: u64,
     messages: Vec<ImportedTranscriptMessage>,
 }
 
@@ -199,6 +673,7 @@ struct CodexPiece {
     project_path: Option<String>,
     created_at: i64,
     updated_at: i64,
+    source_bytes: u64,
     messages: Vec<ParsedMessage>,
     preview_messages: Vec<PreviewMessage>,
 }
@@ -209,6 +684,7 @@ struct PendingCodexPiece {
     project_path: Option<String>,
     created_at: Option<i64>,
     updated_at: Option<i64>,
+    source_bytes: u64,
     messages: Vec<ParsedMessage>,
 }
 
@@ -224,6 +700,7 @@ impl PendingCodexPiece {
             project_path: self.project_path,
             created_at: self.created_at.unwrap_or(fallback_time),
             updated_at: self.updated_at.unwrap_or(fallback_time),
+            source_bytes: self.source_bytes,
             messages: self.messages,
             preview_messages: Vec::new(),
         })
@@ -237,6 +714,7 @@ struct CodexAccumulator {
     title_hint: Option<(String, i64)>,
     first_user_text: Option<String>,
     message_count: usize,
+    source_bytes: u64,
     messages: Vec<ParsedMessage>,
     seen_messages: HashSet<String>,
 }
@@ -246,6 +724,7 @@ struct ClaudePiece {
     project_path: Option<String>,
     created_at: i64,
     updated_at: i64,
+    source_bytes: u64,
     custom_title: Option<(String, i64)>,
     ai_title: Option<(String, i64)>,
     last_prompt: Option<(String, i64)>,
@@ -258,6 +737,7 @@ struct ClaudeAccumulator {
     project_path: Option<String>,
     created_at: i64,
     updated_at: i64,
+    source_bytes: u64,
     custom_title: Option<(String, i64)>,
     ai_title: Option<(String, i64)>,
     last_prompt: Option<(String, i64)>,
@@ -270,14 +750,19 @@ struct ClaudeAccumulator {
 struct ScanOutput {
     conversations: Vec<(String, ParsedConversation)>,
     warnings: Vec<String>,
+    incomplete: bool,
 }
 
 pub fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
     let mut previews = Vec::new();
-    for (source, conversation) in scan_source(CODEX_SOURCE, false, None)?.conversations {
+    let codex = scan_source(CODEX_SOURCE, false, None)?;
+    reject_incomplete_preview(CODEX_SOURCE, &codex)?;
+    for (source, conversation) in codex.conversations {
         previews.push(to_preview(&source, &conversation));
     }
-    for (source, conversation) in scan_source(CLAUDE_SOURCE, false, None)?.conversations {
+    let claude = scan_source(CLAUDE_SOURCE, false, None)?;
+    reject_incomplete_preview(CLAUDE_SOURCE, &claude)?;
+    for (source, conversation) in claude.conversations {
         previews.push(to_preview(&source, &conversation));
     }
     previews.sort_by(|a, b| {
@@ -286,6 +771,20 @@ pub fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
             .then_with(|| a.title.cmp(&b.title))
     });
     Ok(previews)
+}
+
+fn reject_incomplete_preview(source: &str, scan: &ScanOutput) -> Result<(), String> {
+    if !scan.incomplete {
+        return Ok(());
+    }
+    let source_label = if source == CODEX_SOURCE {
+        "Codex"
+    } else {
+        "Claude Code"
+    };
+    Err(format!(
+        "{source_label} 历史记录过多、文件过大或包含超长记录，扫描已达到安全限制。请先归档不需要导入的历史后重试。"
+    ))
 }
 
 pub fn import_external_sessions(
@@ -411,20 +910,30 @@ fn scan_source(
 ) -> Result<ScanOutput, String> {
     let mut warnings = Vec::new();
     match source {
-        CODEX_SOURCE => Ok(ScanOutput {
-            conversations: scan_codex(include_messages, selected_ids, &mut warnings)
-                .into_iter()
-                .map(|conversation| (CODEX_SOURCE.to_string(), conversation))
-                .collect(),
-            warnings,
-        }),
-        CLAUDE_SOURCE => Ok(ScanOutput {
-            conversations: scan_claude(include_messages, selected_ids, &mut warnings)
-                .into_iter()
-                .map(|conversation| (CLAUDE_SOURCE.to_string(), conversation))
-                .collect(),
-            warnings,
-        }),
+        CODEX_SOURCE => {
+            let (conversations, incomplete) =
+                scan_codex(include_messages, selected_ids, &mut warnings);
+            Ok(ScanOutput {
+                conversations: conversations
+                    .into_iter()
+                    .map(|conversation| (CODEX_SOURCE.to_string(), conversation))
+                    .collect(),
+                warnings,
+                incomplete,
+            })
+        }
+        CLAUDE_SOURCE => {
+            let (conversations, incomplete) =
+                scan_claude(include_messages, selected_ids, &mut warnings);
+            Ok(ScanOutput {
+                conversations: conversations
+                    .into_iter()
+                    .map(|conversation| (CLAUDE_SOURCE.to_string(), conversation))
+                    .collect(),
+                warnings,
+                incomplete,
+            })
+        }
         _ => Err(format!("Unsupported external history source: {source}")),
     }
 }
@@ -433,18 +942,30 @@ fn scan_codex(
     include_messages: bool,
     selected_ids: Option<&HashSet<String>>,
     warnings: &mut Vec<String>,
-) -> Vec<ParsedConversation> {
-    let Some(home) = user_home_dir() else {
-        return Vec::new();
+) -> (Vec<ParsedConversation>, bool) {
+    let Some(codex_root) = crate::agent::binary::codex_home_dir() else {
+        return (Vec::new(), false);
     };
-    let codex_root = home.join(".codex");
     if !codex_root.exists() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
+    let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
     let mut files = Vec::new();
-    collect_jsonl_files(&codex_root.join("sessions"), &mut files, warnings);
-    collect_jsonl_files(&codex_root.join("archived_sessions"), &mut files, warnings);
+    collect_jsonl_files(
+        &codex_root.join("sessions"),
+        &mut files,
+        warnings,
+        &mut budget,
+        0,
+    );
+    collect_jsonl_files(
+        &codex_root.join("archived_sessions"),
+        &mut files,
+        warnings,
+        &mut budget,
+        0,
+    );
     files.sort();
 
     let mut pieces = Vec::new();
@@ -456,14 +977,30 @@ fn scan_codex(
                 fallback_id,
                 selected_ids,
                 warnings,
+                &mut budget,
             ));
-        } else if let Some(piece) = parse_codex_preview_file(&path, fallback_id, warnings) {
+        } else if let Some(piece) =
+            parse_codex_preview_file(&path, fallback_id, warnings, &mut budget)
+        {
             pieces.push(piece);
         }
     }
 
-    let index = read_codex_index(&codex_root.join("session_index.jsonl"), warnings);
-    assemble_codex_conversations(pieces, &index, include_messages)
+    if include_messages && budget.incomplete {
+        return (Vec::new(), true);
+    }
+    let index = read_codex_index(
+        &codex_root.join("session_index.jsonl"),
+        warnings,
+        &mut budget,
+    );
+    let incomplete = budget.incomplete;
+    let conversations = if include_messages && incomplete {
+        Vec::new()
+    } else {
+        assemble_codex_conversations(pieces, &index, include_messages)
+    };
+    (conversations, incomplete)
 }
 
 fn assemble_codex_conversations(
@@ -486,6 +1023,7 @@ fn assemble_codex_conversations(
                 title_hint: index_entry.clone(),
                 first_user_text: None,
                 message_count: 0,
+                source_bytes: 0,
                 messages: Vec::new(),
                 seen_messages: HashSet::new(),
             });
@@ -494,6 +1032,7 @@ fn assemble_codex_conversations(
         }
         entry.created_at = min_non_zero(entry.created_at, piece.created_at);
         entry.updated_at = entry.updated_at.max(piece.updated_at);
+        entry.source_bytes = entry.source_bytes.saturating_add(piece.source_bytes);
         if let Some((title, hint_updated_at)) = index_entry {
             let should_replace = entry
                 .title_hint
@@ -506,7 +1045,7 @@ fn assemble_codex_conversations(
         }
         if include_messages {
             for message in piece.messages {
-                let dedupe_key = message_dedupe_key(&message);
+                let dedupe_key = assembly_message_dedupe_key(&message);
                 if !entry.seen_messages.insert(dedupe_key) {
                     continue;
                 }
@@ -546,18 +1085,25 @@ fn assemble_codex_conversations(
                 .filter(|title| !title.trim().is_empty())
                 .or_else(|| entry.first_user_text.map(|text| compact_title(&text)))
                 .unwrap_or_else(|| "Untitled conversation".to_string());
+            let messages = if include_messages {
+                finalize_messages(native_session_id.as_str(), entry.messages)
+            } else {
+                Vec::new()
+            };
+            let message_count = if include_messages {
+                messages.len()
+            } else {
+                entry.message_count
+            };
             ParsedConversation {
                 native_session_id: native_session_id.clone(),
                 title,
                 project_path: entry.project_path,
                 created_at: entry.created_at,
                 updated_at: entry.updated_at,
-                message_count: entry.message_count,
-                messages: if include_messages {
-                    finalize_messages(native_session_id.as_str(), entry.messages)
-                } else {
-                    Vec::new()
-                },
+                message_count,
+                source_bytes: entry.source_bytes,
+                messages,
             }
         })
         .collect::<Vec<_>>();
@@ -570,13 +1116,14 @@ fn scan_claude(
     include_messages: bool,
     selected_ids: Option<&HashSet<String>>,
     warnings: &mut Vec<String>,
-) -> Vec<ParsedConversation> {
-    let Some(home) = user_home_dir() else {
-        return Vec::new();
+) -> (Vec<ParsedConversation>, bool) {
+    let Some(config_dir) = crate::agent::claude::claude_config_dir() else {
+        return (Vec::new(), false);
     };
-    let projects_root = home.join(".claude").join("projects");
+    let projects_root = config_dir.join("projects");
+    let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
     let mut files = Vec::new();
-    collect_jsonl_files(&projects_root, &mut files, warnings);
+    collect_jsonl_files(&projects_root, &mut files, warnings, &mut budget, 0);
     files.sort();
 
     let mut pieces = Vec::new();
@@ -587,12 +1134,20 @@ fn scan_claude(
                 true,
                 selected_ids,
                 warnings,
+                &mut budget,
             ));
         } else {
-            pieces.extend(parse_claude_preview_file(&path, warnings));
+            pieces.extend(parse_claude_preview_file(&path, warnings, &mut budget));
         }
     }
-    assemble_claude_conversations(pieces, include_messages)
+    if include_messages && budget.incomplete {
+        return (Vec::new(), true);
+    }
+    let incomplete = budget.incomplete;
+    (
+        assemble_claude_conversations(pieces, include_messages),
+        incomplete,
+    )
 }
 
 fn assemble_claude_conversations(
@@ -607,6 +1162,7 @@ fn assemble_claude_conversations(
                 project_path: piece.project_path.clone(),
                 created_at: piece.created_at,
                 updated_at: piece.updated_at,
+                source_bytes: 0,
                 custom_title: None,
                 ai_title: None,
                 last_prompt: None,
@@ -620,13 +1176,14 @@ fn assemble_claude_conversations(
         }
         entry.created_at = min_non_zero(entry.created_at, piece.created_at);
         entry.updated_at = entry.updated_at.max(piece.updated_at);
+        entry.source_bytes = entry.source_bytes.saturating_add(piece.source_bytes);
         replace_with_latest(&mut entry.custom_title, piece.custom_title);
         replace_with_latest(&mut entry.ai_title, piece.ai_title);
         replace_with_latest(&mut entry.last_prompt, piece.last_prompt);
         replace_with_earliest(&mut entry.first_user_text, piece.first_user_text);
         if include_messages {
             for message in piece.messages {
-                let dedupe_key = message_dedupe_key(&message);
+                let dedupe_key = assembly_message_dedupe_key(&message);
                 if !entry.seen_messages.insert(dedupe_key) {
                     continue;
                 }
@@ -652,18 +1209,25 @@ fn assemble_claude_conversations(
                 .or_else(|| entry.first_user_text.map(|(text, _)| compact_title(&text)))
                 .or_else(|| entry.last_prompt.map(|(text, _)| compact_title(&text)))
                 .unwrap_or_else(|| "Untitled conversation".to_string());
+            let messages = if include_messages {
+                finalize_messages(native_session_id.as_str(), entry.messages)
+            } else {
+                Vec::new()
+            };
+            let message_count = if include_messages {
+                messages.len()
+            } else {
+                entry.message_count
+            };
             ParsedConversation {
                 native_session_id: native_session_id.clone(),
                 title,
                 project_path: entry.project_path,
                 created_at: entry.created_at,
                 updated_at: entry.updated_at,
-                message_count: entry.message_count,
-                messages: if include_messages {
-                    finalize_messages(native_session_id.as_str(), entry.messages)
-                } else {
-                    Vec::new()
-                },
+                message_count,
+                source_bytes: entry.source_bytes,
+                messages,
             }
         })
         .filter(|conversation| conversation.message_count > 0)
@@ -821,45 +1385,28 @@ fn parse_codex_preview_file(
     path: &Path,
     fallback_id: String,
     warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
 ) -> Option<CodexPiece> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "Could not read Codex history file {}: {error}",
-                    path.display()
-                ),
-            );
-            return None;
-        }
-    };
+    let mut reader = open_bounded_jsonl_reader(path, "Codex history file", warnings, budget)?;
     let fallback_time = file_modified_millis(path).unwrap_or(0);
     let mut native_session_id = fallback_id;
     let mut rollout_id = None;
     let mut project_path = None;
     let mut created_at = None;
     let mut updated_at = None;
+    let mut source_bytes = 0u64;
     let mut preview_messages = Vec::new();
     let mut pending_user_message = None;
     let mut found_session_meta = false;
 
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                push_warning(
-                    warnings,
-                    format!(
-                        "Could not read Codex history line {}:{}: {error}",
-                        path.display(),
-                        line_index + 1
-                    ),
-                );
-                continue;
-            }
-        };
+    while let Some((line_number, line)) =
+        next_bounded_jsonl_line(&mut reader, path, "Codex history", warnings, budget)
+    {
+        let line_bytes = line.len() as u64;
+        if found_session_meta {
+            source_bytes = source_bytes.saturating_add(line_bytes);
+        }
+        let line_index = line_number - 1;
         let record =
             match serde_json::from_str::<PreviewCodexRecord>(line.trim_start_matches('\u{feff}')) {
                 Ok(record) => record,
@@ -910,19 +1457,19 @@ fn parse_codex_preview_file(
                     .and_then(Value::as_object)
                     .is_some_and(|source| source.contains_key("subagent"));
             if is_subagent {
-                continue;
+                return None;
             }
             found_session_meta = true;
+            source_bytes = source_bytes.saturating_add(line_bytes);
             rollout_id = payload
                 .id
                 .as_deref()
                 .filter(|id| !id.trim().is_empty())
                 .map(ToString::to_string);
-            if let Some(id) = payload
-                .session_id
+            if let Some(id) = rollout_id
                 .as_deref()
+                .or(payload.session_id.as_deref())
                 .filter(|id| !id.trim().is_empty())
-                .or(rollout_id.as_deref())
             {
                 native_session_id = id.to_string();
             }
@@ -979,50 +1526,35 @@ fn parse_codex_preview_file(
         push_pending_codex_preview(&mut preview_messages, pending, false);
     }
 
-    (!preview_messages.is_empty()).then_some(CodexPiece {
+    found_session_meta.then_some(CodexPiece {
         native_session_id,
         rollout_id,
         project_path,
         created_at: created_at.unwrap_or(fallback_time),
         updated_at: updated_at.unwrap_or(fallback_time),
+        source_bytes,
         messages: Vec::new(),
         preview_messages,
     })
 }
 
-fn parse_claude_preview_file(path: &Path, warnings: &mut Vec<String>) -> Vec<ClaudePiece> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "Could not read Claude history file {}: {error}",
-                    path.display()
-                ),
-            );
-            return Vec::new();
-        }
+fn parse_claude_preview_file(
+    path: &Path,
+    warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
+) -> Vec<ClaudePiece> {
+    let Some(mut reader) = open_bounded_jsonl_reader(path, "Claude history file", warnings, budget)
+    else {
+        return Vec::new();
     };
     let fallback_time = file_modified_millis(path).unwrap_or(0);
     let file_session_id = fallback_session_id(path);
     let mut pieces: HashMap<String, ClaudePiece> = HashMap::new();
 
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                push_warning(
-                    warnings,
-                    format!(
-                        "Could not read Claude history line {}:{}: {error}",
-                        path.display(),
-                        line_index + 1
-                    ),
-                );
-                continue;
-            }
-        };
+    while let Some((line_number, line)) =
+        next_bounded_jsonl_line(&mut reader, path, "Claude history", warnings, budget)
+    {
+        let line_index = line_number - 1;
         let record = match serde_json::from_str::<PreviewClaudeRecord>(
             line.trim_start_matches('\u{feff}'),
         ) {
@@ -1054,6 +1586,7 @@ fn parse_claude_preview_file(path: &Path, warnings: &mut Vec<String>) -> Vec<Cla
                 project_path: record.cwd.clone(),
                 created_at: initial_time,
                 updated_at: initial_time,
+                source_bytes: 0,
                 custom_title: None,
                 ai_title: None,
                 last_prompt: None,
@@ -1063,6 +1596,7 @@ fn parse_claude_preview_file(path: &Path, warnings: &mut Vec<String>) -> Vec<Cla
             });
         entry.created_at = min_non_zero(entry.created_at, initial_time);
         entry.updated_at = entry.updated_at.max(initial_time);
+        entry.source_bytes = entry.source_bytes.saturating_add(line.len() as u64);
         if entry.project_path.is_none() {
             entry.project_path = record.cwd.clone();
         }
@@ -1126,14 +1660,16 @@ fn parse_claude_preview_file(path: &Path, warnings: &mut Vec<String>) -> Vec<Cla
                     .filter(|attachment| attachment.kind.as_deref() == Some("queued_command"))
                     .and_then(|attachment| attachment.prompt.as_deref())
                     .and_then(normalized_message_text);
-                let role = if queued_prompt.is_some() {
+                let is_internal_context =
+                    queued_prompt.as_deref().is_some_and(is_context_only_prompt);
+                let role = if queued_prompt.is_some() && !is_internal_context {
                     "user"
                 } else {
                     "system"
                 };
                 entry.preview_messages.push(PreviewMessage {
                     dedupe_key: preview_dedupe_key(role, record_time.unwrap_or(0), &line),
-                    user_text: queued_prompt,
+                    user_text: (role == "user").then_some(queued_prompt).flatten(),
                 });
             }
             Some("system") => entry.preview_messages.push(PreviewMessage {
@@ -1148,7 +1684,8 @@ fn parse_claude_preview_file(path: &Path, warnings: &mut Vec<String>) -> Vec<Cla
 
 fn parse_codex_file(path: &Path, fallback_id: String) -> Option<CodexPiece> {
     let mut warnings = Vec::new();
-    parse_codex_file_with_options(path, fallback_id, None, &mut warnings)
+    let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+    parse_codex_file_with_options(path, fallback_id, None, &mut warnings, &mut budget)
         .into_iter()
         .next()
 }
@@ -1158,19 +1695,11 @@ fn parse_codex_file_with_options(
     fallback_id: String,
     selected_ids: Option<&HashSet<String>>,
     warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
 ) -> Vec<CodexPiece> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "Could not read Codex history file {}: {error}",
-                    path.display()
-                ),
-            );
-            return Vec::new();
-        }
+    let Some(mut reader) = open_bounded_jsonl_reader(path, "Codex history file", warnings, budget)
+    else {
+        return Vec::new();
     };
     let fallback_time = file_modified_millis(path).unwrap_or(0);
     let mut pieces = Vec::new();
@@ -1178,21 +1707,18 @@ fn parse_codex_file_with_options(
     let mut pending_user_message: Option<ParsedMessage> = None;
     let source_path = path.to_string_lossy().into_owned();
 
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                push_warning(
-                    warnings,
-                    format!(
-                        "Could not read Codex history line {}:{}: {error}",
-                        path.display(),
-                        line_index + 1
-                    ),
-                );
-                continue;
-            }
-        };
+    while let Some((line_number, line)) =
+        next_bounded_jsonl_line(&mut reader, path, "Codex history", warnings, budget)
+    {
+        let line_bytes = line.len() as u64;
+        let line_index = line_number - 1;
+        let counted_for_import = current.is_some();
+        if counted_for_import && !budget.take_import_bytes(line.len(), warnings) {
+            break;
+        }
+        if let Some(current) = current.as_mut() {
+            current.source_bytes = current.source_bytes.saturating_add(line_bytes);
+        }
         let raw_record = line.trim_start_matches('\u{feff}');
         let record = match serde_json::from_str::<Value>(raw_record) {
             Ok(record) => record,
@@ -1231,8 +1757,8 @@ fn parse_codex_file_with_options(
         }
 
         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
-            if let Some(piece) = current.take().and_then(|piece| piece.finish(fallback_time)) {
-                pieces.push(piece);
+            if current.is_some() {
+                continue;
             }
             let payload = record.get("payload").unwrap_or(&Value::Null);
             let is_subagent = payload
@@ -1244,22 +1770,21 @@ fn parse_codex_file_with_options(
                     .and_then(Value::as_object)
                     .is_some_and(|source| source.contains_key("subagent"));
             if is_subagent {
-                continue;
+                return Vec::new();
             }
             let rollout_id = payload
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
                 .map(ToString::to_string);
-            let native_session_id = payload
-                .get("session_id")
-                .and_then(Value::as_str)
+            let native_session_id = rollout_id
+                .as_deref()
+                .or_else(|| payload.get("session_id").and_then(Value::as_str))
                 .filter(|id| !id.trim().is_empty())
-                .or(rollout_id.as_deref())
                 .unwrap_or(fallback_id.as_str())
                 .to_string();
             if selected_ids.is_some_and(|ids| !ids.contains(&native_session_id)) {
-                continue;
+                return Vec::new();
             }
             let mut piece = PendingCodexPiece {
                 native_session_id,
@@ -1270,11 +1795,15 @@ fn parse_codex_file_with_options(
                     .map(ToString::to_string),
                 created_at: None,
                 updated_at: None,
+                source_bytes: (!counted_for_import).then_some(line_bytes).unwrap_or(0),
                 messages: Vec::new(),
             };
             piece.observe_time(record_time);
             piece.observe_time(timestamp_from_value(payload.get("timestamp")));
             current = Some(piece);
+            if !counted_for_import && !budget.take_import_bytes(line.len(), warnings) {
+                break;
+            }
             continue;
         }
 
@@ -1319,6 +1848,7 @@ fn parse_codex_file_with_options(
             source_kind: CODEX_SOURCE,
             role,
             is_user_prompt: is_source_user && !is_context,
+            is_api_error: false,
             source_turn_id,
             content,
             parts,
@@ -1341,12 +1871,17 @@ fn parse_codex_file_with_options(
     if let Some(piece) = current.and_then(|piece| piece.finish(fallback_time)) {
         pieces.push(piece);
     }
-    pieces
+    if budget.incomplete {
+        Vec::new()
+    } else {
+        pieces
+    }
 }
 
 fn parse_claude_file(path: &Path) -> Vec<ClaudePiece> {
     let mut warnings = Vec::new();
-    parse_claude_file_with_options(path, true, None, &mut warnings)
+    let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+    parse_claude_file_with_options(path, true, None, &mut warnings, &mut budget)
 }
 
 fn parse_claude_file_with_options(
@@ -1354,40 +1889,21 @@ fn parse_claude_file_with_options(
     include_messages: bool,
     selected_ids: Option<&HashSet<String>>,
     warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
 ) -> Vec<ClaudePiece> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "Could not read Claude history file {}: {error}",
-                    path.display()
-                ),
-            );
-            return Vec::new();
-        }
+    let Some(mut reader) = open_bounded_jsonl_reader(path, "Claude history file", warnings, budget)
+    else {
+        return Vec::new();
     };
     let file_session_id = fallback_session_id(path);
     let source_path = path.to_string_lossy().into_owned();
     let mut pieces: HashMap<String, ClaudePiece> = HashMap::new();
     let fallback_time = file_modified_millis(path).unwrap_or(0);
 
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                push_warning(
-                    warnings,
-                    format!(
-                        "Could not read Claude history line {}:{}: {error}",
-                        path.display(),
-                        line_index + 1
-                    ),
-                );
-                continue;
-            }
-        };
+    while let Some((line_number, line)) =
+        next_bounded_jsonl_line(&mut reader, path, "Claude history", warnings, budget)
+    {
+        let line_index = line_number - 1;
         let raw_record = line.trim_start_matches('\u{feff}');
         if let Some(selected_ids) = selected_ids {
             let preview = match serde_json::from_str::<PreviewClaudeRecord>(raw_record) {
@@ -1412,6 +1928,9 @@ fn parse_claude_file_with_options(
             if !selected_ids.contains(native_session_id) {
                 continue;
             }
+        }
+        if include_messages && !budget.take_import_bytes(line.len(), warnings) {
+            break;
         }
         let record = match serde_json::from_str::<Value>(raw_record) {
             Ok(record) => record,
@@ -1450,6 +1969,7 @@ fn parse_claude_file_with_options(
                 project_path: None,
                 created_at: initial_time,
                 updated_at: initial_time,
+                source_bytes: 0,
                 custom_title: None,
                 ai_title: None,
                 last_prompt: None,
@@ -1459,6 +1979,7 @@ fn parse_claude_file_with_options(
             });
         entry.created_at = min_non_zero(entry.created_at, initial_time);
         entry.updated_at = entry.updated_at.max(initial_time);
+        entry.source_bytes = entry.source_bytes.saturating_add(line.len() as u64);
         if entry.project_path.is_none() {
             entry.project_path = record
                 .get("cwd")
@@ -1519,6 +2040,10 @@ fn parse_claude_file_with_options(
                 let is_internal_context = role == "user"
                     && contains_only_text(&parts)
                     && is_context_only_prompt(&content);
+                let is_api_error = record
+                    .get("isApiErrorMessage")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let semantic_role = if is_sidechain
                     || is_meta
                     || (role == "user" && is_task_notification)
@@ -1551,6 +2076,7 @@ fn parse_claude_file_with_options(
                         source_kind: CLAUDE_SOURCE,
                         role: semantic_role.to_string(),
                         is_user_prompt: semantic_role == "user",
+                        is_api_error,
                         source_turn_id: (semantic_role == "user")
                             .then(|| source_message_id.clone())
                             .flatten(),
@@ -1579,7 +2105,15 @@ fn parse_claude_file_with_options(
                 else {
                     continue;
                 };
-                if role == "user" {
+                let semantic_role = if role == "user"
+                    && contains_only_text(&parts)
+                    && is_context_only_prompt(&content)
+                {
+                    "system"
+                } else {
+                    role
+                };
+                if semantic_role == "user" {
                     if let Some(text) = first_text_part(&parts) {
                         replace_with_earliest(
                             &mut entry.first_user_text,
@@ -1596,9 +2130,10 @@ fn parse_claude_file_with_options(
                         .map(ToString::to_string);
                     entry.messages.push(ParsedMessage {
                         source_kind: CLAUDE_SOURCE,
-                        role: role.to_string(),
-                        is_user_prompt: role == "user",
-                        source_turn_id: (role == "user")
+                        role: semantic_role.to_string(),
+                        is_user_prompt: semantic_role == "user",
+                        is_api_error: false,
+                        source_turn_id: (semantic_role == "user")
                             .then(|| source_message_id.clone())
                             .flatten(),
                         content,
@@ -1611,11 +2146,11 @@ fn parse_claude_file_with_options(
                 } else {
                     entry.preview_messages.push(PreviewMessage {
                         dedupe_key: preview_dedupe_key(
-                            role,
+                            semantic_role,
                             record_time.unwrap_or(0),
                             line.trim_start_matches('\u{feff}'),
                         ),
-                        user_text: (role == "user")
+                        user_text: (semantic_role == "user")
                             .then(|| first_text_part(&parts).map(ToString::to_string))
                             .flatten(),
                     });
@@ -1647,6 +2182,7 @@ fn parse_claude_file_with_options(
                         source_kind: CLAUDE_SOURCE,
                         role: "system".to_string(),
                         is_user_prompt: false,
+                        is_api_error: false,
                         source_turn_id: None,
                         content,
                         parts,
@@ -1666,6 +2202,7 @@ fn parse_claude_file_with_options(
                     });
                 }
             }
+            Some("queue-operation") | Some("mode") => {}
             Some(kind) => push_warning(
                 warnings,
                 format!(
@@ -1684,7 +2221,11 @@ fn parse_claude_file_with_options(
             ),
         }
     }
-    pieces.into_values().collect()
+    if include_messages && budget.incomplete {
+        Vec::new()
+    } else {
+        pieces.into_values().collect()
+    }
 }
 
 fn extract_codex_message(payload: &Value) -> Option<(String, String, Vec<ImportedTranscriptPart>)> {
@@ -2425,20 +2966,29 @@ fn media_part_from_data_url(
         );
         return None;
     }
+    Some(validated_media_part(data_url, media_type, name, alt))
+}
+
+fn validated_media_part(
+    data_url: &str,
+    media_type: &str,
+    name: Option<String>,
+    alt: Option<String>,
+) -> ImportedTranscriptPart {
     if media_type.to_ascii_lowercase().starts_with("image/") {
-        Some(ImportedTranscriptPart::Image {
+        ImportedTranscriptPart::Image {
             data_url: Some(data_url.to_string()),
             asset_id: None,
             alt: alt.or(name),
-        })
+        }
     } else {
-        Some(ImportedTranscriptPart::Attachment {
+        ImportedTranscriptPart::Attachment {
             name,
             media_type: Some(media_type.to_string()),
             data_url: Some(data_url.to_string()),
             asset_id: None,
             url: None,
-        })
+        }
     }
 }
 
@@ -2520,16 +3070,46 @@ fn sanitize_embedded_data_urls(
     warnings: &mut Vec<String>,
     context: &str,
 ) -> String {
+    let candidate = text.trim();
+    if let Some((media_type, payload)) = parse_base64_data_url(candidate) {
+        if validate_base64_payload(payload).is_ok() {
+            let part = validated_media_part(candidate, media_type, None, None);
+            let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
+                "[Image data omitted]"
+            } else {
+                "[Attachment data omitted]"
+            };
+            push_media_part_unique(media, part);
+            let start = text.find(candidate).unwrap_or(0);
+            return format!(
+                "{}{}{}",
+                &text[..start],
+                placeholder,
+                &text[start + candidate.len()..]
+            );
+        }
+    }
+
     let mut result = String::with_capacity(text.len());
     let mut offset = 0;
     while let Some(relative_start) = text[offset..].find("data:") {
         let start = offset + relative_start;
         result.push_str(&text[offset..start]);
-        let Some(relative_comma) = text[start..].find(',') else {
-            result.push_str(&text[start..]);
-            return result;
+        let after_marker = start + "data:".len();
+        let next_marker = text[after_marker..]
+            .find("data:")
+            .map(|relative| after_marker + relative);
+        let header_end = next_marker.unwrap_or(text.len());
+        let Some(relative_comma) = text[after_marker..header_end].find(',') else {
+            result.push_str("data:");
+            offset = after_marker;
+            if next_marker.is_none() {
+                result.push_str(&text[offset..]);
+                return result;
+            }
+            continue;
         };
-        let comma = start + relative_comma;
+        let comma = after_marker + relative_comma;
         let header = &text[start..=comma];
         if !header.to_ascii_lowercase().contains(";base64,") {
             result.push_str("data:");
@@ -2542,18 +3122,30 @@ fn sanitize_embedded_data_urls(
             .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
             .count();
         let end = payload_start + payload_len;
-        let candidate = &text[start..end];
-        if let Some(part) = media_part_from_data_url(candidate, None, None, warnings, context) {
-            let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
-                "[Image data omitted]"
-            } else {
-                "[Attachment data omitted]"
-            };
-            push_media_part_unique(media, part);
-            result.push_str(placeholder);
-        } else {
-            result.push_str("[Invalid attachment data omitted]");
-        }
+        let embedded = &text[start..end];
+        let replacement = parse_base64_data_url(embedded).and_then(|(media_type, payload)| {
+            match validate_base64_payload(payload) {
+                Ok(decoded_bytes) if decoded_bytes >= MIN_MIXED_EMBEDDED_MEDIA_BYTES => {
+                    let part = validated_media_part(embedded, media_type, None, None);
+                    let placeholder = if matches!(part, ImportedTranscriptPart::Image { .. }) {
+                        "[Image data omitted]"
+                    } else {
+                        "[Attachment data omitted]"
+                    };
+                    push_media_part_unique(media, part);
+                    Some(placeholder)
+                }
+                Err("payload exceeds size limit") => {
+                    push_warning(
+                        warnings,
+                        format!("{context}: embedded attachment data exceeds the size limit"),
+                    );
+                    Some("[Invalid attachment data omitted]")
+                }
+                _ => None,
+            }
+        });
+        result.push_str(replacement.unwrap_or(embedded));
         offset = end.max(payload_start);
     }
     result.push_str(&text[offset..]);
@@ -2673,11 +3265,23 @@ fn message_dedupe_key(message: &ParsedMessage) -> String {
             message_fingerprint(
                 message.source_kind,
                 &message.role,
+                message.is_api_error,
                 message.timestamp,
                 &message.content,
                 &message.parts,
             )
         })
+}
+
+fn assembly_message_dedupe_key(message: &ParsedMessage) -> String {
+    let stable_key = message_dedupe_key(message);
+    if message.source_message_id.is_none() {
+        return stable_key;
+    }
+    format!(
+        "{stable_key}:{}",
+        hex::encode(replayed_message_fingerprint(message))
+    )
 }
 
 fn message_part_kind(parts: &[ImportedTranscriptPart]) -> &'static str {
@@ -2832,6 +3436,7 @@ fn update_parts_fingerprint(hasher: &mut Sha256, parts: &[ImportedTranscriptPart
 fn message_fingerprint(
     source_kind: &str,
     role: &str,
+    is_api_error: bool,
     timestamp: i64,
     content: &str,
     parts: &[ImportedTranscriptPart],
@@ -2839,6 +3444,7 @@ fn message_fingerprint(
     let mut hasher = Sha256::new();
     update_fingerprint_field(&mut hasher, b"source-kind", source_kind.as_bytes());
     update_fingerprint_field(&mut hasher, b"role", role.as_bytes());
+    update_fingerprint_field(&mut hasher, b"is-api-error", &[u8::from(is_api_error)]);
     update_fingerprint_field(&mut hasher, b"timestamp", &timestamp.to_le_bytes());
     if parts.is_empty() {
         update_fingerprint_field(&mut hasher, b"content", content.as_bytes());
@@ -2851,10 +3457,80 @@ fn imported_message_fingerprint(source_kind: &str, message: &ImportedTranscriptM
     message_fingerprint(
         source_kind,
         &message.role,
+        message.is_api_error.unwrap_or(false),
         message.timestamp,
         &message.content,
         &message.parts,
     )
+}
+
+fn replayed_message_fingerprint(message: &ParsedMessage) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    update_fingerprint_field(&mut hasher, b"source-kind", message.source_kind.as_bytes());
+    update_fingerprint_field(&mut hasher, b"role", message.role.as_bytes());
+    update_fingerprint_field(
+        &mut hasher,
+        b"is-user-prompt",
+        &[u8::from(message.is_user_prompt)],
+    );
+    update_fingerprint_field(
+        &mut hasher,
+        b"is-api-error",
+        &[u8::from(message.is_api_error)],
+    );
+    update_fingerprint_field(&mut hasher, b"content", message.content.as_bytes());
+    update_parts_fingerprint(&mut hasher, &message.parts);
+    hasher.finalize().into()
+}
+
+fn replayed_turn_fingerprint(messages: &[ParsedMessage]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    update_fingerprint_field(
+        &mut hasher,
+        b"message-count",
+        &(messages.len() as u64).to_le_bytes(),
+    );
+    for message in messages {
+        update_fingerprint_field(
+            &mut hasher,
+            b"message",
+            &replayed_message_fingerprint(message),
+        );
+    }
+    hasher.finalize().into()
+}
+
+fn append_replay_filtered_turn(
+    turn: Vec<ParsedMessage>,
+    output: &mut Vec<ParsedMessage>,
+    seen_turns: &mut HashSet<(String, [u8; 32])>,
+) {
+    const MAX_REPLAY_TURN_FINGERPRINTS: usize = 50_000;
+    let source_turn_id = turn
+        .iter()
+        .find(|message| message.is_user_prompt)
+        .and_then(|message| message.source_turn_id.as_deref())
+        .map(str::trim)
+        .filter(|turn_id| !turn_id.is_empty());
+    let can_dedupe = source_turn_id.is_some()
+        && turn.iter().any(|message| message.is_user_prompt)
+        && turn.iter().any(|message| !message.is_user_prompt)
+        && turn.iter().all(|message| {
+            message.timestamp > 0
+                && message.source_turn_id.as_deref().map(str::trim) == source_turn_id
+        });
+    if can_dedupe {
+        if let Some(source_turn_id) = source_turn_id {
+            let fingerprint = (source_turn_id.to_string(), replayed_turn_fingerprint(&turn));
+            if seen_turns.contains(&fingerprint) {
+                return;
+            }
+            if seen_turns.len() < MAX_REPLAY_TURN_FINGERPRINTS {
+                seen_turns.insert(fingerprint);
+            }
+        }
+    }
+    output.extend(turn);
 }
 
 fn align_imported_message_ids(
@@ -2891,28 +3567,69 @@ fn finalize_messages(
     native_session_id: &str,
     mut messages: Vec<ParsedMessage>,
 ) -> Vec<ImportedTranscriptMessage> {
+    const MAX_REPLAY_SOURCE_IDENTITIES: usize = 50_000;
     messages.sort_by(|a, b| {
         a.timestamp
             .cmp(&b.timestamp)
             .then_with(|| a.source_path.cmp(&b.source_path))
             .then_with(|| a.line_number.cmp(&b.line_number))
     });
-    let mut occurrences: HashMap<String, usize> = HashMap::new();
     let mut active_turn_id: Option<String> = None;
-    messages
-        .into_iter()
-        .map(|mut message| {
-            if message.is_user_prompt {
-                let turn_id = message
-                    .source_turn_id
-                    .clone()
-                    .or_else(|| message.source_message_id.clone())
-                    .unwrap_or_else(|| message_dedupe_key(&message));
-                message.source_turn_id = Some(turn_id.clone());
-                active_turn_id = Some(turn_id);
-            } else if message.source_turn_id.is_none() {
-                message.source_turn_id = active_turn_id.clone();
+    for message in &mut messages {
+        if message.is_user_prompt {
+            active_turn_id = message.source_turn_id.clone();
+        } else if message.source_turn_id.is_none() {
+            message.source_turn_id = active_turn_id.clone();
+        }
+    }
+    let mut message_deduped = Vec::with_capacity(messages.len());
+    let mut replay_scope: Option<String> = None;
+    let mut seen_source_ids = HashSet::new();
+    for message in messages {
+        if message.is_user_prompt {
+            replay_scope = message.source_turn_id.clone();
+            seen_source_ids.clear();
+            message_deduped.push(message);
+            continue;
+        }
+        if message.source_turn_id != replay_scope {
+            replay_scope = message.source_turn_id.clone();
+            seen_source_ids.clear();
+        }
+        if let Some(source_message_id) = message.source_message_id.as_ref() {
+            let source_identity = (
+                source_message_id.clone(),
+                replayed_message_fingerprint(&message),
+            );
+            if seen_source_ids.contains(&source_identity) {
+                continue;
             }
+            if seen_source_ids.len() < MAX_REPLAY_SOURCE_IDENTITIES {
+                seen_source_ids.insert(source_identity);
+            }
+        }
+        message_deduped.push(message);
+    }
+
+    let mut replay_filtered = Vec::with_capacity(message_deduped.len());
+    let mut current_turn = Vec::new();
+    let mut seen_turns = HashSet::new();
+    for message in message_deduped {
+        if message.is_user_prompt && !current_turn.is_empty() {
+            append_replay_filtered_turn(
+                std::mem::take(&mut current_turn),
+                &mut replay_filtered,
+                &mut seen_turns,
+            );
+        }
+        current_turn.push(message);
+    }
+    append_replay_filtered_turn(current_turn, &mut replay_filtered, &mut seen_turns);
+
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    replay_filtered
+        .into_iter()
+        .map(|message| {
             let fingerprint = message_dedupe_key(&message);
             let occurrence = occurrences.entry(fingerprint.clone()).or_default();
             let id = if *occurrence == 0 {
@@ -2925,6 +3642,7 @@ fn finalize_messages(
                 id,
                 role: message.role,
                 is_user_prompt: Some(message.is_user_prompt),
+                is_api_error: message.is_api_error.then_some(true),
                 source_turn_id: message.source_turn_id,
                 content: message.content,
                 parts: message.parts,
@@ -2934,37 +3652,20 @@ fn finalize_messages(
         .collect()
 }
 
-fn read_codex_index(path: &Path, warnings: &mut Vec<String>) -> HashMap<String, (String, i64)> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "Could not read Codex session index {}: {error}",
-                    path.display()
-                ),
-            );
-            return HashMap::new();
-        }
+fn read_codex_index(
+    path: &Path,
+    warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
+) -> HashMap<String, (String, i64)> {
+    let Some(mut reader) = open_bounded_jsonl_reader(path, "Codex session index", warnings, budget)
+    else {
+        return HashMap::new();
     };
     let mut index = HashMap::new();
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                push_warning(
-                    warnings,
-                    format!(
-                        "Could not read Codex session index line {}:{}: {error}",
-                        path.display(),
-                        line_index + 1
-                    ),
-                );
-                continue;
-            }
-        };
+    while let Some((line_number, line)) =
+        next_bounded_jsonl_line(&mut reader, path, "Codex session index", warnings, budget)
+    {
+        let line_index = line_number - 1;
         let record = match serde_json::from_str::<Value>(line.trim_start_matches('\u{feff}')) {
             Ok(record) => record,
             Err(error) => {
@@ -3004,6 +3705,7 @@ fn to_preview(source: &str, conversation: &ParsedConversation) -> ExternalSessio
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
         message_count: conversation.message_count,
+        source_bytes: conversation.source_bytes,
     }
 }
 
@@ -3058,10 +3760,87 @@ fn imported_config_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn lock_imported_store() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    IMPORTED_STORE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|error| format!("Imported conversations store lock failed: {error}"))
+    lock_imported_store_with_timeout(IMPORTED_STORE_LOCK_TIMEOUT)
+}
+
+fn lock_imported_store_with_timeout(
+    timeout: Duration,
+) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    let lock = IMPORTED_STORE_LOCK.get_or_init(|| Mutex::new(()));
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(error)) => {
+                return Err(format!("Imported conversations store lock failed: {error}"));
+            }
+            Err(TryLockError::WouldBlock) if started.elapsed() >= timeout => {
+                return Err("Timed out waiting for imported conversations store lock".to_string());
+            }
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+struct ImportedStoreFileLock {
+    file: File,
+}
+
+impl Drop for ImportedStoreFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn lock_imported_store_file(config_dir: &Path) -> Result<ImportedStoreFileLock, String> {
+    lock_imported_store_file_with_timeout(config_dir, IMPORTED_STORE_LOCK_TIMEOUT)
+}
+
+fn lock_imported_store_file_with_timeout(
+    config_dir: &Path,
+    timeout: Duration,
+) -> Result<ImportedStoreFileLock, String> {
+    let lock_path = config_dir.join(STORE_LOCK_FILE);
+    reject_symlink_path(&lock_path, "Imported conversations store lock")?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| format!("Could not open imported conversations store lock: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(ImportedStoreFileLock { file }),
+            Err(error) if is_file_lock_contended(&error) && started.elapsed() >= timeout => {
+                return Err(
+                    "Timed out waiting for imported conversations store file lock".to_string(),
+                );
+            }
+            Err(error) if is_file_lock_contended(&error) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not lock imported conversations store: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn is_file_lock_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports these raw Windows errors through fs2 rather than
+        // consistently mapping them to ErrorKind::WouldBlock.
+        return matches!(error.raw_os_error(), Some(32) | Some(33));
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 fn with_imported_store<T>(
@@ -3070,6 +3849,7 @@ fn with_imported_store<T>(
 ) -> Result<T, String> {
     let config_dir = imported_config_dir(app)?;
     let _guard = lock_imported_store()?;
+    let _file_guard = lock_imported_store_file(&config_dir)?;
     action(&config_dir)
 }
 
@@ -3083,6 +3863,27 @@ fn v3_store_path(config_dir: &Path) -> PathBuf {
 
 fn v3_index_path(config_dir: &Path) -> PathBuf {
     v3_store_path(config_dir).join(STORE_INDEX_FILE)
+}
+
+fn transaction_store_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(STORE_TRANSACTION_DIRECTORY)
+}
+
+fn transaction_manifest_path(config_dir: &Path) -> PathBuf {
+    transaction_store_path(config_dir).join(STORE_TRANSACTION_MANIFEST_FILE)
+}
+
+fn transaction_backup_item_path(config_dir: &Path, id: &str) -> PathBuf {
+    item_path_in_store(
+        &transaction_store_path(config_dir).join(STORE_TRANSACTION_BACKUPS_DIRECTORY),
+        id,
+    )
+}
+
+fn transaction_backup_index_path(config_dir: &Path) -> PathBuf {
+    transaction_store_path(config_dir)
+        .join(STORE_TRANSACTION_BACKUPS_DIRECTORY)
+        .join(STORE_TRANSACTION_OLD_INDEX_FILE)
 }
 
 fn item_path_in_store(store_dir: &Path, id: &str) -> PathBuf {
@@ -3122,10 +3923,100 @@ fn validate_asset_data_url(data_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn reject_symlink_path(path: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("{label} must not be a symbolic link"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not inspect {label}: {error}")),
+    }
+}
+
+fn sync_file_at(path: &Path) -> Result<(), String> {
+    reject_symlink_path(path, "Imported data file")?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Could not synchronize imported data file: {error}"))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Could not synchronize imported data directory: {error}"))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), String> {
+    // Rust's portable File API cannot open directory handles on Windows.
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    path.parent().map_or(Ok(()), sync_directory)
+}
+
+fn write_new_file_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    reject_symlink_path(path, "Imported data destination")?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("Could not create imported data file: {error}"))?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Could not persist imported data file: {error}"));
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn create_unique_synced_temporary(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Imported data path has no parent directory".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("imported-data");
+    for _ in 0..8 {
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        match write_new_file_synced(&temporary, bytes) {
+            Ok(()) => return Ok(temporary),
+            Err(_) if temporary.exists() => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err("Could not allocate a unique imported data temporary file".to_string())
+}
+
+fn save_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    reject_symlink_path(path, "Imported data destination")?;
+    let temporary = create_unique_synced_temporary(path, bytes)?;
+    if let Err(error) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    sync_file_at(path)?;
+    sync_parent_directory(path)
+}
+
 fn write_asset_to_store(store_dir: &Path, data_url: &str) -> Result<String, String> {
     validate_asset_data_url(data_url)?;
     let asset_id = asset_id_for_data_url(data_url);
     let path = asset_path_in_store(store_dir, &asset_id);
+    reject_symlink_path(&path, "Imported asset destination")?;
     if path.is_file() {
         let existing = load_asset_from_store(store_dir, &asset_id)?;
         if existing != data_url {
@@ -3135,11 +4026,14 @@ fn write_asset_to_store(store_dir: &Path, data_url: &str) -> Result<String, Stri
     }
     fs::create_dir_all(store_dir.join(STORE_ASSETS_DIRECTORY))
         .map_err(|error| format!("Could not create imported asset directory: {error}"))?;
-    let temporary = path.with_extension("txt.tmp");
-    fs::write(&temporary, data_url.as_bytes())
-        .map_err(|error| format!("Could not save imported asset: {error}"))?;
-    fs::rename(&temporary, &path)
-        .map_err(|error| format!("Could not finalize imported asset: {error}"))?;
+    let temporary = create_unique_synced_temporary(&path, data_url.as_bytes())?;
+    reject_symlink_path(&path, "Imported asset destination")?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Could not finalize imported asset: {error}"));
+    }
+    sync_file_at(&path)?;
+    sync_parent_directory(&path)?;
     Ok(asset_id)
 }
 
@@ -3166,12 +4060,7 @@ fn load_asset_from_store(store_dir: &Path, asset_id: &str) -> Result<String, Str
 fn load_imported_asset_at(config_dir: &Path, asset_id: &str) -> Result<String, String> {
     let asset_id = normalize_asset_id(asset_id)?;
     let index = load_v3_index_at(config_dir)?;
-    if !index
-        .asset_references
-        .values()
-        .flatten()
-        .any(|referenced| referenced.eq_ignore_ascii_case(&asset_id))
-    {
+    if !index_references_asset(&index, &asset_id)? {
         return Err("Imported asset is not referenced by any conversation".to_string());
     }
     load_asset_from_store(&v3_store_path(config_dir), &asset_id)
@@ -3329,6 +4218,67 @@ fn asset_reference_list(conversation: &ImportedConversation) -> Result<Vec<Strin
     Ok(assets)
 }
 
+fn collect_index_asset_ids(
+    asset_references: &HashMap<String, Vec<String>>,
+) -> Result<Vec<String>, String> {
+    let mut assets = asset_references
+        .values()
+        .flatten()
+        .map(|asset_id| normalize_asset_id(asset_id))
+        .collect::<Result<HashSet<_>, _>>()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    assets.sort();
+    Ok(assets)
+}
+
+fn refresh_index_asset_ids(index: &mut ImportedConversationsIndex) -> Result<(), String> {
+    index.asset_ids = Some(collect_index_asset_ids(&index.asset_references)?);
+    Ok(())
+}
+
+fn validate_or_upgrade_index_asset_ids(
+    index: &mut ImportedConversationsIndex,
+    persist: impl FnOnce(&ImportedConversationsIndex) -> Result<(), String>,
+) -> Result<(), String> {
+    let expected_asset_ids = collect_index_asset_ids(&index.asset_references)?;
+    if let Some(asset_ids) = index.asset_ids.as_ref() {
+        if asset_ids != &expected_asset_ids {
+            return Err("Imported asset lookup index is invalid".to_string());
+        }
+        return Ok(());
+    }
+    index.asset_ids = Some(expected_asset_ids);
+    if index.generation.is_none() {
+        index.generation = Some(uuid::Uuid::new_v4().to_string());
+    }
+    if let Err(error) = persist(index) {
+        log::warn!(
+            "Could not persist imported asset lookup index upgrade; using it in memory: {error}"
+        );
+    }
+    Ok(())
+}
+
+fn index_references_asset(
+    index: &ImportedConversationsIndex,
+    asset_id: &str,
+) -> Result<bool, String> {
+    if let Some(asset_ids) = &index.asset_ids {
+        if asset_ids != &collect_index_asset_ids(&index.asset_references)? {
+            return Err("Imported asset lookup index is invalid".to_string());
+        }
+        return Ok(asset_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(asset_id))
+            .is_ok());
+    }
+    Ok(index
+        .asset_references
+        .values()
+        .flatten()
+        .any(|referenced| referenced.eq_ignore_ascii_case(asset_id)))
+}
+
 fn install_v3_store_at(
     config_dir: &Path,
     conversations: &[ImportedConversation],
@@ -3363,24 +4313,31 @@ fn install_v3_store_at(
         let stored = prepare_conversation_for_store(&staging_dir, None, conversation)?;
         let bytes = serde_json::to_vec(&stored)
             .map_err(|error| format!("Could not serialize imported conversation: {error}"))?;
-        fs::write(item_path_in_store(&staging_dir, &conversation.id), bytes)
-            .map_err(|error| format!("Could not save imported conversation: {error}"))?;
+        write_new_file_synced(&item_path_in_store(&staging_dir, &conversation.id), &bytes)?;
         summaries.push(to_summary(&stored));
         asset_references.insert(stored.id.clone(), asset_reference_list(&stored)?);
     }
     sort_summaries(&mut summaries);
-    let index = ImportedConversationsIndex {
+    let mut index = ImportedConversationsIndex {
         version: STORE_VERSION,
         conversations: summaries,
         asset_references,
+        asset_ids: None,
+        generation: Some(uuid::Uuid::new_v4().to_string()),
     };
+    refresh_index_asset_ids(&mut index)?;
     let index_bytes = serde_json::to_vec(&index)
         .map_err(|error| format!("Could not serialize imported conversations index: {error}"))?;
-    fs::write(staging_dir.join(STORE_INDEX_FILE), index_bytes)
-        .map_err(|error| format!("Could not save imported conversations index: {error}"))?;
+    write_new_file_synced(&staging_dir.join(STORE_INDEX_FILE), &index_bytes)?;
+    sync_directory(&staging_dir.join(STORE_ITEMS_DIRECTORY))?;
+    sync_directory(&staging_dir.join(STORE_ASSETS_DIRECTORY))?;
+    sync_directory(&staging_dir)?;
+    sync_directory(config_dir)?;
 
     fs::rename(&staging_dir, &store_dir)
         .map_err(|error| format!("Could not install imported conversations store: {error}"))?;
+    sync_directory(&store_dir)?;
+    sync_directory(config_dir)?;
     Ok(())
 }
 
@@ -3393,11 +4350,24 @@ fn read_index_from_store(store_dir: &Path) -> Result<ImportedConversationsIndex,
 
 fn validate_v4_store_at(store_dir: &Path) -> Result<ImportedConversationsIndex, String> {
     let index = read_index_from_store(store_dir)?;
+    validate_v4_index_at(store_dir, &index)?;
+    Ok(index)
+}
+
+fn validate_v4_index_at(
+    store_dir: &Path,
+    index: &ImportedConversationsIndex,
+) -> Result<(), String> {
     if index.version != STORE_VERSION {
         return Err(format!(
             "Unsupported imported conversations index version: {}",
             index.version
         ));
+    }
+    if let Some(asset_ids) = &index.asset_ids {
+        if asset_ids != &collect_index_asset_ids(&index.asset_references)? {
+            return Err("Imported asset lookup index is invalid".to_string());
+        }
     }
     for summary in &index.conversations {
         let bytes = fs::read(item_path_in_store(store_dir, &summary.id))
@@ -3406,6 +4376,9 @@ fn validate_v4_store_at(store_dir: &Path) -> Result<ImportedConversationsIndex, 
             .map_err(|error| format!("Imported conversation is invalid: {error}"))?;
         if conversation.id != summary.id {
             return Err("Imported conversation id does not match its index entry".to_string());
+        }
+        if &to_summary(&conversation) != summary {
+            return Err("Imported conversation summary does not match its index entry".to_string());
         }
         for message in &conversation.messages {
             for part in &message.parts {
@@ -3438,7 +4411,7 @@ fn validate_v4_store_at(store_dir: &Path) -> Result<ImportedConversationsIndex, 
             );
         }
     }
-    Ok(index)
+    Ok(())
 }
 
 fn migrate_v3_store_to_v4_at(config_dir: &Path) -> Result<(), String> {
@@ -3476,27 +4449,32 @@ fn migrate_v3_store_to_v4_at(config_dir: &Path) -> Result<(), String> {
             }
             let stored =
                 prepare_conversation_for_store(&staging_dir, Some(&store_dir), &conversation)?;
-            fs::write(
-                item_path_in_store(&staging_dir, &stored.id),
-                serde_json::to_vec(&stored)
+            write_new_file_synced(
+                &item_path_in_store(&staging_dir, &stored.id),
+                &serde_json::to_vec(&stored)
                     .map_err(|error| format!("Could not serialize v4 conversation: {error}"))?,
-            )
-            .map_err(|error| format!("Could not save v4 conversation: {error}"))?;
+            )?;
             summaries.push(to_summary(&stored));
             asset_references.insert(stored.id.clone(), asset_reference_list(&stored)?);
         }
         sort_summaries(&mut summaries);
-        let index = ImportedConversationsIndex {
+        let mut index = ImportedConversationsIndex {
             version: STORE_VERSION,
             conversations: summaries,
             asset_references,
+            asset_ids: None,
+            generation: Some(uuid::Uuid::new_v4().to_string()),
         };
-        fs::write(
-            staging_dir.join(STORE_INDEX_FILE),
-            serde_json::to_vec(&index)
+        refresh_index_asset_ids(&mut index)?;
+        write_new_file_synced(
+            &staging_dir.join(STORE_INDEX_FILE),
+            &serde_json::to_vec(&index)
                 .map_err(|error| format!("Could not serialize v4 index: {error}"))?,
-        )
-        .map_err(|error| format!("Could not save v4 index: {error}"))?;
+        )?;
+        sync_directory(&staging_dir.join(STORE_ITEMS_DIRECTORY))?;
+        sync_directory(&staging_dir.join(STORE_ASSETS_DIRECTORY))?;
+        sync_directory(&staging_dir)?;
+        sync_directory(config_dir)?;
         validate_v4_store_at(&staging_dir)?;
         Ok(())
     })();
@@ -3512,10 +4490,13 @@ fn migrate_v3_store_to_v4_at(config_dir: &Path) -> Result<(), String> {
     }
     fs::rename(&store_dir, &backup_dir)
         .map_err(|error| format!("Could not back up v3 imported store: {error}"))?;
+    sync_directory(config_dir)?;
     if let Err(error) = fs::rename(&staging_dir, &store_dir) {
         let _ = fs::rename(&backup_dir, &store_dir);
         return Err(format!("Could not install v4 imported store: {error}"));
     }
+    sync_directory(&store_dir)?;
+    sync_directory(config_dir)?;
     if let Err(error) = validate_v4_store_at(&store_dir) {
         let _ = fs::remove_dir_all(&store_dir);
         let rollback = fs::rename(&backup_dir, &store_dir);
@@ -3530,6 +4511,313 @@ fn migrate_v3_store_to_v4_at(config_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn json_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn recover_json_backup(
+    path: &Path,
+    validate: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let backup = json_backup_path(path);
+    let backup_metadata = match fs::symlink_metadata(&backup) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Could not inspect imported data backup: {error}")),
+    };
+    if backup_metadata.file_type().is_symlink() || !backup_metadata.is_file() {
+        return Err("Imported data backup is not a regular file".to_string());
+    }
+    reject_symlink_path(path, "Imported data destination")?;
+    if path.is_file() && validate(path).is_ok() {
+        fs::remove_file(&backup)
+            .map_err(|error| format!("Could not remove stale imported data backup: {error}"))?;
+        sync_parent_directory(&backup)?;
+        return Ok(());
+    }
+    validate(&backup).map_err(|error| {
+        format!("Imported data backup is invalid and cannot be restored: {error}")
+    })?;
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("Could not remove invalid imported data file: {error}"))?;
+    }
+    fs::rename(&backup, path)
+        .map_err(|error| format!("Could not restore imported data backup: {error}"))?;
+    sync_file_at(path)?;
+    sync_parent_directory(path)
+}
+
+fn validate_index_bytes(bytes: &[u8]) -> Result<ImportedConversationsIndex, String> {
+    let index: ImportedConversationsIndex = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Imported conversations index is invalid: {error}"))?;
+    if index.version != 3 && index.version != STORE_VERSION {
+        return Err(format!(
+            "Unsupported imported conversations index version: {}",
+            index.version
+        ));
+    }
+    Ok(index)
+}
+
+fn rollback_store_transaction_items(
+    config_dir: &Path,
+    manifest: &ImportedStoreTransactionManifest,
+) -> Result<(), String> {
+    for item in manifest.items.iter().rev() {
+        let target = v3_item_path(config_dir, &item.id);
+        let backup = transaction_backup_item_path(config_dir, &item.id);
+        if backup.is_file() {
+            reject_symlink_path(&target, "Imported conversation rollback destination")?;
+            if target.exists() {
+                fs::remove_file(&target).map_err(|error| {
+                    format!("Could not remove uncommitted imported conversation: {error}")
+                })?;
+            }
+            fs::rename(&backup, &target).map_err(|error| {
+                format!("Could not restore imported conversation transaction backup: {error}")
+            })?;
+            sync_file_at(&target)?;
+        } else if !item.had_existing_file && target.exists() {
+            reject_symlink_path(&target, "Imported conversation rollback destination")?;
+            fs::remove_file(&target).map_err(|error| {
+                format!("Could not remove uncommitted imported conversation: {error}")
+            })?;
+        }
+    }
+    sync_directory(&v3_store_path(config_dir).join(STORE_ITEMS_DIRECTORY))?;
+    let backup_items = transaction_store_path(config_dir)
+        .join(STORE_TRANSACTION_BACKUPS_DIRECTORY)
+        .join(STORE_ITEMS_DIRECTORY);
+    if backup_items.is_dir() {
+        sync_directory(&backup_items)?;
+    }
+    Ok(())
+}
+
+fn restore_transaction_item_backups_by_name(config_dir: &Path) -> Result<(), String> {
+    let backup_items = transaction_store_path(config_dir)
+        .join(STORE_TRANSACTION_BACKUPS_DIRECTORY)
+        .join(STORE_ITEMS_DIRECTORY);
+    if !backup_items.is_dir() {
+        return Ok(());
+    }
+    let live_items = v3_store_path(config_dir).join(STORE_ITEMS_DIRECTORY);
+    fs::create_dir_all(&live_items)
+        .map_err(|error| format!("Could not create imported conversation directory: {error}"))?;
+    for entry in fs::read_dir(&backup_items)
+        .map_err(|error| format!("Could not scan imported transaction backups: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("Could not inspect imported transaction backup: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("Could not inspect imported transaction backup type: {error}")
+        })?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        let target = live_items.join(entry.file_name());
+        reject_symlink_path(&target, "Imported conversation rollback destination")?;
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not replace uncommitted imported conversation: {error}"
+                ));
+            }
+        }
+        fs::rename(entry.path(), &target)
+            .map_err(|error| format!("Could not restore imported conversation backup: {error}"))?;
+        sync_file_at(&target)?;
+    }
+    sync_directory(&live_items)?;
+    sync_directory(&backup_items)
+}
+
+fn restore_transaction_old_index(config_dir: &Path) -> Result<(), String> {
+    let backup = transaction_backup_index_path(config_dir);
+    reject_symlink_path(&backup, "Imported transaction index backup")?;
+    let bytes = fs::read(&backup)
+        .map_err(|error| format!("Could not read imported transaction index backup: {error}"))?;
+    validate_index_bytes(&bytes)?;
+    save_bytes_atomically(&v3_index_path(config_dir), &bytes)
+}
+
+fn clear_transaction_directory(config_dir: &Path) -> Result<(), String> {
+    let transaction_dir = transaction_store_path(config_dir);
+    match fs::remove_dir_all(&transaction_dir) {
+        Ok(()) => sync_directory(config_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not clear imported conversations transaction: {error}"
+        )),
+    }
+}
+
+fn read_optional_regular_file(path: &Path, label: &str) -> Option<Vec<u8>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            log::warn!("Could not inspect {label}: {error}");
+            return None;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        log::warn!("Ignoring non-regular {label}");
+        return None;
+    }
+    match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            log::warn!("Could not read {label}: {error}");
+            None
+        }
+    }
+}
+
+fn index_bytes_match_hash(bytes: &[u8], expected: Option<&str>) -> bool {
+    expected.is_some_and(|expected| hex::encode(Sha256::digest(bytes)) == expected)
+}
+
+fn validate_index_bytes_against_store(
+    bytes: &[u8],
+    store_dir: &Path,
+) -> Result<ImportedConversationsIndex, String> {
+    let index = validate_index_bytes(bytes)?;
+    if index.version == STORE_VERSION {
+        validate_v4_index_at(store_dir, &index)?;
+    }
+    Ok(index)
+}
+
+fn validate_index_file_against_store(path: &Path, store_dir: &Path) -> Result<(), String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Could not read imported conversations index: {error}"))?;
+    validate_index_bytes_against_store(&bytes, store_dir).map(|_| ())
+}
+
+fn recover_store_transaction_at(config_dir: &Path) -> Result<(), String> {
+    let transaction_dir = transaction_store_path(config_dir);
+    let transaction_metadata = match fs::symlink_metadata(&transaction_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect imported conversations transaction: {error}"
+            ));
+        }
+    };
+    if transaction_metadata.file_type().is_symlink() || !transaction_metadata.is_dir() {
+        return Err(
+            "Imported conversations transaction path is not a regular directory".to_string(),
+        );
+    }
+    let manifest_path = transaction_manifest_path(config_dir);
+    let manifest = read_optional_regular_file(&manifest_path, "imported transaction manifest")
+        .and_then(|bytes| {
+            match serde_json::from_slice::<ImportedStoreTransactionManifest>(&bytes) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    log::warn!("Ignoring invalid imported transaction manifest: {error}");
+                    None
+                }
+            }
+        });
+    let staged_index = read_optional_regular_file(
+        &transaction_dir.join(STORE_INDEX_FILE),
+        "staged imported transaction index",
+    );
+    let old_index = read_optional_regular_file(
+        &transaction_backup_index_path(config_dir),
+        "imported transaction index backup",
+    );
+    let old_index_is_trusted = old_index.as_ref().is_some_and(|bytes| {
+        manifest
+            .as_ref()
+            .and_then(|manifest| manifest.old_index_sha256.as_deref())
+            .map_or(true, |expected| {
+                index_bytes_match_hash(bytes, Some(expected))
+            })
+    });
+    if old_index.is_some() && !old_index_is_trusted {
+        log::warn!("Ignoring imported transaction index backup with an invalid checksum");
+    }
+    let current_index = read_optional_regular_file(
+        &v3_index_path(config_dir),
+        "current imported conversations index",
+    );
+    let store_dir = v3_store_path(config_dir);
+    let current_is_valid = current_index
+        .as_deref()
+        .is_some_and(|bytes| validate_index_bytes_against_store(bytes, &store_dir).is_ok());
+    let target_items_are_valid = manifest
+        .as_ref()
+        .map(|manifest| validate_transaction_items(config_dir, manifest).is_ok())
+        .unwrap_or(true);
+    let current_matches_target = current_is_valid
+        && target_items_are_valid
+        && current_index.as_ref().is_some_and(|current| {
+            staged_index
+                .as_ref()
+                .is_some_and(|staged| staged == current)
+                || manifest.as_ref().is_some_and(|manifest| {
+                    index_bytes_match_hash(current, manifest.new_index_sha256.as_deref())
+                })
+        });
+
+    if current_matches_target {
+        if let Err(error) = clear_transaction_directory(config_dir) {
+            log::warn!("{error}");
+        }
+        return Ok(());
+    }
+
+    let current_matches_old = current_index.as_ref().is_some_and(|current| {
+        old_index.as_ref().is_some_and(|old| old == current)
+            || manifest.as_ref().is_some_and(|manifest| {
+                index_bytes_match_hash(current, manifest.old_index_sha256.as_deref())
+            })
+    });
+    // A valid index with no remaining staged or old index is a transaction
+    // directory left behind by partial cleanup. It is safe to keep serving it.
+    if current_is_valid && staged_index.is_none() && old_index.is_none() {
+        if let Err(error) = clear_transaction_directory(config_dir) {
+            log::warn!("{error}");
+        }
+        return Ok(());
+    }
+    // If the current store is valid and differs from the durable old index,
+    // the index publication completed even if the manifest was lost.
+    if current_is_valid && !current_matches_old && old_index.is_some() && manifest.is_none() {
+        if let Err(error) = clear_transaction_directory(config_dir) {
+            log::warn!("{error}");
+        }
+        return Ok(());
+    }
+
+    if let Some(manifest) = manifest.as_ref() {
+        rollback_store_transaction_items(config_dir, manifest)?;
+    } else {
+        restore_transaction_item_backups_by_name(config_dir)?;
+    }
+
+    if let Some(old_index) = old_index.as_deref().filter(|_| old_index_is_trusted) {
+        validate_index_bytes(old_index)?;
+        save_bytes_atomically(&v3_index_path(config_dir), old_index)?;
+    } else {
+        recover_json_backup(&v3_index_path(config_dir), |candidate| {
+            validate_index_file_against_store(candidate, &store_dir)
+        })?;
+    }
+    validate_index_file_against_store(&v3_index_path(config_dir), &store_dir)?;
+    if let Err(error) = clear_transaction_directory(config_dir) {
+        log::warn!("{error}");
+    }
+    Ok(())
+}
+
 fn ensure_v3_store_at(config_dir: &Path) -> Result<bool, String> {
     let store_dir = v3_store_path(config_dir);
     let backup_dir = config_dir.join(STORE_BACKUP_DIRECTORY);
@@ -3538,6 +4826,12 @@ fn ensure_v3_store_at(config_dir: &Path) -> Result<bool, String> {
             .map_err(|error| format!("Could not restore imported store backup: {error}"))?;
     }
     let index_path = v3_index_path(config_dir);
+    if store_dir.exists() {
+        recover_store_transaction_at(config_dir)?;
+        recover_json_backup(&index_path, |candidate| {
+            validate_index_file_against_store(candidate, &store_dir)
+        })?;
+    }
     if index_path.is_file() {
         let index = read_index_from_store(&store_dir)?;
         return match index.version {
@@ -3574,7 +4868,7 @@ fn load_v3_index_at(config_dir: &Path) -> Result<ImportedConversationsIndex, Str
         }
         Ok(index)
     })();
-    let index = match index_result {
+    let mut index = match index_result {
         Ok(index) => index,
         Err(error) if migrated => {
             let rollback = fs::remove_dir_all(v3_store_path(config_dir));
@@ -3613,53 +4907,310 @@ fn load_v3_index_at(config_dir: &Path) -> Result<ImportedConversationsIndex, Str
         fs::remove_dir_all(&backup_dir)
             .map_err(|error| format!("Could not remove imported store backup: {error}"))?;
     }
+    validate_or_upgrade_index_asset_ids(&mut index, |upgraded| {
+        save_json_atomically(&v3_index_path(config_dir), upgraded)
+    })?;
     Ok(index)
 }
 
 fn save_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("Could not serialize imported conversation data: {error}"))?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("Could not save imported conversation data: {error}"))?;
-    replace_file(&temporary, path)
+    save_bytes_atomically(path, &bytes)
+}
+
+fn read_imported_conversation_item_at(
+    config_dir: &Path,
+    id: &str,
+) -> Result<ImportedConversation, String> {
+    let path = v3_item_path(config_dir, id);
+    recover_json_backup(&path, |candidate| {
+        let bytes = fs::read(candidate)
+            .map_err(|error| format!("Could not read imported conversation: {error}"))?;
+        let conversation: ImportedConversation = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Imported conversation is invalid: {error}"))?;
+        if conversation.id != id {
+            return Err("Imported conversation id does not match its index entry".to_string());
+        }
+        Ok(())
+    })?;
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("Could not read imported conversation: {error}"))?;
+    let conversation: ImportedConversation = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Imported conversation is invalid: {error}"))?;
+    if conversation.id != id {
+        return Err("Imported conversation id does not match its index entry".to_string());
+    }
+    Ok(conversation)
+}
+
+fn stage_imported_conversations_at(
+    config_dir: &Path,
+    conversations: &[ImportedConversation],
+) -> Result<Vec<ImportedConversationSummary>, String> {
+    let mut index = load_v3_index_at(config_dir)?;
+    let old_index_bytes = fs::read(v3_index_path(config_dir))
+        .map_err(|error| format!("Could not read current imported index: {error}"))?;
+    let store_dir = v3_store_path(config_dir);
+    let transaction_dir = transaction_store_path(config_dir);
+    if transaction_dir.exists() {
+        fs::remove_dir_all(&transaction_dir).map_err(|error| {
+            format!("Could not clear imported conversations transaction: {error}")
+        })?;
+    }
+    fs::create_dir_all(transaction_dir.join(STORE_ITEMS_DIRECTORY))
+        .map_err(|error| format!("Could not create imported transaction items: {error}"))?;
+    fs::create_dir_all(transaction_dir.join(STORE_ASSETS_DIRECTORY))
+        .map_err(|error| format!("Could not create imported transaction assets: {error}"))?;
+    fs::create_dir_all(
+        transaction_dir
+            .join(STORE_TRANSACTION_BACKUPS_DIRECTORY)
+            .join(STORE_ITEMS_DIRECTORY),
+    )
+    .map_err(|error| format!("Could not create imported transaction backups: {error}"))?;
+
+    let stage_result = (|| {
+        let mut imported = Vec::with_capacity(conversations.len());
+        let mut manifest = ImportedStoreTransactionManifest {
+            items: Vec::new(),
+            old_index_sha256: Some(hex::encode(Sha256::digest(&old_index_bytes))),
+            new_index_sha256: None,
+        };
+        let mut staged_ids = HashSet::new();
+        for conversation in conversations {
+            if !staged_ids.insert(conversation.id.clone()) {
+                return Err(format!(
+                    "Imported conversation batch contains duplicate id: {}",
+                    conversation.id
+                ));
+            }
+            let mut incoming = conversation.clone();
+            if index
+                .conversations
+                .iter()
+                .any(|summary| summary.id == conversation.id)
+            {
+                let existing = read_imported_conversation_item_at(config_dir, &conversation.id)?;
+                align_imported_message_ids(&existing, &mut incoming);
+            }
+            let stored =
+                prepare_conversation_for_store(&transaction_dir, Some(&store_dir), &incoming)?;
+            let stored_bytes = serde_json::to_vec(&stored)
+                .map_err(|error| format!("Could not serialize imported conversation: {error}"))?;
+            write_new_file_synced(
+                &item_path_in_store(&transaction_dir, &stored.id),
+                &stored_bytes,
+            )?;
+            let live_item_path = v3_item_path(config_dir, &stored.id);
+            if live_item_path.exists() && !live_item_path.is_file() {
+                return Err("Imported conversation item path is not a regular file".to_string());
+            }
+            manifest.items.push(ImportedStoreTransactionItem {
+                id: stored.id.clone(),
+                had_existing_file: live_item_path.is_file(),
+                new_sha256: Some(hex::encode(Sha256::digest(&stored_bytes))),
+            });
+            index
+                .asset_references
+                .insert(stored.id.clone(), asset_reference_list(&stored)?);
+            imported.push(to_summary(&stored));
+        }
+        let imported_ids: HashSet<&str> = imported.iter().map(|item| item.id.as_str()).collect();
+        index
+            .conversations
+            .retain(|item| !imported_ids.contains(item.id.as_str()));
+        index.conversations.extend(imported.iter().cloned());
+        sort_summaries(&mut index.conversations);
+        refresh_index_asset_ids(&mut index)?;
+        index.generation = Some(uuid::Uuid::new_v4().to_string());
+        let new_index_bytes = serde_json::to_vec(&index)
+            .map_err(|error| format!("Could not serialize imported index: {error}"))?;
+        manifest.new_index_sha256 = Some(hex::encode(Sha256::digest(new_index_bytes.as_slice())));
+        write_new_file_synced(&transaction_dir.join(STORE_INDEX_FILE), &new_index_bytes)?;
+        write_new_file_synced(&transaction_backup_index_path(config_dir), &old_index_bytes)?;
+        write_new_file_synced(
+            &transaction_manifest_path(config_dir),
+            &serde_json::to_vec(&manifest)
+                .map_err(|error| format!("Could not serialize imported transaction: {error}"))?,
+        )?;
+        sync_directory(&transaction_dir.join(STORE_ITEMS_DIRECTORY))?;
+        sync_directory(&transaction_dir.join(STORE_ASSETS_DIRECTORY))?;
+        sync_directory(
+            &transaction_dir
+                .join(STORE_TRANSACTION_BACKUPS_DIRECTORY)
+                .join(STORE_ITEMS_DIRECTORY),
+        )?;
+        sync_directory(&transaction_dir.join(STORE_TRANSACTION_BACKUPS_DIRECTORY))?;
+        sync_directory(&transaction_dir)?;
+        sync_directory(config_dir)?;
+        Ok(imported)
+    })();
+    if stage_result.is_err() {
+        let _ = fs::remove_dir_all(&transaction_dir);
+    }
+    stage_result
+}
+
+fn install_transaction_assets(config_dir: &Path) -> Result<(), String> {
+    let transaction_dir = transaction_store_path(config_dir);
+    let assets_dir = transaction_dir.join(STORE_ASSETS_DIRECTORY);
+    for entry in fs::read_dir(&assets_dir)
+        .map_err(|error| format!("Could not read imported transaction assets: {error}"))?
+    {
+        let entry = entry
+            .map_err(|error| format!("Could not inspect imported transaction asset: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!("Could not inspect imported transaction asset type: {error}")
+        })?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err("Imported transaction asset is not a regular file".to_string());
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let asset_id = normalize_asset_id(
+            file_name
+                .strip_suffix(".txt")
+                .ok_or_else(|| "Imported transaction asset has an invalid name".to_string())?,
+        )?;
+        let staged_data = load_asset_from_store(&transaction_dir, &asset_id)?;
+        let target = asset_path_in_store(&v3_store_path(config_dir), &asset_id);
+        reject_symlink_path(&target, "Imported asset destination")?;
+        if target.is_file() {
+            if load_asset_from_store(&v3_store_path(config_dir), &asset_id)? != staged_data {
+                return Err("Imported asset hash collision was detected".to_string());
+            }
+            fs::remove_file(entry.path())
+                .map_err(|error| format!("Could not clear staged imported asset: {error}"))?;
+        } else {
+            fs::rename(entry.path(), target)
+                .map_err(|error| format!("Could not install imported asset: {error}"))?;
+            sync_file_at(&asset_path_in_store(&v3_store_path(config_dir), &asset_id))?;
+        }
+    }
+    sync_directory(&assets_dir)?;
+    sync_directory(&v3_store_path(config_dir).join(STORE_ASSETS_DIRECTORY))?;
+    Ok(())
+}
+
+fn install_transaction_items(
+    config_dir: &Path,
+    manifest: &ImportedStoreTransactionManifest,
+) -> Result<(), String> {
+    let transaction_dir = transaction_store_path(config_dir);
+    for item in &manifest.items {
+        let staged = item_path_in_store(&transaction_dir, &item.id);
+        let target = v3_item_path(config_dir, &item.id);
+        let backup = transaction_backup_item_path(config_dir, &item.id);
+        reject_symlink_path(&target, "Imported conversation destination")?;
+        reject_symlink_path(&backup, "Imported conversation backup")?;
+        if target.exists() {
+            fs::rename(&target, &backup).map_err(|error| {
+                format!("Could not back up imported conversation during update: {error}")
+            })?;
+            sync_file_at(&backup)?;
+            sync_parent_directory(&target)?;
+            sync_parent_directory(&backup)?;
+        }
+        fs::rename(&staged, &target)
+            .map_err(|error| format!("Could not install imported conversation update: {error}"))?;
+        sync_file_at(&target)?;
+        sync_parent_directory(&target)?;
+        sync_parent_directory(&staged)?;
+    }
+    sync_directory(&v3_store_path(config_dir).join(STORE_ITEMS_DIRECTORY))?;
+    Ok(())
+}
+
+fn validate_transaction_items(
+    config_dir: &Path,
+    manifest: &ImportedStoreTransactionManifest,
+) -> Result<(), String> {
+    for item in &manifest.items {
+        let Some(expected) = item.new_sha256.as_deref() else {
+            continue;
+        };
+        let path = v3_item_path(config_dir, &item.id);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("Could not inspect installed conversation: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("Installed imported conversation is not a regular file".to_string());
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("Could not read installed conversation: {error}"))?;
+        if hex::encode(Sha256::digest(&bytes)) != expected {
+            return Err(
+                "Installed imported conversation does not match its transaction manifest"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn commit_imported_conversations_at(
+    config_dir: &Path,
+) -> Result<ImportedConversationsIndex, String> {
+    let transaction_dir = transaction_store_path(config_dir);
+    let manifest: ImportedStoreTransactionManifest = serde_json::from_slice(
+        &fs::read(transaction_manifest_path(config_dir))
+            .map_err(|error| format!("Could not read imported transaction manifest: {error}"))?,
+    )
+    .map_err(|error| format!("Imported transaction manifest is invalid: {error}"))?;
+    let index_bytes = fs::read(transaction_dir.join(STORE_INDEX_FILE))
+        .map_err(|error| format!("Could not read staged imported index: {error}"))?;
+    if !index_bytes_match_hash(&index_bytes, manifest.new_index_sha256.as_deref()) {
+        return Err("Staged imported index does not match its transaction manifest".to_string());
+    }
+    let old_index_bytes = fs::read(transaction_backup_index_path(config_dir))
+        .map_err(|error| format!("Could not read imported transaction index backup: {error}"))?;
+    if !index_bytes_match_hash(&old_index_bytes, manifest.old_index_sha256.as_deref()) {
+        return Err("Imported index backup does not match its transaction manifest".to_string());
+    }
+    validate_index_bytes(&old_index_bytes)?;
+    let index: ImportedConversationsIndex = serde_json::from_slice(&index_bytes)
+        .map_err(|error| format!("Staged imported index is invalid: {error}"))?;
+
+    let commit_result = (|| {
+        install_transaction_assets(config_dir)?;
+        install_transaction_items(config_dir, &manifest)?;
+        validate_transaction_items(config_dir, &manifest)?;
+        validate_v4_index_at(&v3_store_path(config_dir), &index)?;
+        save_bytes_atomically(&v3_index_path(config_dir), &index_bytes)?;
+        validate_v4_store_at(&v3_store_path(config_dir)).map(|_| ())
+    })();
+
+    if let Err(error) = commit_result {
+        return match rollback_store_transaction_items(config_dir, &manifest)
+            .and_then(|()| restore_transaction_old_index(config_dir))
+            .and_then(|()| validate_v4_store_at(&v3_store_path(config_dir)).map(|_| ()))
+        {
+            Ok(()) => {
+                if let Err(cleanup_error) = clear_transaction_directory(config_dir) {
+                    log::warn!("{cleanup_error}");
+                }
+                Err(format!(
+                    "{error}; imported conversation update was rolled back"
+                ))
+            }
+            Err(rollback_error) => Err(format!(
+                "{error}; imported conversation update could not be rolled back: {rollback_error}"
+            )),
+        };
+    }
+    if let Err(error) = clear_transaction_directory(config_dir) {
+        log::warn!("{error}");
+    }
+    Ok(index)
 }
 
 fn upsert_imported_conversations_at(
     config_dir: &Path,
     conversations: &[ImportedConversation],
 ) -> Result<Vec<ImportedConversationSummary>, String> {
-    let mut index = load_v3_index_at(config_dir)?;
-    let mut imported = Vec::with_capacity(conversations.len());
-    for conversation in conversations {
-        let store_dir = v3_store_path(config_dir);
-        let mut incoming = conversation.clone();
-        if index
-            .conversations
-            .iter()
-            .any(|summary| summary.id == conversation.id)
-        {
-            let bytes = fs::read(v3_item_path(config_dir, &conversation.id))
-                .map_err(|error| format!("Could not read imported conversation: {error}"))?;
-            let existing: ImportedConversation = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("Imported conversation is invalid: {error}"))?;
-            align_imported_message_ids(&existing, &mut incoming);
-        }
-        let stored = prepare_conversation_for_store(&store_dir, Some(&store_dir), &incoming)?;
-        save_json_atomically(&v3_item_path(config_dir, &stored.id), &stored)?;
-        index
-            .asset_references
-            .insert(stored.id.clone(), asset_reference_list(&stored)?);
-        imported.push(to_summary(&stored));
+    let mut imported = stage_imported_conversations_at(config_dir, conversations)?;
+    let index = commit_imported_conversations_at(config_dir)?;
+    if let Err(error) = cleanup_orphan_assets_at(config_dir, &index) {
+        log::warn!("Could not remove orphan imported assets after update: {error}");
     }
-    let imported_ids: HashSet<&str> = imported.iter().map(|item| item.id.as_str()).collect();
-    index
-        .conversations
-        .retain(|item| !imported_ids.contains(item.id.as_str()));
-    index.conversations.extend(imported.iter().cloned());
-    sort_summaries(&mut index.conversations);
-    save_json_atomically(&v3_index_path(config_dir), &index)?;
-    cleanup_orphan_assets_at(config_dir, &index)?;
     sort_summaries(&mut imported);
     Ok(imported)
 }
@@ -3684,15 +5235,7 @@ fn load_imported_conversation_at(
     {
         return Err("Imported conversation was not found".to_string());
     }
-    let path = v3_item_path(config_dir, id);
-    let bytes = fs::read(&path)
-        .map_err(|error| format!("Could not read imported conversation: {error}"))?;
-    let conversation: ImportedConversation = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Imported conversation is invalid: {error}"))?;
-    if conversation.id != id {
-        return Err("Imported conversation id does not match its index entry".to_string());
-    }
-    Ok(conversation)
+    read_imported_conversation_item_at(config_dir, id)
 }
 
 fn cleanup_orphan_assets_at(
@@ -3711,12 +5254,18 @@ fn cleanup_orphan_assets_at(
     {
         return Ok(());
     }
-    let referenced = index
-        .asset_references
-        .values()
-        .flatten()
-        .map(|asset_id| normalize_asset_id(asset_id))
-        .collect::<Result<HashSet<_>, _>>()?;
+    let referenced = match &index.asset_ids {
+        Some(asset_ids) => asset_ids
+            .iter()
+            .map(|asset_id| normalize_asset_id(asset_id))
+            .collect::<Result<HashSet<_>, _>>()?,
+        None => index
+            .asset_references
+            .values()
+            .flatten()
+            .map(|asset_id| normalize_asset_id(asset_id))
+            .collect::<Result<HashSet<_>, _>>()?,
+    };
     let entries = fs::read_dir(&assets_dir)
         .map_err(|error| format!("Could not scan imported asset directory: {error}"))?;
     for entry in entries {
@@ -3750,6 +5299,8 @@ fn remove_imported_conversation_at(config_dir: &Path, id: &str) -> Result<(), St
         return Ok(());
     }
     index.asset_references.remove(id);
+    refresh_index_asset_ids(&mut index)?;
+    index.generation = Some(uuid::Uuid::new_v4().to_string());
 
     // Publish the small index first. If deleting the item fails, it is only an
     // unreachable orphan and the removed conversation cannot reappear in lists.
@@ -3765,23 +5316,41 @@ fn remove_imported_conversation_at(config_dir: &Path, id: &str) -> Result<(), St
 }
 
 fn replace_file(temporary: &Path, path: &Path) -> Result<(), String> {
+    reject_symlink_path(temporary, "Imported data temporary file")?;
+    reject_symlink_path(path, "Imported data destination")?;
     #[cfg(windows)]
-    if path.exists() {
-        let backup = path.with_extension("json.bak");
-        if backup.exists() {
+    if fs::symlink_metadata(path).is_ok() {
+        let backup = json_backup_path(path);
+        reject_symlink_path(&backup, "Imported data backup")?;
+        if fs::symlink_metadata(&backup).is_ok() {
             fs::remove_file(&backup).map_err(|error| {
                 format!("Could not clear imported conversations backup: {error}")
             })?;
+            sync_parent_directory(&backup)?;
         }
         fs::rename(path, &backup)
             .map_err(|error| format!("Could not back up imported conversations: {error}"))?;
+        sync_file_at(&backup)?;
+        sync_parent_directory(path)?;
         return match fs::rename(temporary, path) {
             Ok(()) => {
-                let _ = fs::remove_file(backup);
+                sync_file_at(path)?;
+                sync_parent_directory(path)?;
+                if let Err(error) = fs::remove_file(&backup) {
+                    log::warn!("Could not clear imported conversations backup: {error}");
+                } else {
+                    sync_parent_directory(&backup)?;
+                }
                 Ok(())
             }
             Err(error) => {
-                let _ = fs::rename(&backup, path);
+                if let Err(rollback_error) = fs::rename(&backup, path) {
+                    return Err(format!(
+                        "Could not finalize imported conversations ({error}) or restore its backup ({rollback_error})"
+                    ));
+                }
+                sync_file_at(path)?;
+                sync_parent_directory(path)?;
                 Err(format!(
                     "Could not finalize imported conversations: {error}"
                 ))
@@ -3789,14 +5358,37 @@ fn replace_file(temporary: &Path, path: &Path) -> Result<(), String> {
         };
     }
     fs::rename(temporary, path)
-        .map_err(|error| format!("Could not finalize imported conversations: {error}"))
+        .map_err(|error| format!("Could not finalize imported conversations: {error}"))?;
+    sync_file_at(path)?;
+    sync_parent_directory(path)
 }
 
-fn collect_jsonl_files(root: &Path, output: &mut Vec<PathBuf>, warnings: &mut Vec<String>) {
+fn collect_jsonl_files(
+    root: &Path,
+    output: &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
+    budget: &mut HistoryScanBudget,
+    depth: usize,
+) {
+    if depth > budget.limits.max_directory_depth {
+        budget.incomplete = true;
+        if !budget.depth_limit_warned {
+            budget.depth_limit_warned = true;
+            push_warning(
+                warnings,
+                format!(
+                    "History scan skipped directories deeper than {} levels",
+                    budget.limits.max_directory_depth
+                ),
+            );
+        }
+        return;
+    }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
+            budget.incomplete = true;
             push_warning(
                 warnings,
                 format!(
@@ -3808,9 +5400,13 @@ fn collect_jsonl_files(root: &Path, output: &mut Vec<PathBuf>, warnings: &mut Ve
         }
     };
     for entry in entries {
+        if !budget.visit_entry(warnings) {
+            return;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
+                budget.incomplete = true;
                 push_warning(
                     warnings,
                     format!("Could not read an entry in {}: {error}", root.display()),
@@ -3822,6 +5418,7 @@ fn collect_jsonl_files(root: &Path, output: &mut Vec<PathBuf>, warnings: &mut Ve
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) => {
+                budget.incomplete = true;
                 push_warning(
                     warnings,
                     format!("Could not inspect history path {}: {error}", path.display()),
@@ -3833,26 +5430,16 @@ fn collect_jsonl_files(root: &Path, output: &mut Vec<PathBuf>, warnings: &mut Ve
             continue;
         }
         if file_type.is_dir() {
-            collect_jsonl_files(&path, output, warnings);
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
-            output.push(path);
+            collect_jsonl_files(&path, output, warnings, budget, depth + 1);
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+        {
+            if budget.discover_file(warnings) {
+                output.push(path);
+            } else {
+                return;
+            }
         }
-    }
-}
-
-fn user_home_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(path) = std::env::var_os("USERPROFILE") {
-            return Some(PathBuf::from(path));
-        }
-        let drive = std::env::var_os("HOMEDRIVE")?;
-        let path = std::env::var_os("HOMEPATH")?;
-        return Some(PathBuf::from(drive).join(path));
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
     }
 }
 
@@ -3961,6 +5548,7 @@ fn is_context_only_prompt(text: &str) -> bool {
         || normalized.starts_with("<local-command-caveat")
         || normalized.starts_with("<local-command-name")
         || normalized.starts_with("<local-command-stdout")
+        || normalized.starts_with("<command-name")
         || normalized.starts_with("<task-notification>")
 }
 
@@ -4018,6 +5606,7 @@ mod tests {
                 id: format!("{id}:0"),
                 role: "user".to_string(),
                 is_user_prompt: None,
+                is_api_error: None,
                 source_turn_id: None,
                 content: "inspect this image".to_string(),
                 parts: vec![
@@ -4259,11 +5848,22 @@ mod tests {
                     "commandMode": "task-notification"
                 }
             }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "attachment",
+                "uuid": "notification-uuid",
+                "sessionId": "attachment-session",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": "<task-notification>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>",
+                    "commandMode": "task-notification"
+                }
+            }),
         ]);
 
         let pieces = parse_claude_file(&path);
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].messages.len(), 4);
+        assert_eq!(pieces[0].messages.len(), 5);
         assert_eq!(pieces[0].messages[0].role, "system");
         assert_eq!(
             pieces[0].messages[0].source_message_id.as_deref(),
@@ -4302,6 +5902,13 @@ mod tests {
         assert!(matches!(
             &pieces[0].messages[3].parts[0],
             ImportedTranscriptPart::Text { text } if text == "sent while the tool was running"
+        ));
+        assert_eq!(pieces[0].messages[4].role, "system");
+        assert!(!pieces[0].messages[4].is_user_prompt);
+        assert_eq!(pieces[0].messages[4].source_turn_id, None);
+        assert!(matches!(
+            &pieces[0].messages[4].parts[0],
+            ImportedTranscriptPart::Text { text } if text.starts_with("<task-notification>")
         ));
 
         let directory = test_store_directory("claude-top-level-attachments");
@@ -4350,15 +5957,92 @@ mod tests {
                 "isSidechain": true,
                 "message": { "content": "sidechain context" }
             }),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "user",
+                "uuid": "command-uuid",
+                "sessionId": "meta-session",
+                "message": {
+                    "content": "<command-name>/review</command-name>\n<command-message>review</command-message>"
+                }
+            }),
         ]);
 
         let pieces = parse_claude_file(&path);
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].messages.len(), 2);
+        assert_eq!(pieces[0].messages.len(), 3);
         assert!(pieces[0]
             .messages
             .iter()
             .all(|message| message.role == "system"));
+        assert!(pieces[0]
+            .messages
+            .iter()
+            .all(|message| !message.is_user_prompt));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn skips_claude_queue_and_mode_metadata_without_import_warnings() {
+        let records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "queue-operation",
+                "sessionId": "queue-session",
+                "operation": "enqueue"
+            }),
+            json!({
+                "type": "mode",
+                "mode": "normal",
+                "sessionId": "queue-session"
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "user",
+                "uuid": "user-message",
+                "sessionId": "queue-session",
+                "message": { "content": "real request" }
+            }),
+        ];
+        let expected_source_bytes = records
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
+        let mut warnings = Vec::new();
+        let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+
+        let pieces = parse_claude_file_with_options(&path, true, None, &mut warnings, &mut budget);
+
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].messages.len(), 1);
+        assert_eq!(pieces[0].messages[0].content, "real request");
+        assert_eq!(pieces[0].source_bytes, expected_source_bytes);
+        assert!(warnings.is_empty());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn preserves_claude_api_error_messages_as_non_reply_assistant_events() {
+        let path = write_test_jsonl(vec![json!({
+            "timestamp": "2026-07-13T00:00:00Z",
+            "type": "assistant",
+            "uuid": "api-error-uuid",
+            "sessionId": "api-error-session",
+            "isApiErrorMessage": true,
+            "message": { "content": "API Error: overloaded_error" }
+        })]);
+
+        let mut pieces = parse_claude_file(&path);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].messages.len(), 1);
+        assert_eq!(pieces[0].messages[0].role, "assistant");
+        assert!(!pieces[0].messages[0].is_user_prompt);
+        assert!(pieces[0].messages[0].is_api_error);
+        assert_eq!(pieces[0].messages[0].content, "API Error: overloaded_error");
+        let imported = finalize_messages("api-error-session", pieces.remove(0).messages);
+        assert_eq!(imported[0].role, "assistant");
+        assert_eq!(imported[0].is_api_error, Some(true));
         fs::remove_file(path).ok();
     }
 
@@ -4391,7 +6075,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_embedded_images_from_text_and_tool_input() {
+    fn preserves_data_url_examples_in_text_but_extracts_structured_tool_values() {
         let message = json!({
             "type": "message",
             "role": "user",
@@ -4411,12 +6095,9 @@ mod tests {
         assert!(matches!(
             &message_parts[0],
             ImportedTranscriptPart::Text { text }
-                if text == "before [Image data omitted] after"
+                if text == "before data:image/png;base64,aGVsbG8= after"
         ));
-        assert!(matches!(
-            message_parts[1],
-            ImportedTranscriptPart::Image { .. }
-        ));
+        assert_eq!(message_parts.len(), 1);
 
         let (_, _, call_parts) = extract_codex_message(&call).expect("tool call");
         assert!(matches!(
@@ -4428,6 +6109,136 @@ mod tests {
             call_parts[1],
             ImportedTranscriptPart::Image { .. }
         ));
+    }
+
+    #[test]
+    fn incomplete_preview_scan_returns_a_visible_error() {
+        let scan = ScanOutput {
+            conversations: Vec::new(),
+            warnings: vec!["History scan byte limit was exceeded".to_string()],
+            incomplete: true,
+        };
+
+        let error = reject_incomplete_preview(CODEX_SOURCE, &scan)
+            .expect_err("incomplete preview scans must not look successful");
+        assert!(error.contains("Codex"));
+        assert!(error.contains("安全限制"));
+    }
+
+    #[test]
+    fn extracts_large_complete_data_urls_embedded_in_mixed_text() {
+        let payload = "A".repeat(4096);
+        let expected_data_url = format!("data:image/png;base64,{payload}");
+        let text = format!("before {expected_data_url} after");
+        let mut media = Vec::new();
+        let mut warnings = Vec::new();
+
+        let sanitized =
+            sanitize_embedded_data_urls(&text, &mut media, &mut warnings, "mixed tool value");
+
+        assert_eq!(sanitized, "before [Image data omitted] after");
+        assert_eq!(media.len(), 1);
+        assert!(matches!(
+            &media[0],
+            ImportedTranscriptPart::Image { data_url, .. }
+                if data_url.as_deref() == Some(expected_data_url.as_str())
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn skips_many_plain_data_prefixes_before_a_large_embedded_data_url() {
+        let payload = "A".repeat(4096);
+        let expected_data_url = format!("data:image/png;base64,{payload}");
+        let prefixes = "plain data: marker ".repeat(4096);
+        let text = format!("{prefixes}{expected_data_url} after");
+        let mut media = Vec::new();
+        let mut warnings = Vec::new();
+
+        let sanitized =
+            sanitize_embedded_data_urls(&text, &mut media, &mut warnings, "mixed tool value");
+
+        assert_eq!(
+            sanitized,
+            format!("{prefixes}[Image data omitted] after")
+        );
+        assert_eq!(media.len(), 1);
+        assert!(matches!(
+            &media[0],
+            ImportedTranscriptPart::Image { data_url, .. }
+                if data_url.as_deref() == Some(expected_data_url.as_str())
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn preserves_source_regex_and_truncated_data_url_text_without_attachment_warnings() {
+        let source_text = concat!(
+            "let url = format!(\"data:image/png;base64,{data}\");\n",
+            "let pattern = r\"data:image\\/[^;]+;base64,\";\n",
+            "preview=data:image/png;base64,abc...tokens truncated..."
+        );
+        let message = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": source_text }]
+        });
+        let mut warnings = Vec::new();
+
+        let (_, content, parts) =
+            extract_codex_message_with_warnings(&message, &mut warnings, "tool output")
+                .expect("message");
+
+        assert_eq!(content, source_text);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            ImportedTranscriptPart::Text { text } if text == source_text
+        ));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn preserves_mixed_and_truncated_data_url_text_in_custom_tool_records_without_warnings() {
+        let mixed = "prefix data:image/png;base64,aGVsbG8= suffix";
+        let truncated = "data:image/png;base64,abc...tokens truncated...";
+        let call = json!({
+            "type": "custom_tool_call",
+            "call_id": "custom-call",
+            "name": "inspect",
+            "input": {
+                "mixed": mixed,
+                "truncated": truncated
+            }
+        });
+        let output = json!({
+            "type": "custom_tool_call_output",
+            "call_id": "custom-call",
+            "output": {
+                "mixed": mixed,
+                "truncated": truncated
+            }
+        });
+        let mut warnings = Vec::new();
+
+        let (_, _, call_parts) =
+            extract_codex_message_with_warnings(&call, &mut warnings, "custom tool call")
+                .expect("custom tool call");
+        let (_, _, output_parts) =
+            extract_codex_message_with_warnings(&output, &mut warnings, "custom tool output")
+                .expect("custom tool output");
+
+        assert!(matches!(
+            &call_parts[..],
+            [ImportedTranscriptPart::ToolCall { input, .. }]
+                if input == &json!({ "mixed": mixed, "truncated": truncated })
+        ));
+        assert!(matches!(
+            &output_parts[..],
+            [ImportedTranscriptPart::ToolResult { output, .. }]
+                if output == &json!({ "mixed": mixed, "truncated": truncated })
+        ));
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -4582,6 +6393,9 @@ mod tests {
         assert!(is_context_only_prompt(
             "<codex_internal_context source=\"goal\">hidden</codex_internal_context>"
         ));
+        assert!(is_context_only_prompt(
+            "<command-name>/review</command-name>\n<command-message>review</command-message>"
+        ));
     }
 
     #[test]
@@ -4597,6 +6411,7 @@ mod tests {
         assert_eq!(message.content, "old message");
         assert!(message.parts.is_empty());
         assert_eq!(message.is_user_prompt, None);
+        assert_eq!(message.is_api_error, None);
         assert_eq!(message.source_turn_id, None);
     }
 
@@ -4607,6 +6422,7 @@ mod tests {
                 source_kind: CLAUDE_SOURCE,
                 role: "assistant".to_string(),
                 is_user_prompt: false,
+                is_api_error: false,
                 source_turn_id: None,
                 content: "second".to_string(),
                 parts: vec![ImportedTranscriptPart::Text {
@@ -4621,6 +6437,7 @@ mod tests {
                 source_kind: CLAUDE_SOURCE,
                 role: "user".to_string(),
                 is_user_prompt: true,
+                is_api_error: false,
                 source_turn_id: Some("first-turn".to_string()),
                 content: "first".to_string(),
                 parts: vec![ImportedTranscriptPart::Text {
@@ -4639,11 +6456,401 @@ mod tests {
     }
 
     #[test]
+    fn preserves_equal_non_user_messages_when_stable_source_ids_differ() {
+        let parsed = |role: &str, prompt: bool, turn: &str, text: &str, at: i64| ParsedMessage {
+            source_kind: CODEX_SOURCE,
+            role: role.to_string(),
+            is_user_prompt: prompt,
+            is_api_error: false,
+            source_turn_id: Some(turn.to_string()),
+            content: text.to_string(),
+            parts: vec![ImportedTranscriptPart::Text {
+                text: text.to_string(),
+            }],
+            timestamp: at,
+            source_message_id: Some(format!("{role}-{at}")),
+            source_path: "history.jsonl".to_string(),
+            line_number: at as usize,
+        };
+        let messages = vec![
+            parsed("system", false, "turn-a", "policy", 10),
+            parsed("system", false, "turn-a", "policy", 20),
+            parsed("assistant", false, "turn-a", "Done", 30),
+            parsed("assistant", false, "turn-a", "Done", 40),
+            parsed("assistant", false, "turn-b", "Done", 50),
+            parsed("user", true, "turn-c", "Retry", 60),
+            parsed("user", true, "turn-d", "Retry", 70),
+        ];
+
+        let result = finalize_messages("session", messages);
+        let count = |text: &str| {
+            result
+                .iter()
+                .filter(|message| message.content == text)
+                .count()
+        };
+        assert_eq!(count("policy"), 2);
+        assert_eq!(count("Done"), 3);
+        assert_eq!(count("Retry"), 2);
+    }
+
+    #[test]
+    fn deduplicates_a_replayed_stable_turn_without_deleting_legitimate_repeats() {
+        let parsed = |role: &str, prompt: bool, turn: &str, text: &str, at: i64| ParsedMessage {
+            source_kind: CLAUDE_SOURCE,
+            role: role.to_string(),
+            is_user_prompt: prompt,
+            is_api_error: false,
+            source_turn_id: Some(turn.to_string()),
+            content: text.to_string(),
+            parts: vec![ImportedTranscriptPart::Text {
+                text: text.to_string(),
+            }],
+            timestamp: at,
+            source_message_id: Some(format!("{turn}-{role}-{at}")),
+            source_path: "history.jsonl".to_string(),
+            line_number: at as usize,
+        };
+        let result = finalize_messages(
+            "session",
+            vec![
+                parsed("user", true, "turn-a", "Retry", 10),
+                parsed("assistant", false, "turn-a", "Done", 20),
+                parsed("user", true, "turn-a", "Retry", 30),
+                parsed("assistant", false, "turn-a", "Done", 40),
+                parsed("user", true, "turn-c", "Retry", 50),
+                parsed("assistant", false, "turn-c", "Done", 60),
+                parsed("user", true, "turn-d", "Retry", 70),
+                parsed("assistant", false, "turn-d", "Different", 80),
+            ],
+        );
+
+        let count = |text: &str| {
+            result
+                .iter()
+                .filter(|message| message.content == text)
+                .count()
+        };
+        assert_eq!(count("Retry"), 3);
+        assert_eq!(count("Done"), 2);
+        assert_eq!(count("Different"), 1);
+    }
+
+    #[test]
+    fn preserves_changed_tool_payloads_that_reuse_a_source_message_id() {
+        let parsed = |tool_call_id: &str, path: &str, timestamp: i64| ParsedMessage {
+            source_kind: CLAUDE_SOURCE,
+            role: "assistant".to_string(),
+            is_user_prompt: false,
+            is_api_error: false,
+            source_turn_id: Some("turn-a".to_string()),
+            content: "[Tool call: Read]".to_string(),
+            parts: vec![ImportedTranscriptPart::ToolCall {
+                tool_call_id: Some(tool_call_id.to_string()),
+                name: "Read".to_string(),
+                input: json!({"path": path}),
+            }],
+            timestamp,
+            source_message_id: Some("same-source-message".to_string()),
+            source_path: "history.jsonl".to_string(),
+            line_number: timestamp as usize,
+        };
+
+        let result = finalize_messages(
+            "session",
+            vec![parsed("call-1", "a", 10), parsed("call-2", "b", 20)],
+        );
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(
+            &result[0].parts[0],
+            ImportedTranscriptPart::ToolCall { tool_call_id, input, .. }
+                if tool_call_id.as_deref() == Some("call-1") && input == &json!({"path": "a"})
+        ));
+        assert!(matches!(
+            &result[1].parts[0],
+            ImportedTranscriptPart::ToolCall { tool_call_id, input, .. }
+                if tool_call_id.as_deref() == Some("call-2") && input == &json!({"path": "b"})
+        ));
+    }
+
+    #[test]
+    fn codex_assembly_preserves_changed_tool_payloads_that_reuse_a_source_message_id() {
+        let parsed = |tool_call_id: &str, path: &str, timestamp: i64| ParsedMessage {
+            source_kind: CODEX_SOURCE,
+            role: "assistant".to_string(),
+            is_user_prompt: false,
+            is_api_error: false,
+            source_turn_id: Some("turn-a".to_string()),
+            content: "[Tool call: inspect]".to_string(),
+            parts: vec![ImportedTranscriptPart::ToolCall {
+                tool_call_id: Some(tool_call_id.to_string()),
+                name: "inspect".to_string(),
+                input: json!({"path": path}),
+            }],
+            timestamp,
+            source_message_id: Some("same-source-message".to_string()),
+            source_path: "history.jsonl".to_string(),
+            line_number: timestamp as usize,
+        };
+        let conversations = assemble_codex_conversations(
+            vec![CodexPiece {
+                native_session_id: "session".to_string(),
+                rollout_id: None,
+                project_path: None,
+                created_at: 10,
+                updated_at: 20,
+                source_bytes: 0,
+                messages: vec![parsed("call-1", "a", 10), parsed("call-2", "b", 20)],
+                preview_messages: Vec::new(),
+            }],
+            &HashMap::new(),
+            true,
+        );
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn preserves_equal_timestamp_free_messages_without_reliable_replay_evidence() {
+        let parsed =
+            |role: &str, prompt: bool, source_id: &str, line_number: usize| ParsedMessage {
+                source_kind: CLAUDE_SOURCE,
+                role: role.to_string(),
+                is_user_prompt: prompt,
+                is_api_error: false,
+                source_turn_id: Some("turn-a".to_string()),
+                content: if prompt { "Retry" } else { "Same answer" }.to_string(),
+                parts: vec![ImportedTranscriptPart::Text {
+                    text: if prompt { "Retry" } else { "Same answer" }.to_string(),
+                }],
+                timestamp: 0,
+                source_message_id: Some(source_id.to_string()),
+                source_path: "history.jsonl".to_string(),
+                line_number,
+            };
+        let result = finalize_messages(
+            "session",
+            vec![
+                parsed("user", true, "user", 1),
+                parsed("assistant", false, "answer-a", 2),
+                parsed("assistant", false, "answer-b", 3),
+            ],
+        );
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "Same answer")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn deduplicates_tool_rich_replays_only_for_the_same_stable_turn() {
+        let tool_turn = |prefix: &str, turn: &str, tool_call_id: &str, at: i64| {
+            vec![
+                ParsedMessage {
+                    source_kind: CLAUDE_SOURCE,
+                    role: "user".to_string(),
+                    is_user_prompt: true,
+                    is_api_error: false,
+                    source_turn_id: Some(turn.to_string()),
+                    content: "Read the file".to_string(),
+                    parts: vec![ImportedTranscriptPart::Text {
+                        text: "Read the file".to_string(),
+                    }],
+                    timestamp: at,
+                    source_message_id: Some(format!("{prefix}-user")),
+                    source_path: "history.jsonl".to_string(),
+                    line_number: at as usize,
+                },
+                ParsedMessage {
+                    source_kind: CLAUDE_SOURCE,
+                    role: "assistant".to_string(),
+                    is_user_prompt: false,
+                    is_api_error: false,
+                    source_turn_id: Some(turn.to_string()),
+                    content: "[Tool call: Read]".to_string(),
+                    parts: vec![ImportedTranscriptPart::ToolCall {
+                        tool_call_id: Some(tool_call_id.to_string()),
+                        name: "Read".to_string(),
+                        input: json!({"path": "a"}),
+                    }],
+                    timestamp: at + 1,
+                    source_message_id: Some(format!("{prefix}-call")),
+                    source_path: "history.jsonl".to_string(),
+                    line_number: (at + 1) as usize,
+                },
+                ParsedMessage {
+                    source_kind: CLAUDE_SOURCE,
+                    role: "tool".to_string(),
+                    is_user_prompt: false,
+                    is_api_error: false,
+                    source_turn_id: Some(turn.to_string()),
+                    content: "[Tool result]".to_string(),
+                    parts: vec![ImportedTranscriptPart::ToolResult {
+                        tool_call_id: Some(tool_call_id.to_string()),
+                        output: json!("done"),
+                        is_error: false,
+                    }],
+                    timestamp: at + 2,
+                    source_message_id: Some(format!("{prefix}-result")),
+                    source_path: "history.jsonl".to_string(),
+                    line_number: (at + 2) as usize,
+                },
+            ]
+        };
+        let result = finalize_messages(
+            "session",
+            [
+                tool_turn("original", "turn-a", "call-1", 10),
+                tool_turn("replay", "turn-a", "call-1", 20),
+                tool_turn("legitimate", "turn-b", "call-2", 30),
+            ]
+            .concat(),
+        );
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.is_user_prompt == Some(true))
+                .count(),
+            2
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "[Tool call: Read]")
+                .count(),
+            2
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "[Tool result]")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn preserves_equal_untimestamped_replies_that_cannot_be_assigned_to_a_turn() {
+        let parsed = |role: &str, prompt: bool, text: &str, timestamp: i64, line_number: usize| {
+            ParsedMessage {
+                source_kind: CLAUDE_SOURCE,
+                role: role.to_string(),
+                is_user_prompt: prompt,
+                is_api_error: false,
+                source_turn_id: None,
+                content: text.to_string(),
+                parts: vec![ImportedTranscriptPart::Text {
+                    text: text.to_string(),
+                }],
+                timestamp,
+                source_message_id: prompt.then(|| format!("prompt-{line_number}")),
+                source_path: "history.jsonl".to_string(),
+                line_number,
+            }
+        };
+        let result = finalize_messages(
+            "session",
+            vec![
+                parsed("user", true, "First", 10, 1),
+                parsed("assistant", false, "Same reply", 0, 2),
+                parsed("user", true, "Second", 20, 3),
+                parsed("assistant", false, "Same reply", 0, 4),
+            ],
+        );
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|message| message.content == "Same reply")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn keeps_distinct_tool_calls_while_deduplicating_replayed_thinking() {
+        let parsed = |source_id: &str,
+                      timestamp: i64,
+                      content: &str,
+                      parts: Vec<ImportedTranscriptPart>| ParsedMessage {
+            source_kind: CLAUDE_SOURCE,
+            role: "assistant".to_string(),
+            is_user_prompt: false,
+            is_api_error: false,
+            source_turn_id: Some("turn-a".to_string()),
+            content: content.to_string(),
+            parts,
+            timestamp,
+            source_message_id: Some(source_id.to_string()),
+            source_path: "history.jsonl".to_string(),
+            line_number: timestamp as usize,
+        };
+        let messages = vec![
+            parsed(
+                "thinking-1",
+                10,
+                "[thinking]",
+                vec![ImportedTranscriptPart::Event {
+                    kind: "thinking".to_string(),
+                    data: Value::Null,
+                }],
+            ),
+            parsed(
+                "thinking-1",
+                20,
+                "[thinking]",
+                vec![ImportedTranscriptPart::Event {
+                    kind: "thinking".to_string(),
+                    data: Value::Null,
+                }],
+            ),
+            parsed(
+                "tool-1",
+                30,
+                "[Tool call: Read]",
+                vec![ImportedTranscriptPart::ToolCall {
+                    tool_call_id: Some("call-1".to_string()),
+                    name: "Read".to_string(),
+                    input: json!({"path": "a"}),
+                }],
+            ),
+            parsed(
+                "tool-2",
+                40,
+                "[Tool call: Read]",
+                vec![ImportedTranscriptPart::ToolCall {
+                    tool_call_id: Some("call-2".to_string()),
+                    name: "Read".to_string(),
+                    input: json!({"path": "a"}),
+                }],
+            ),
+        ];
+
+        let result = finalize_messages("session", messages);
+        let count = |text: &str| {
+            result
+                .iter()
+                .filter(|message| message.content == text)
+                .count()
+        };
+        assert_eq!(count("[thinking]"), 1);
+        assert_eq!(count("[Tool call: Read]"), 2);
+    }
+
+    #[test]
     fn stable_message_ids_do_not_shift_after_middle_insertion() {
         let parsed = |content: &str, timestamp: i64| ParsedMessage {
             source_kind: CODEX_SOURCE,
             role: "assistant".to_string(),
             is_user_prompt: false,
+            is_api_error: false,
             source_turn_id: None,
             content: content.to_string(),
             parts: vec![ImportedTranscriptPart::Text {
@@ -4686,6 +6893,8 @@ mod tests {
                 version: 3,
                 conversations: vec![to_summary(&existing)],
                 asset_references: HashMap::new(),
+                asset_ids: None,
+                generation: None,
             })
             .expect("v3 index"),
         )
@@ -4722,39 +6931,193 @@ mod tests {
     }
 
     #[test]
-    fn separates_codex_messages_when_session_metadata_changes() {
-        let path = write_test_jsonl(vec![
+    fn keeps_codex_file_owned_by_its_first_rollout_metadata() {
+        let records = vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "session_meta",
-                "payload": { "session_id": "first", "id": "first-rollout", "cwd": "C:/one" }
+                "payload": {
+                    "id": "owner-rollout",
+                    "session_id": "ancestor-session",
+                    "thread_source": "user",
+                    "cwd": "C:/owner"
+                }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:01Z",
                 "type": "response_item",
-                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "first request" }] }
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "owner request" }] }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:02Z",
                 "type": "session_meta",
-                "payload": { "session_id": "second", "id": "second-rollout", "cwd": "C:/two" }
+                "payload": { "session_id": "ancestor-session", "id": "ancestor-rollout", "cwd": "C:/ancestor" }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:03Z",
                 "type": "response_item",
-                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "second answer" }] }
+                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "owner answer" }] }
+            }),
+        ];
+        let expected_source_bytes = records
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
+
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            None,
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        );
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].native_session_id, "owner-rollout");
+        assert_eq!(pieces[0].rollout_id.as_deref(), Some("owner-rollout"));
+        assert_eq!(pieces[0].project_path.as_deref(), Some("C:/owner"));
+        assert_eq!(pieces[0].source_bytes, expected_source_bytes);
+        assert_eq!(pieces[0].messages.len(), 2);
+        assert_eq!(pieces[0].messages[0].content, "owner request");
+        assert_eq!(pieces[0].messages[1].content, "owner answer");
+
+        let selected_ancestor = HashSet::from(["ancestor-rollout".to_string()]);
+        assert!(parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_ancestor),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_empty());
+
+        let preview = parse_codex_preview_file(
+            &path,
+            "fallback".to_string(),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .expect("owner preview");
+        assert_eq!(preview.native_session_id, "owner-rollout");
+        assert_eq!(preview.rollout_id.as_deref(), Some("owner-rollout"));
+        assert_eq!(preview.project_path.as_deref(), Some("C:/owner"));
+        assert_eq!(preview.source_bytes, expected_source_bytes);
+        assert_eq!(preview.preview_messages.len(), 2);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn selected_codex_import_only_charges_bytes_consumed_from_unselected_files() {
+        let directory = test_store_directory("selected-codex-read-budget");
+        let unselected_path = directory.join("unselected.jsonl");
+        let selected_path = directory.join("selected.jsonl");
+        let unselected_meta = json!({
+            "timestamp": "2026-07-13T00:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "unselected", "session_id": "unselected" }
+        })
+        .to_string();
+        let unselected_contents = format!("{unselected_meta}\n{}", "x".repeat(2048));
+        fs::write(&unselected_path, &unselected_contents).expect("unselected Codex history");
+
+        let selected_contents = [
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "session_meta",
+                "payload": { "id": "selected", "session_id": "selected" }
+            })
+            .to_string(),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "selected request" }]
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&selected_path, &selected_contents).expect("selected Codex history");
+
+        let limits = HistoryScanLimits {
+            max_file_bytes: 4096,
+            max_total_bytes: 1024,
+            ..HISTORY_SCAN_LIMITS
+        };
+        assert!(unselected_contents.len() as u64 > limits.max_total_bytes);
+        let selected_ids = HashSet::from(["selected".to_string()]);
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+
+        assert!(parse_codex_file_with_options(
+            &unselected_path,
+            "unselected-fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        )
+        .is_empty());
+        assert_eq!(budget.total_bytes, unselected_meta.len() as u64 + 1);
+        assert!(!budget.incomplete);
+
+        let pieces = parse_codex_file_with_options(
+            &selected_path,
+            "selected-fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        );
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].native_session_id, "selected");
+        assert_eq!(pieces[0].messages.len(), 1);
+        assert_eq!(
+            budget.total_bytes,
+            unselected_meta.len() as u64 + 1 + selected_contents.len() as u64
+        );
+        assert!(!budget.incomplete);
+        assert!(warnings.is_empty());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn selected_codex_import_accepts_legacy_session_id_only_owner() {
+        let path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "legacy-owner", "cwd": "C:/legacy" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "legacy request" }]
+                }
             }),
         ]);
+        let selected_ids = HashSet::from(["legacy-owner".to_string()]);
+        let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+        let mut warnings = Vec::new();
 
-        let pieces =
-            parse_codex_file_with_options(&path, "fallback".to_string(), None, &mut Vec::new());
-        assert_eq!(pieces.len(), 2);
-        assert_eq!(pieces[0].native_session_id, "first");
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        );
+
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].native_session_id, "legacy-owner");
+        assert_eq!(pieces[0].rollout_id, None);
+        assert_eq!(pieces[0].project_path.as_deref(), Some("C:/legacy"));
         assert_eq!(pieces[0].messages.len(), 1);
-        assert_eq!(pieces[0].messages[0].content, "first request");
-        assert_eq!(pieces[1].native_session_id, "second");
-        assert_eq!(pieces[1].messages.len(), 1);
-        assert_eq!(pieces[1].messages[0].content, "second answer");
+        assert!(!budget.incomplete);
+        assert!(warnings.is_empty());
         fs::remove_file(path).ok();
     }
 
@@ -4799,12 +7162,16 @@ mod tests {
     }
 
     #[test]
-    fn skips_subagent_metadata_without_discarding_later_user_session() {
+    fn skips_entire_codex_subagent_file_with_embedded_parent_snapshot() {
         let path = write_test_jsonl(vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "session_meta",
-                "payload": { "session_id": "child", "source": { "subagent": { "other": "test" } } }
+                "payload": {
+                    "id": "child-rollout",
+                    "session_id": "parent-rollout",
+                    "source": { "subagent": { "other": "test" } }
+                }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:01Z",
@@ -4814,7 +7181,7 @@ mod tests {
             json!({
                 "timestamp": "2026-07-13T00:00:02Z",
                 "type": "session_meta",
-                "payload": { "session_id": "parent", "thread_source": "user" }
+                "payload": { "session_id": "parent-rollout", "id": "parent-rollout", "thread_source": "user" }
             }),
             json!({
                 "timestamp": "2026-07-13T00:00:03Z",
@@ -4823,17 +7190,36 @@ mod tests {
             }),
         ]);
 
-        let piece = parse_codex_file(&path, "fallback".to_string())
-            .expect("later user session should be parsed");
-        assert_eq!(piece.native_session_id, "parent");
-        assert_eq!(piece.messages.len(), 1);
-        assert_eq!(piece.messages[0].content, "real request");
+        assert!(parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            None,
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_empty());
+        assert!(parse_codex_preview_file(
+            &path,
+            "fallback".to_string(),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_none());
+        let selected_parent = HashSet::from(["parent-rollout".to_string()]);
+        assert!(parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_parent),
+            &mut Vec::new(),
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .is_empty());
         fs::remove_file(path).ok();
     }
 
     #[test]
     fn preview_parser_keeps_only_lightweight_codex_message_metadata() {
-        let path = write_test_jsonl(vec![
+        let records = vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "session_meta",
@@ -4851,16 +7237,199 @@ mod tests {
                     ]
                 }
             }),
-        ]);
+        ];
+        let expected_source_bytes = records
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
         let mut warnings = Vec::new();
 
-        let piece = parse_codex_preview_file(&path, "fallback".to_string(), &mut warnings)
-            .expect("preview piece");
+        let piece = parse_codex_preview_file(
+            &path,
+            "fallback".to_string(),
+            &mut warnings,
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        )
+        .expect("preview piece");
         assert!(piece.messages.is_empty());
         assert_eq!(piece.preview_messages.len(), 1);
         assert_eq!(
             piece.preview_messages[0].user_text.as_deref(),
             Some("inspect this")
+        );
+        assert_eq!(piece.source_bytes, expected_source_bytes);
+        let conversation = assemble_codex_conversations(vec![piece], &HashMap::new(), false)
+            .into_iter()
+            .next()
+            .expect("assembled preview");
+        let preview = to_preview(CODEX_SOURCE, &conversation);
+        assert_eq!(preview.source_bytes, expected_source_bytes);
+        assert_eq!(
+            serde_json::to_value(preview).expect("serialized preview")["sourceBytes"],
+            expected_source_bytes
+        );
+        assert!(warnings.is_empty());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn codex_preview_counts_event_only_pieces_for_visible_sessions() {
+        let visible_records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "shared", "cwd": "C:/one" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "visible request" }]
+                }
+            }),
+        ];
+        let duplicate_records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "session_meta",
+                "payload": { "session_id": "shared", "cwd": "C:/one" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "event_msg",
+                "payload": { "type": "token_count", "info": { "total_token_usage": 10 } }
+            }),
+        ];
+        let empty_records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:04Z",
+                "type": "session_meta",
+                "payload": { "session_id": "empty", "cwd": "C:/two" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:05Z",
+                "type": "event_msg",
+                "payload": { "type": "token_count", "info": { "total_token_usage": 20 } }
+            }),
+        ];
+        let expected_source_bytes = visible_records
+            .iter()
+            .chain(&duplicate_records)
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let visible_path = write_test_jsonl(visible_records);
+        let duplicate_path = write_test_jsonl(duplicate_records);
+        let empty_path = write_test_jsonl(empty_records);
+        let mut warnings = Vec::new();
+        let mut budget = HistoryScanBudget::new(HISTORY_SCAN_LIMITS);
+
+        let pieces = [
+            (&visible_path, "visible-fallback"),
+            (&duplicate_path, "duplicate-fallback"),
+            (&empty_path, "empty-fallback"),
+        ]
+        .into_iter()
+        .map(|(path, fallback_id)| {
+            parse_codex_preview_file(path, fallback_id.to_string(), &mut warnings, &mut budget)
+                .expect("session metadata should produce a preview piece")
+        })
+        .collect::<Vec<_>>();
+
+        let conversations = assemble_codex_conversations(pieces, &HashMap::new(), false);
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].native_session_id, "shared");
+        assert_eq!(conversations[0].message_count, 1);
+        assert_eq!(conversations[0].source_bytes, expected_source_bytes);
+        assert!(warnings.is_empty());
+
+        fs::remove_file(visible_path).ok();
+        fs::remove_file(duplicate_path).ok();
+        fs::remove_file(empty_path).ok();
+    }
+
+    #[test]
+    fn claude_preview_reports_per_session_source_bytes_and_ignores_internal_queue_prompts() {
+        let internal_prompt = "<task-notification><status>completed</status></task-notification>";
+        let records = vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "queue-operation",
+                "sessionId": "alpha"
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "user",
+                "sessionId": "alpha",
+                "message": { "content": "alpha request" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "attachment",
+                "sessionId": "beta",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": internal_prompt,
+                    "commandMode": "task-notification"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "user",
+                "sessionId": "beta",
+                "message": {
+                    "content": "<command-name>/review</command-name>\n<command-message>review</command-message>"
+                }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:04Z",
+                "type": "assistant",
+                "sessionId": "beta",
+                "message": { "content": "background complete" }
+            }),
+        ];
+        let expected_alpha_bytes = records[..2]
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let expected_beta_bytes = records[2..]
+            .iter()
+            .map(|record| record.to_string().len() as u64)
+            .sum::<u64>();
+        let path = write_test_jsonl(records);
+        let mut warnings = Vec::new();
+
+        let pieces = parse_claude_preview_file(
+            &path,
+            &mut warnings,
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        );
+        let beta_piece = pieces
+            .iter()
+            .find(|piece| piece.native_session_id == "beta")
+            .expect("beta preview piece");
+        assert_eq!(beta_piece.first_user_text, None);
+        assert!(beta_piece
+            .preview_messages
+            .iter()
+            .all(|message| message.user_text.is_none()));
+
+        let previews = assemble_claude_conversations(pieces, false)
+            .into_iter()
+            .map(|conversation| {
+                let preview = to_preview(CLAUDE_SOURCE, &conversation);
+                (preview.native_session_id.clone(), preview)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(previews["alpha"].source_bytes, expected_alpha_bytes);
+        assert_eq!(previews["beta"].source_bytes, expected_beta_bytes);
+        assert_eq!(previews["beta"].title, "Untitled conversation");
+        assert_eq!(
+            serde_json::to_value(&previews["beta"]).expect("serialized preview")["sourceBytes"]
+                .as_u64(),
+            Some(expected_beta_bytes)
         );
         assert!(warnings.is_empty());
         fs::remove_file(path).ok();
@@ -4897,13 +7466,333 @@ mod tests {
         let selected = HashSet::from(["selected".to_string()]);
         let mut warnings = Vec::new();
 
-        let pieces = parse_claude_file_with_options(&path, true, Some(&selected), &mut warnings);
+        let pieces = parse_claude_file_with_options(
+            &path,
+            true,
+            Some(&selected),
+            &mut warnings,
+            &mut HistoryScanBudget::new(HISTORY_SCAN_LIMITS),
+        );
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].native_session_id, "selected");
         assert_eq!(pieces[0].messages.len(), 1);
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("invalid JSON")));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn bounded_jsonl_reader_discards_overlong_line_before_reading_next_line() {
+        let mut input = std::io::Cursor::new(b"123456789\nok\n".to_vec());
+        let first = read_bounded_physical_line(&mut input, 8)
+            .expect("read overlong line")
+            .expect("first line");
+        assert_eq!(first.0, b"12345678");
+        assert!(first.1);
+        assert_eq!(first.2, 10);
+        let second = read_bounded_physical_line(&mut input, 8)
+            .expect("read following line")
+            .expect("second line");
+        assert_eq!(second.0, b"ok");
+        assert!(!second.1);
+        assert_eq!(second.2, 3);
+    }
+
+    #[test]
+    fn bounded_jsonl_reader_warns_and_skips_overlong_and_invalid_utf8_lines() {
+        let directory = test_store_directory("bounded-jsonl-lines");
+        let path = directory.join("history.jsonl");
+        let mut contents = b"123456789\n".to_vec();
+        contents.extend_from_slice(&[0xff, b'\n']);
+        contents.extend_from_slice(b"{}\n");
+        fs::write(&path, contents).expect("bounded JSONL fixture");
+        let limits = HistoryScanLimits {
+            max_line_bytes: 8,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let mut reader =
+            open_bounded_jsonl_reader(&path, "test history", &mut warnings, &mut budget)
+                .expect("bounded reader");
+
+        assert_eq!(
+            next_bounded_jsonl_line(
+                &mut reader,
+                &path,
+                "test history",
+                &mut warnings,
+                &mut budget,
+            ),
+            Some((3, "{}".to_string()))
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("overlong")));
+        assert!(warnings.iter().any(|warning| warning.contains("non-UTF-8")));
+        assert_eq!(budget.total_bytes, 15);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn jsonl_file_and_record_limits_skip_with_warnings() {
+        let directory = test_store_directory("jsonl-scan-limits");
+        let first = directory.join("first.jsonl");
+        fs::write(&first, b"{}\n{}\n").expect("first JSONL fixture");
+        let limits = HistoryScanLimits {
+            max_file_bytes: 6,
+            max_records: 1,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let mut reader =
+            open_bounded_jsonl_reader(&first, "test history", &mut warnings, &mut budget)
+                .expect("first bounded reader");
+        assert_eq!(
+            next_bounded_jsonl_line(
+                &mut reader,
+                &first,
+                "test history",
+                &mut warnings,
+                &mut budget,
+            ),
+            Some((1, "{}".to_string()))
+        );
+        assert!(next_bounded_jsonl_line(
+            &mut reader,
+            &first,
+            "test history",
+            &mut warnings,
+            &mut budget,
+        )
+        .is_none());
+        assert_eq!(budget.total_bytes, 3);
+        assert!(warnings.iter().any(|warning| warning.contains("records")));
+
+        let oversized = directory.join("oversized.jsonl");
+        fs::write(&oversized, b"1234567").expect("oversized JSONL fixture");
+        let mut file_budget = HistoryScanBudget::new(limits);
+        assert!(open_bounded_jsonl_reader(
+            &oversized,
+            "test history",
+            &mut warnings,
+            &mut file_budget,
+        )
+        .is_none());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("file limit")));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn selected_codex_actual_read_limit_returns_no_partial_piece() {
+        let metadata = json!({
+            "timestamp": "2026-07-13T00:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "selected", "session_id": "selected" }
+        })
+        .to_string();
+        let message = json!({
+            "timestamp": "2026-07-13T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "must not be partial" }]
+            }
+        })
+        .to_string();
+        let directory = test_store_directory("selected-codex-total-limit");
+        let path = directory.join("selected.jsonl");
+        fs::write(&path, format!("{metadata}\n{message}")).expect("selected Codex history");
+        let metadata_bytes = metadata.len() as u64 + 1;
+        let limits = HistoryScanLimits {
+            max_total_bytes: metadata_bytes,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let selected_ids = HashSet::from(["selected".to_string()]);
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected_ids),
+            &mut warnings,
+            &mut budget,
+        );
+
+        assert!(pieces.is_empty());
+        assert!(budget.incomplete);
+        assert_eq!(budget.total_bytes, metadata_bytes);
+        assert!(warnings.iter().any(|warning| warning.contains("bytes")));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn jsonl_file_and_depth_discovery_limits_are_bounded() {
+        let directory = test_store_directory("jsonl-discovery-limits");
+        fs::write(directory.join("one.jsonl"), "{}").expect("first history");
+        fs::write(directory.join("two.jsonl"), "{}").expect("second history");
+        let nested = directory.join("nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::write(nested.join("deep.jsonl"), "{}").expect("deep history");
+        let limits = HistoryScanLimits {
+            max_files: 1,
+            max_directory_depth: 0,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        collect_jsonl_files(&directory, &mut files, &mut warnings, &mut budget, 0);
+        assert_eq!(files.len(), 1);
+        assert!(warnings.iter().any(|warning| warning.contains("files")));
+        assert!(warnings.iter().any(|warning| warning.contains("deeper")));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn jsonl_entry_limit_counts_directories_and_non_history_files() {
+        let directory = test_store_directory("jsonl-entry-limit");
+        for index in 0..3 {
+            fs::create_dir_all(directory.join(format!("dir-{index}")))
+                .expect("non-history directory");
+            fs::write(directory.join(format!("other-{index}.txt")), "ignored")
+                .expect("non-history file");
+        }
+        let limits = HistoryScanLimits {
+            max_entries: 2,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+
+        collect_jsonl_files(&directory, &mut files, &mut warnings, &mut budget, 0);
+
+        assert_eq!(budget.visited_entries, 2);
+        assert!(budget.incomplete);
+        assert!(files.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("filesystem entries")));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn complete_import_limit_does_not_return_partial_codex_piece() {
+        let path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "selected" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "keep all or none" }] }
+            }),
+        ]);
+        let limits = HistoryScanLimits {
+            max_import_bytes: 1,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let selected = HashSet::from(["selected".to_string()]);
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected),
+            &mut warnings,
+            &mut budget,
+        );
+        assert!(pieces.is_empty());
+        assert!(budget.import_limit_exceeded);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("no partial conversations")));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn record_limit_does_not_return_partial_codex_piece() {
+        let path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "session_id": "selected" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "first" }] }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "missing" }] }
+            }),
+        ]);
+        let limits = HistoryScanLimits {
+            max_records: 2,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let selected = HashSet::from(["selected".to_string()]);
+
+        let pieces = parse_codex_file_with_options(
+            &path,
+            "fallback".to_string(),
+            Some(&selected),
+            &mut warnings,
+            &mut budget,
+        );
+
+        assert!(pieces.is_empty());
+        assert!(budget.incomplete);
+        assert!(warnings.iter().any(|warning| warning.contains("records")));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn record_limit_does_not_return_partial_claude_piece() {
+        let path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "user",
+                "sessionId": "selected",
+                "message": { "content": "first" }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:01Z",
+                "type": "assistant",
+                "sessionId": "selected",
+                "message": { "content": "missing" }
+            }),
+        ]);
+        let limits = HistoryScanLimits {
+            max_records: 1,
+            ..HISTORY_SCAN_LIMITS
+        };
+        let mut budget = HistoryScanBudget::new(limits);
+        let mut warnings = Vec::new();
+        let selected = HashSet::from(["selected".to_string()]);
+
+        let pieces = parse_claude_file_with_options(
+            &path,
+            true,
+            Some(&selected),
+            &mut warnings,
+            &mut budget,
+        );
+
+        assert!(pieces.is_empty());
+        assert!(budget.incomplete);
+        assert!(warnings.iter().any(|warning| warning.contains("records")));
         fs::remove_file(path).ok();
     }
 
@@ -5168,6 +8057,8 @@ mod tests {
             version: 3,
             conversations: vec![to_summary(&conversation)],
             asset_references: HashMap::new(),
+            asset_ids: None,
+            generation: None,
         };
         fs::write(
             store.join(STORE_INDEX_FILE),
@@ -5246,6 +8137,8 @@ mod tests {
             version: 3,
             conversations: vec![to_summary(&conversation)],
             asset_references: HashMap::new(),
+            asset_ids: None,
+            generation: None,
         };
         let original_index = serde_json::to_vec(&v3_index).expect("v3 index serialization");
         fs::write(store.join(STORE_INDEX_FILE), &original_index).expect("v3 index");
@@ -5434,11 +8327,635 @@ mod tests {
     }
 
     #[test]
+    fn failed_batch_staging_keeps_existing_store_untouched() {
+        let directory = test_store_directory("batch-transaction-rollback");
+        let mut existing = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[existing.clone()])
+            .expect("initial conversation");
+        let index_before = fs::read(v3_index_path(&directory)).expect("index before batch");
+        let item_before =
+            fs::read(v3_item_path(&directory, &existing.id)).expect("item before batch");
+
+        existing.title = "Updated".to_string();
+        if let ImportedTranscriptPart::Image {
+            data_url, asset_id, ..
+        } = &mut existing.messages[0].parts[1]
+        {
+            *data_url = Some("data:image/png;base64,d29ybGQ=".to_string());
+            *asset_id = None;
+        }
+        let mut invalid = test_conversation("external:codex:invalid", "Invalid", 4000);
+        if let ImportedTranscriptPart::Image { data_url, .. } = &mut invalid.messages[0].parts[1] {
+            *data_url = Some("data:image/png;base64,%%%".to_string());
+        }
+
+        assert!(upsert_imported_conversations_at(&directory, &[existing, invalid]).is_err());
+        assert_eq!(
+            fs::read(v3_index_path(&directory)).expect("index after failed batch"),
+            index_before
+        );
+        assert_eq!(
+            fs::read(v3_item_path(&directory, "external:codex:existing"))
+                .expect("item after failed batch"),
+            item_before
+        );
+        assert!(!transaction_store_path(&directory).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn failed_index_publish_rolls_back_replaced_items() {
+        let directory = test_store_directory("index-publish-rollback");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        let item_path = v3_item_path(&directory, &conversation.id);
+        let item_before = fs::read(&item_path).expect("item before failed publish");
+        let index_path = v3_index_path(&directory);
+        let saved_index = directory.join("saved-index.json");
+
+        conversation.title = "Updated".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("staged conversation update");
+        fs::rename(&index_path, &saved_index).expect("save live index");
+        fs::create_dir(&index_path).expect("blocking index directory");
+        fs::write(index_path.join("blocker"), "block").expect("non-empty index directory");
+        let index_backup = json_backup_path(&index_path);
+        fs::create_dir(&index_backup).expect("blocking index backup directory");
+        fs::write(index_backup.join("blocker"), "block").expect("non-empty backup directory");
+
+        let error = match commit_imported_conversations_at(&directory) {
+            Ok(_) => panic!("index publication should fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("rolled back"));
+        assert_eq!(fs::read(&item_path).expect("rolled back item"), item_before);
+        assert!(transaction_store_path(&directory).exists());
+
+        fs::remove_dir_all(&index_path).expect("remove blocking index directory");
+        fs::remove_dir_all(&index_backup).expect("remove blocking backup directory");
+        fs::rename(saved_index, &index_path).expect("restore live index");
+        list_imported_conversations_at(&directory).expect("finish transaction recovery");
+        assert!(!transaction_store_path(&directory).exists());
+        let loaded = load_imported_conversation_at(&directory, "external:codex:existing")
+            .expect("load rolled back conversation");
+        assert_eq!(loaded.title, "Existing");
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn startup_rolls_back_interrupted_item_publication() {
+        let directory = test_store_directory("interrupted-item-publication");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        conversation.title = "Interrupted update".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("staged interrupted update");
+        let manifest: ImportedStoreTransactionManifest = serde_json::from_slice(
+            &fs::read(transaction_manifest_path(&directory)).expect("transaction manifest"),
+        )
+        .expect("parse transaction manifest");
+        install_transaction_assets(&directory).expect("install transaction assets");
+        install_transaction_items(&directory, &manifest).expect("install transaction items");
+        assert_eq!(
+            read_imported_conversation_item_at(&directory, "external:codex:existing")
+                .expect("uncommitted item")
+                .title,
+            "Interrupted update"
+        );
+
+        list_imported_conversations_at(&directory).expect("recover interrupted transaction");
+        assert_eq!(
+            load_imported_conversation_at(&directory, "external:codex:existing")
+                .expect("rolled back conversation")
+                .title,
+            "Existing"
+        );
+        assert!(!transaction_store_path(&directory).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn startup_recovers_when_staged_index_is_missing() {
+        let directory = test_store_directory("missing-staged-index");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        conversation.title = "Interrupted update".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("stage interrupted update");
+        let manifest: ImportedStoreTransactionManifest = serde_json::from_slice(
+            &fs::read(transaction_manifest_path(&directory)).expect("transaction manifest"),
+        )
+        .expect("parse transaction manifest");
+        install_transaction_assets(&directory).expect("install transaction assets");
+        install_transaction_items(&directory, &manifest).expect("install transaction items");
+        fs::remove_file(transaction_store_path(&directory).join(STORE_INDEX_FILE))
+            .expect("remove staged index");
+
+        list_imported_conversations_at(&directory).expect("recover missing staged index");
+        assert_eq!(
+            load_imported_conversation_at(&directory, "external:codex:existing")
+                .expect("rolled back conversation")
+                .title,
+            "Existing"
+        );
+        assert!(!transaction_store_path(&directory).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn startup_recovers_when_transaction_manifest_is_corrupt() {
+        let directory = test_store_directory("corrupt-transaction-manifest");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        conversation.title = "Interrupted update".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("stage interrupted update");
+        let manifest: ImportedStoreTransactionManifest = serde_json::from_slice(
+            &fs::read(transaction_manifest_path(&directory)).expect("transaction manifest"),
+        )
+        .expect("parse transaction manifest");
+        install_transaction_assets(&directory).expect("install transaction assets");
+        install_transaction_items(&directory, &manifest).expect("install transaction items");
+        fs::write(transaction_manifest_path(&directory), b"{")
+            .expect("corrupt transaction manifest");
+
+        list_imported_conversations_at(&directory).expect("recover corrupt manifest");
+        assert_eq!(
+            load_imported_conversation_at(&directory, "external:codex:existing")
+                .expect("rolled back conversation")
+                .title,
+            "Existing"
+        );
+        assert!(!transaction_store_path(&directory).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn startup_rolls_back_published_index_when_item_is_missing() {
+        let directory = test_store_directory("published-index-missing-item");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        conversation.title = "Interrupted update".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("stage interrupted update");
+        let manifest: ImportedStoreTransactionManifest = serde_json::from_slice(
+            &fs::read(transaction_manifest_path(&directory)).expect("transaction manifest"),
+        )
+        .expect("parse transaction manifest");
+        let staged_index = fs::read(transaction_store_path(&directory).join(STORE_INDEX_FILE))
+            .expect("staged index");
+        install_transaction_assets(&directory).expect("install transaction assets");
+        install_transaction_items(&directory, &manifest).expect("install transaction items");
+        save_bytes_atomically(&v3_index_path(&directory), &staged_index)
+            .expect("publish staged index");
+        fs::remove_file(v3_item_path(&directory, "external:codex:existing"))
+            .expect("remove published item");
+
+        list_imported_conversations_at(&directory).expect("recover incomplete publication");
+        assert_eq!(
+            load_imported_conversation_at(&directory, "external:codex:existing")
+                .expect("restored conversation")
+                .title,
+            "Existing"
+        );
+        assert!(!transaction_store_path(&directory).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn partial_transaction_cleanup_does_not_block_valid_store() {
+        let directory = test_store_directory("partial-transaction-cleanup");
+        let conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation])
+            .expect("initial conversation");
+        fs::create_dir_all(transaction_store_path(&directory))
+            .expect("leftover transaction directory");
+        fs::write(transaction_manifest_path(&directory), b"{").expect("leftover corrupt manifest");
+
+        assert_eq!(
+            list_imported_conversations_at(&directory)
+                .expect("list through partial cleanup")
+                .len(),
+            1
+        );
+        assert!(!transaction_store_path(&directory).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn commit_rejects_staged_index_that_does_not_match_manifest_hash() {
+        let directory = test_store_directory("transaction-index-hash");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        conversation.title = "Tampered update".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("stage conversation update");
+        let staged_index_path = transaction_store_path(&directory).join(STORE_INDEX_FILE);
+        let mut staged_index: ImportedConversationsIndex =
+            serde_json::from_slice(&fs::read(&staged_index_path).expect("staged index"))
+                .expect("parse staged index");
+        staged_index.generation = Some("tampered".to_string());
+        fs::write(
+            &staged_index_path,
+            serde_json::to_vec(&staged_index).expect("serialize tampered index"),
+        )
+        .expect("write tampered index");
+
+        let error = match commit_imported_conversations_at(&directory) {
+            Ok(_) => panic!("tampered index must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not match"));
+        list_imported_conversations_at(&directory).expect("recover rejected transaction");
+        assert_eq!(
+            load_imported_conversation_at(&directory, "external:codex:existing")
+                .expect("unchanged conversation")
+                .title,
+            "Existing"
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn commit_rejects_old_index_backup_that_does_not_match_manifest_hash() {
+        let directory = test_store_directory("transaction-old-index-hash");
+        let mut conversation = test_conversation("external:codex:existing", "Existing", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+        conversation.title = "Updated".to_string();
+        conversation.updated_at = 5000;
+        stage_imported_conversations_at(&directory, &[conversation])
+            .expect("stage conversation update");
+        let backup_path = transaction_backup_index_path(&directory);
+        let mut backup_index: ImportedConversationsIndex =
+            serde_json::from_slice(&fs::read(&backup_path).expect("old index backup"))
+                .expect("parse old index backup");
+        backup_index.generation = Some("tampered".to_string());
+        fs::write(
+            &backup_path,
+            serde_json::to_vec(&backup_index).expect("serialize tampered old index"),
+        )
+        .expect("write tampered old index");
+
+        let error = match commit_imported_conversations_at(&directory) {
+            Ok(_) => panic!("tampered old index must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("backup does not match"));
+        list_imported_conversations_at(&directory).expect("recover rejected transaction");
+        assert_eq!(
+            load_imported_conversation_at(&directory, "external:codex:existing")
+                .expect("unchanged conversation")
+                .title,
+            "Existing"
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn recovers_missing_index_and_item_files_from_backups() {
+        let directory = test_store_directory("file-backup-recovery");
+        let conversation = test_conversation("external:codex:recover", "Recover", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation.clone()])
+            .expect("initial conversation");
+
+        let index_path = v3_index_path(&directory);
+        fs::rename(&index_path, json_backup_path(&index_path)).expect("index crash backup");
+        assert_eq!(
+            list_imported_conversations_at(&directory)
+                .expect("recover index")
+                .len(),
+            1
+        );
+        assert!(index_path.is_file());
+
+        let item_path = v3_item_path(&directory, &conversation.id);
+        fs::rename(&item_path, json_backup_path(&item_path)).expect("item crash backup");
+        assert_eq!(
+            load_imported_conversation_at(&directory, &conversation.id)
+                .expect("recover item")
+                .title,
+            "Recover"
+        );
+        assert!(item_path.is_file());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn valid_index_backup_replaces_parseable_but_inconsistent_current_index() {
+        let directory = test_store_directory("consistent-index-backup");
+        let conversation = test_conversation("external:codex:recover", "Recover", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation])
+            .expect("initial conversation");
+        let index_path = v3_index_path(&directory);
+        let valid_index = fs::read(&index_path).expect("valid index");
+        let mut inconsistent: ImportedConversationsIndex =
+            serde_json::from_slice(&valid_index).expect("parse valid index");
+        inconsistent.conversations[0].title = "Wrong summary".to_string();
+        fs::write(
+            &index_path,
+            serde_json::to_vec(&inconsistent).expect("serialize inconsistent index"),
+        )
+        .expect("write inconsistent index");
+        fs::write(json_backup_path(&index_path), valid_index).expect("write valid backup");
+
+        let summaries =
+            list_imported_conversations_at(&directory).expect("recover consistent index backup");
+        assert_eq!(summaries[0].title, "Recover");
+        assert!(!json_backup_path(&index_path).exists());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn reverse_asset_index_supports_direct_reference_lookup() {
+        let directory = test_store_directory("reverse-asset-index");
+        let conversation = test_conversation("external:codex:asset", "Asset", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation]).expect("asset conversation");
+        let index = load_v3_index_at(&directory).expect("asset index");
+        let asset_id = index
+            .asset_ids
+            .as_ref()
+            .and_then(|asset_ids| asset_ids.first())
+            .cloned()
+            .expect("reverse asset entry");
+        assert!(index_references_asset(&index, &asset_id).expect("direct asset lookup"));
+        assert!(!index_references_asset(&index, &"f".repeat(64)).expect("missing asset lookup"));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn first_load_upgrades_legacy_v4_asset_lookup_index_once() {
+        let directory = test_store_directory("legacy-reverse-asset-index");
+        let conversation = test_conversation("external:codex:asset", "Asset", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation]).expect("asset conversation");
+        let mut legacy_index = load_v3_index_at(&directory).expect("current index");
+        legacy_index.asset_ids = None;
+        legacy_index.generation = None;
+        save_json_atomically(&v3_index_path(&directory), &legacy_index)
+            .expect("legacy v4 index without reverse lookup");
+
+        let upgraded = load_v3_index_at(&directory).expect("upgrade legacy v4 index");
+        let asset_id = upgraded
+            .asset_ids
+            .as_ref()
+            .and_then(|asset_ids| asset_ids.first())
+            .cloned()
+            .expect("upgraded reverse asset entry");
+        assert!(upgraded.generation.is_some());
+        let upgraded_bytes = fs::read(v3_index_path(&directory)).expect("upgraded index bytes");
+
+        assert!(index_references_asset(&upgraded, &asset_id).expect("direct upgraded lookup"));
+        assert_eq!(
+            load_imported_asset_at(&directory, &asset_id).expect("asset after upgrade"),
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(
+            fs::read(v3_index_path(&directory)).expect("index after direct lookup"),
+            upgraded_bytes
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn legacy_asset_lookup_upgrade_remains_readable_when_persist_fails() {
+        let mut index = ImportedConversationsIndex {
+            version: STORE_VERSION,
+            conversations: Vec::new(),
+            asset_references: HashMap::from([("conversation".to_string(), vec!["a".repeat(64)])]),
+            asset_ids: None,
+            generation: None,
+        };
+
+        validate_or_upgrade_index_asset_ids(&mut index, |_| {
+            Err("simulated read-only store".to_string())
+        })
+        .expect("in-memory lookup upgrade");
+        assert_eq!(index.asset_ids, Some(vec!["a".repeat(64)]));
+        assert!(index.generation.is_some());
+    }
+
+    #[test]
+    fn normal_load_rejects_inconsistent_reverse_asset_index() {
+        let directory = test_store_directory("invalid-reverse-asset-index");
+        let conversation = test_conversation("external:codex:asset", "Asset", 3000);
+        upsert_imported_conversations_at(&directory, &[conversation]).expect("asset conversation");
+        let mut index = load_v3_index_at(&directory).expect("valid asset index");
+        index.asset_ids = Some(vec!["f".repeat(64)]);
+        save_json_atomically(&v3_index_path(&directory), &index).expect("invalid index fixture");
+
+        let error = match load_v3_index_at(&directory) {
+            Ok(_) => panic!("invalid reverse lookup must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("lookup index is invalid"));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn imported_store_file_lock_excludes_other_handles() {
+        let directory = test_store_directory("file-lock");
+        let first = lock_imported_store_file(&directory).expect("first file lock");
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join(STORE_LOCK_FILE))
+            .expect("second lock handle");
+        assert!(second.try_lock_exclusive().is_err());
+        drop(first);
+        second
+            .try_lock_exclusive()
+            .expect("lock after first handle is released");
+        fs2::FileExt::unlock(&second).expect("unlock second handle");
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn imported_store_file_lock_times_out() {
+        let directory = test_store_directory("file-lock-timeout");
+        let first = lock_imported_store_file(&directory).expect("first file lock");
+        let started = Instant::now();
+        let error =
+            match lock_imported_store_file_with_timeout(&directory, Duration::from_millis(25)) {
+                Ok(_) => panic!("second file lock must time out"),
+                Err(error) => error,
+            };
+        assert!(error.contains("Timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(first);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn imported_store_process_lock_times_out() {
+        let first = lock_imported_store().expect("first process lock");
+        let error = match lock_imported_store_with_timeout(Duration::from_millis(25)) {
+            Ok(_) => panic!("second process lock must time out"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Timed out"));
+        drop(first);
+    }
+
+    #[test]
+    fn atomic_save_does_not_use_predictable_temporary_path() {
+        let directory = test_store_directory("unique-atomic-temporary");
+        let target = directory.join("value.json");
+        let predictable = target.with_extension("json.tmp");
+        fs::write(&predictable, "sentinel").expect("predictable path sentinel");
+
+        save_bytes_atomically(&target, br#"{"ok":true}"#).expect("atomic save");
+        assert_eq!(
+            fs::read_to_string(&predictable).expect("untouched sentinel"),
+            "sentinel"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("saved target"),
+            r#"{"ok":true}"#
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn atomic_save_rejects_symbolic_link_destination() {
+        let directory = test_store_directory("atomic-symlink-destination");
+        let victim = directory.join("victim.json");
+        let destination = directory.join("value.json");
+        fs::write(&victim, "keep").expect("symlink victim");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &destination).expect("destination symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&victim, &destination).is_err() {
+            fs::remove_dir_all(directory).ok();
+            return;
+        }
+
+        assert!(save_bytes_atomically(&destination, b"replace")
+            .expect_err("symlink destination must fail")
+            .contains("symbolic link"));
+        assert_eq!(
+            fs::read_to_string(&victim).expect("untouched victim"),
+            "keep"
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn codex_scan_uses_custom_home_directory() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("CODEX_HOME", value);
+                } else {
+                    std::env::remove_var("CODEX_HOME");
+                }
+            }
+        }
+
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let directory = test_store_directory("codex-custom-home");
+        let sessions = directory.join("sessions");
+        fs::create_dir_all(&sessions).expect("custom Codex sessions directory");
+        fs::write(
+            sessions.join("session.jsonl"),
+            [
+                json!({
+                    "timestamp": "2026-07-13T00:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "custom-home-session",
+                        "session_id": "custom-home-session",
+                        "cwd": "C:/custom"
+                    }
+                })
+                .to_string(),
+                json!({
+                    "timestamp": "2026-07-13T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "custom home request" }]
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("custom Codex history");
+        let restore = RestoreEnv(std::env::var_os("CODEX_HOME"));
+        std::env::set_var("CODEX_HOME", &directory);
+
+        let (conversations, incomplete) = scan_codex(false, None, &mut Vec::new());
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].native_session_id, "custom-home-session");
+        assert!(!incomplete);
+
+        drop(restore);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn claude_scan_uses_custom_config_directory() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("CLAUDE_CONFIG_DIR", value);
+                } else {
+                    std::env::remove_var("CLAUDE_CONFIG_DIR");
+                }
+            }
+        }
+
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let directory = test_store_directory("claude-custom-config");
+        let projects = directory.join("projects").join("project");
+        fs::create_dir_all(&projects).expect("custom Claude projects directory");
+        fs::write(
+            projects.join("session.jsonl"),
+            json!({
+                "timestamp": "2026-07-13T00:00:00Z",
+                "type": "user",
+                "sessionId": "custom-config-session",
+                "message": { "content": "custom config request" }
+            })
+            .to_string(),
+        )
+        .expect("custom Claude history");
+        let restore = RestoreEnv(std::env::var_os("CLAUDE_CONFIG_DIR"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", &directory);
+
+        let (conversations, incomplete) = scan_claude(false, None, &mut Vec::new());
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].native_session_id, "custom-config-session");
+        assert!(!incomplete);
+
+        drop(restore);
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
     fn preserves_each_claude_session_and_merges_files_by_native_id() {
         let first_path = write_test_jsonl(vec![
             json!({
                 "timestamp": "2026-07-13T00:00:00Z",
                 "type": "user",
+                "uuid": "first-user",
                 "sessionId": "first",
                 "cwd": "C:/one",
                 "message": { "content": "first request" }
@@ -5451,13 +8968,24 @@ mod tests {
                 "message": { "content": [{ "type": "text", "text": "second answer" }] }
             }),
         ]);
-        let second_path = write_test_jsonl(vec![json!({
-            "timestamp": "2026-07-13T00:00:02Z",
-            "type": "assistant",
-            "sessionId": "first",
-            "cwd": "C:/one",
-            "message": { "content": [{ "type": "text", "text": "first answer" }] }
-        })]);
+        let second_path = write_test_jsonl(vec![
+            json!({
+                "timestamp": "2026-07-13T00:00:02Z",
+                "type": "assistant",
+                "uuid": "first-answer",
+                "sessionId": "first",
+                "cwd": "C:/one",
+                "message": { "content": [{ "type": "text", "text": "first answer" }] }
+            }),
+            json!({
+                "timestamp": "2026-07-13T00:00:03Z",
+                "type": "assistant",
+                "uuid": "first-answer",
+                "sessionId": "first",
+                "cwd": "C:/one",
+                "message": { "content": [{ "type": "text", "text": "first answer" }] }
+            }),
+        ]);
 
         let mut pieces = parse_claude_file(&first_path);
         pieces.extend(parse_claude_file(&second_path));
@@ -5468,6 +8996,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         assert_eq!(by_id["first"].messages.len(), 2);
+        assert_eq!(by_id["first"].message_count, 2);
         assert_eq!(by_id["first"].messages[1].content, "first answer");
         assert_eq!(by_id["second"].messages[0].content, "second answer");
         fs::remove_file(first_path).ok();

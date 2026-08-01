@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { invoke, isTauri } from "../lib/bridge";
+import { invoke } from "../lib/bridge";
 import { importedHistoryErrorBlock } from "../lib/importedConversation";
 import type { ImportedConversationSummary } from "../types/externalHistory";
 import { useTabsStore } from "./useTabsStore";
@@ -19,7 +19,6 @@ export const useImportedConversationsStore = create<ImportedConversationsState>(
   loaded: false,
 
   refresh: () => {
-    if (!isTauri) return Promise.resolve();
     if (!refreshPromise) {
       refreshPromise = invoke<ImportedConversationSummary[]>("list_imported_conversations")
         .then((conversations) => set({ conversations, loaded: true }))
@@ -65,7 +64,6 @@ export const useImportedConversationsStore = create<ImportedConversationsState>(
   },
 
   remove: async (id) => {
-    if (!isTauri) return;
     await invoke("remove_imported_conversation", { id });
     set((state) => ({
       conversations: state.conversations.filter((conversation) => conversation.id !== id),

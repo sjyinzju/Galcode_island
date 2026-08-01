@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-imported-conversations"
+description = "Enables the list_imported_conversations command without any pre-configured scope."
+commands.allow = ["list_imported_conversations"]
+
+[[permission]]
+identifier = "deny-list-imported-conversations"
+description = "Denies the list_imported_conversations command without any pre-configured scope."
+commands.deny = ["list_imported_conversations"]

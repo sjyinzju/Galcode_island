@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-set-auth"
+description = "Enables the opencode_set_auth command without any pre-configured scope."
+commands.allow = ["opencode_set_auth"]
+
+[[permission]]
+identifier = "deny-opencode-set-auth"
+description = "Denies the opencode_set_auth command without any pre-configured scope."
+commands.deny = ["opencode_set_auth"]

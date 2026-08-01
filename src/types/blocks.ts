@@ -65,6 +65,8 @@ export interface CliBlock {
   content?: string;
   message?: string;
   tone?: string;          // text (file 标记)
+  collapsedLabel?: string; // 长内部上下文 / 导入事件默认折叠时显示的短标签
+  isApiError?: boolean; // 导入源明确标记的 API 失败，不应注入续聊上下文
   images?: CliBlockImage[];
   attachments?: CliBlockAttachment[];
 

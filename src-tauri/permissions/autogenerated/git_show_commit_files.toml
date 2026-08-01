@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-show-commit-files"
+description = "Enables the git_show_commit_files command without any pre-configured scope."
+commands.allow = ["git_show_commit_files"]
+
+[[permission]]
+identifier = "deny-git-show-commit-files"
+description = "Denies the git_show_commit_files command without any pre-configured scope."
+commands.deny = ["git_show_commit_files"]

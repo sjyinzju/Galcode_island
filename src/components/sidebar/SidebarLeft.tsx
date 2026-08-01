@@ -17,10 +17,10 @@ import { useTabsStore } from "../../stores/useTabsStore";
 import { useProfileStore } from "../../stores/useProfileStore";
 import { useAboutStore } from "../../stores/useAboutStore";
 import { ProjectTree } from "./ProjectTree";
+import { SearchPanel } from "./SearchPanel";
+import { GitPanel } from "./GitPanel";
 
 const HistoryList = lazyNamed(() => import("./HistoryList"), "HistoryList");
-const SearchPanel = lazyNamed(() => import("./SearchPanel"), "SearchPanel");
-const GitPanel = lazyNamed(() => import("./GitPanel"), "GitPanel");
 
 const isMacOS = typeof navigator !== "undefined"
   && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");

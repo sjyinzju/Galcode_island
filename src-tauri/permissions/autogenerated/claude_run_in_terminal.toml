@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-claude-run-in-terminal"
+description = "Enables the claude_run_in_terminal command without any pre-configured scope."
+commands.allow = ["claude_run_in_terminal"]
+
+[[permission]]
+identifier = "deny-claude-run-in-terminal"
+description = "Denies the claude_run_in_terminal command without any pre-configured scope."
+commands.deny = ["claude_run_in_terminal"]

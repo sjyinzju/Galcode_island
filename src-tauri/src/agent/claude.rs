@@ -1464,22 +1464,6 @@ pub fn kill_claude_stream_client(client: &ClaudeStreamClient) {
     }
 }
 
-/// Restart idle Claude clients after an external provider configuration change.
-/// Active turns are left running and cause the caller to retry later.
-pub fn reset_idle_claude_clients(state: &RuntimeState) -> bool {
-    let (idle, all_idle) = drain_idle_claude_clients(state);
-    for client in &idle {
-        kill_claude_stream_client(client);
-    }
-    if !idle.is_empty() {
-        log::info!(
-            "[config-watch] reset {} idle Claude stream client(s)",
-            idle.len()
-        );
-    }
-    all_idle
-}
-
 pub fn discard_claude_stream_client(state: &RuntimeState, run_id: &str) {
     let client = with_claude_state(state, run_id, |claude| claude.client.take())
         .ok()

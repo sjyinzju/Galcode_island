@@ -42,6 +42,8 @@ export function getClientId(): string {
 
 type ExternalListener = (rawValue: string | null, source: string) => void;
 const externalListeners = new Map<string, Set<ExternalListener>>();
+type ExternalReconciler = (key: string, rawValue: string | null) => void;
+const externalReconcilers = new Set<ExternalReconciler>();
 
 function ensureListener(key: string): Set<ExternalListener> {
   let set = externalListeners.get(key);
@@ -68,6 +70,7 @@ function installGlobalListener(): void {
     (e) => {
       const { key, value, source } = e.payload;
       if (source === CLIENT_ID) return;
+      for (const reconcile of externalReconcilers) reconcile(key, value);
       // 关键：把远端写入同步到**本端 localStorage**，让后续 rehydrate 调 getItem
       // 时拿到最新 value（Tauri 桌面端 getItem 同步读 localStorage，不读后端镜像；
       // 没有这步就会用本地旧值反向覆盖后端，对方的更新就丢了）
@@ -86,6 +89,7 @@ function installGlobalListener(): void {
   void listen<{ key: string; source: string }>("storage://removed", (e) => {
     const { key, source } = e.payload;
     if (source === CLIENT_ID) return;
+    for (const reconcile of externalReconcilers) reconcile(key, null);
     if (typeof localStorage !== "undefined") {
       try {
         localStorage.removeItem(key);
@@ -146,6 +150,26 @@ export function createSharedStorage(
       }
     }
   };
+
+  const cancelPendingWrite = (name: string): void => {
+    pendingWrites.delete(name);
+    if (pendingWrites.size === 0 && flushTimer !== null) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+  };
+
+  // An external event is authoritative over snapshots created before it. An
+  // operation already sent cannot be cancelled, so replay the external state
+  // after it finishes to keep the backend from ending on the stale value.
+  externalReconcilers.add((name, rawValue) => {
+    cancelPendingWrite(name);
+    pendingRemote.delete(name);
+    if (!activeRemote.has(name)) return;
+    pendingRemote.set(name, rawValue === null
+      ? { kind: "remove" }
+      : { kind: "set", raw: rawValue });
+  });
 
   // 同一个 key 的远端写只允许一个在途；期间产生的新快照只保留最后一个。
   // 这既减少 IPC，也避免多个异步命令完成顺序颠倒后旧值覆盖新值。
@@ -242,11 +266,7 @@ export function createSharedStorage(
     setItem: scheduleWrite,
 
     removeItem: (name) => {
-      pendingWrites.delete(name);
-      if (pendingWrites.size === 0 && flushTimer !== null) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
+      cancelPendingWrite(name);
       if (typeof localStorage !== "undefined") {
         try { localStorage.removeItem(name); } catch { /* ignore */ }
       }
