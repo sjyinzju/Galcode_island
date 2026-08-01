@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef, type KeyboardEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { invoke, pickFolder } from "../../lib/bridge";
+import { invoke, isTauri, pickFiles, pickFolder } from "../../lib/bridge";
 import {
   buildImportedFallbackContext,
   canContinueImportedConversation,
 } from "../../lib/importedConversation";
+import { resolveLaunchMessage } from "../../lib/chatLaunch";
 import { runExclusive } from "../../lib/runExclusive";
 import { useAppStore } from "../../stores/useAppStore";
 import { useProfileStore } from "../../stores/useProfileStore";
@@ -179,8 +180,9 @@ export function InputBubble(): JSX.Element {
   }, [greeting, agentStatus]);
 
   const handleLaunch = (): Promise<void> => runExclusive(launchInFlightRef, async () => {
-    const visibleText = task.trim();
-    if (!visibleText || !activeTabId) return;
+    const launchMessage = resolveLaunchMessage(task, attachmentPaths.length);
+    if (!launchMessage || !activeTabId) return;
+    const { visibleText, agentInput } = launchMessage;
     if (!canContinueImportedConversation(
       tab.importedConversationId,
       tab.hasFullImportedHistory,
@@ -188,7 +190,7 @@ export function InputBubble(): JSX.Element {
     // 斜杠命令优先：能本地处理就不走 start_agent。
     // tryRunBuiltin 内部已 clear value 并返回 true；passthrough / 项目命令 /
     // 未知命令返回 false，落到下面的 start_agent 透传路径。
-    if (await slash.tryRunBuiltin()) return;
+    if (visibleText && await slash.tryRunBuiltin()) return;
     let launchProjectPath = projectPath;
     if (launchProjectPath) {
       try {
@@ -235,7 +237,7 @@ export function InputBubble(): JSX.Element {
         uiState: "running",
         mode: "working",
         agentStatus: "running",
-        lastUserPrompt: visibleText.slice(0, 80),
+        ...(visibleText ? { lastUserPrompt: visibleText.slice(0, 80) } : {}),
         lastActiveAt: Date.now(),
       });
       // 在流式区追加一条用户消息气泡（右对齐），让多轮对话有清晰的"用户/agent"
@@ -248,15 +250,21 @@ export function InputBubble(): JSX.Element {
         sourceTimestamp: userTimestamp,
         sourceRole: "user",
         sourceTurnId: `galcode:${userBlockId}`,
+        attachments: attachmentPaths.map((path) => ({
+          name: path.split(/[\\/]/).filter(Boolean).at(-1) || "attachment",
+          mediaType: "application/octet-stream",
+          localPath: path,
+        })),
       });
 
       const res = await invoke<{ sessionId?: string }>("start_agent", {
-        userInputZh: visibleText,
+        userInputZh: agentInput,
         cwd: launchProjectPath,
         agent: tab.agent,
         runId: activeTabId,
         sessionId: resumeHint,
         importedFallbackContext: importedFallbackContext || null,
+        attachmentPaths,
         // 仅 claude-code 后端读取；codex/opencode 在 Rust 侧忽略
         permissionMode: tab.agent === "claude-code" ? tab.permissionMode : null,
         promptOverride: (() => {
@@ -437,7 +445,7 @@ export function InputBubble(): JSX.Element {
                 whileHover={{ scale: 1.02, y: -1 }}
                 whileTap={{ scale: 0.98 }}
                 onClick={() => void handleLaunch()}
-                disabled={!task.trim()}
+                disabled={!task.trim() && attachmentPaths.length === 0}
                 // 移动端 px-7/py-3 = 44px+ 触控目标；桌面端保留原尺寸
                 className="min-h-[44px] rounded-xl bg-sky-500 px-7 py-3 text-[15px] font-semibold tracking-wide text-white shadow-md shadow-sky-400/25 transition-all hover:bg-sky-600 hover:shadow-sky-400/40 active:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50 sm:min-h-0 sm:px-6 sm:py-2.5 sm:text-sm"
               >

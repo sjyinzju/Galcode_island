@@ -381,6 +381,7 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                     p.run_id,
                     p.session_id,
                     p.imported_fallback_context,
+                    None,
                     p.permission_mode,
                     p.prompt_override,
                 )
