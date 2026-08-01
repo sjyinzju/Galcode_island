@@ -16,12 +16,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(),
 }));
 
+let pickFiles: typeof import("./bridge").pickFiles;
 let pickFolder: typeof import("./bridge").pickFolder;
 
 beforeAll(async () => {
   vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
   vi.resetModules();
-  ({ pickFolder } = await import("./bridge"));
+  ({ pickFiles, pickFolder } = await import("./bridge"));
 });
 
 beforeEach(() => {
@@ -64,5 +65,26 @@ describe("pickFolder", () => {
     dialogMocks.open.mockResolvedValue(null);
 
     await expect(pickFolder()).resolves.toBeNull();
+  });
+});
+
+describe("pickFiles", () => {
+  it("returns an empty list when the dialog is cancelled", async () => {
+    dialogMocks.open.mockResolvedValue(null);
+
+    await expect(pickFiles()).resolves.toEqual([]);
+  });
+
+  it("wraps a single selected file in a list", async () => {
+    dialogMocks.open.mockResolvedValue("C:\\work\\report.pdf");
+
+    await expect(pickFiles()).resolves.toEqual(["C:\\work\\report.pdf"]);
+  });
+
+  it("returns multiple selected files unchanged", async () => {
+    const files = ["C:\\work\\one.png", "C:\\work\\two.png"];
+    dialogMocks.open.mockResolvedValue(files);
+
+    await expect(pickFiles()).resolves.toEqual(files);
   });
 });
