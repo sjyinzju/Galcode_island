@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-llm-models"
+description = "Enables the list_llm_models command without any pre-configured scope."
+commands.allow = ["list_llm_models"]
+
+[[permission]]
+identifier = "deny-list-llm-models"
+description = "Denies the list_llm_models command without any pre-configured scope."
+commands.deny = ["list_llm_models"]

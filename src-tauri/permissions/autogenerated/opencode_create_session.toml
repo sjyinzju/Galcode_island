@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-create-session"
+description = "Enables the opencode_create_session command without any pre-configured scope."
+commands.allow = ["opencode_create_session"]
+
+[[permission]]
+identifier = "deny-opencode-create-session"
+description = "Denies the opencode_create_session command without any pre-configured scope."
+commands.deny = ["opencode_create_session"]

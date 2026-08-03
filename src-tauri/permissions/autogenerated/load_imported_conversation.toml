@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-load-imported-conversation"
+description = "Enables the load_imported_conversation command without any pre-configured scope."
+commands.allow = ["load_imported_conversation"]
+
+[[permission]]
+identifier = "deny-load-imported-conversation"
+description = "Denies the load_imported_conversation command without any pre-configured scope."
+commands.deny = ["load_imported_conversation"]

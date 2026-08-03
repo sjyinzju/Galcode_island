@@ -1,6 +1,7 @@
 pub mod binary;
 pub mod claude;
 pub mod codex;
+pub mod config_watch;
 pub mod manager;
 pub mod opencode;
 pub mod preferences;

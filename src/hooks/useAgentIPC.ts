@@ -18,8 +18,10 @@ import { listen, type UnlistenFn } from "../lib/bridge";
 import { useAppStore } from "../stores/useAppStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
 import { useTabsStore, type TabState } from "../stores/useTabsStore";
+import type { AgentStatus, UiState } from "../types/agent";
 import type {
   ErrorPayload,
+  ResumeFallbackPayload,
   SessionCompletePayload,
   StatusChangedPayload,
 } from "../types/ipc";
@@ -59,6 +61,30 @@ function mapAgentStatusToStage(
   if (s === "waitingapproval") return "thinking";
   if (s === "error") return "error";
   return "default";
+}
+
+const AGENT_STATUSES: ReadonlySet<AgentStatus> = new Set([
+  "idle",
+  "starting",
+  "running",
+  "thinking",
+  "processing",
+  "waitingApproval",
+  "completed",
+  "error",
+]);
+
+function parseAgentStatus(value: unknown): AgentStatus | null {
+  return typeof value === "string" && AGENT_STATUSES.has(value as AgentStatus)
+    ? (value as AgentStatus)
+    : null;
+}
+
+function uiStateForAgentStatus(status: AgentStatus): UiState {
+  if (status === "completed") return "done";
+  if (status === "error") return "error";
+  if (status === "idle") return "idle";
+  return "running";
 }
 
 /// 路由事件到对应 tab。返回 tab id（命中），或 null（未命中）。
@@ -105,11 +131,18 @@ export function useAgentIPC(): void {
           }
           ensureSessionLinked(tabId, p?.sessionId);
 
+          const status = parseAgentStatus(p.status);
+          if (!status) {
+            console.warn("[ipc] status-changed dropped, invalid status", p.status);
+            return;
+          }
+
           const update = useTabsStore.getState().updateTab;
           const patch: Partial<TabState> = {
-            uiState: "running",
-            agentStatus: "running",
-            lastStage: mapAgentStatusToStage(p.status),
+            uiState: uiStateForAgentStatus(status),
+            agentStatus: status,
+            lastStage: mapAgentStatusToStage(status),
+            lastActiveAt: Date.now(),
           };
           if (typeof p.percent === "number") {
             patch.percent = Math.max(0, Math.min(100, p.percent));
@@ -140,6 +173,22 @@ export function useAgentIPC(): void {
           useTabsStore.getState().updateTab(tabId, {
             pendingResultRaw: p?.resultRaw ?? null,
             pendingUserZh: p?.userZh ?? null,
+          });
+        }),
+      );
+
+      unsubs.push(
+        await listen<ResumeFallbackPayload>("agent://resume-fallback", (e) => {
+          const p = e.payload;
+          const tabId = resolveTabId(p?.runId, p?.sessionId);
+          if (!tabId) return;
+          ensureSessionLinked(tabId, p?.sessionId);
+          useTabsStore.getState().updateTab(tabId, {
+            agentNativeSessionId: null,
+            uiState: "running",
+            agentStatus: "running",
+            bubble: "原生会话不可用，正在从导入历史创建新会话。",
+            lastActiveAt: Date.now(),
           });
         }),
       );
@@ -178,17 +227,19 @@ export function useAgentIPC(): void {
           }
 
           const update = useTabsStore.getState().updateTab;
+          const completedWithError = p.mode === "error";
           const patch: Partial<TabState> = {
-            uiState: "done",
+            uiState: completedWithError ? "error" : "done",
             percent: 100,
-            lastStage: "done",
+            lastStage: completedWithError ? "error" : "done",
             mode: p.mode ?? "complete",
             resultZh: p.resultZh ?? "",
             summaryTranslation: p.summaryTranslation ?? "",
             emotionText: p.emotion ?? "",
             suggestionOptions: p.suggestionOptions ?? [],
             bubble: p.emotion || "任务完成！",
-            agentStatus: "idle",
+            agentStatus: completedWithError ? "error" : "completed",
+            lastActiveAt: Date.now(),
             // finalize 已经走完，清掉中间结果防止下次启动重复触发 finalize_pending
             pendingResultRaw: null,
             pendingUserZh: null,
@@ -224,6 +275,7 @@ export function useAgentIPC(): void {
             agentStatus: "error",
             lastStage: "error",
             bubble: msg,
+            lastActiveAt: Date.now(),
           });
         }),
       );

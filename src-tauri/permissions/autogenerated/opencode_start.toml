@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-opencode-start"
+description = "Enables the opencode_start command without any pre-configured scope."
+commands.allow = ["opencode_start"]
+
+[[permission]]
+identifier = "deny-opencode-start"
+description = "Denies the opencode_start command without any pre-configured scope."
+commands.deny = ["opencode_start"]

@@ -183,7 +183,9 @@ pub fn user_home_dir() -> Option<PathBuf> {
 }
 
 pub fn codex_home_dir() -> Option<PathBuf> {
-    user_home_dir().map(|home| home.join(".codex"))
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| user_home_dir().map(|home| home.join(".codex")))
 }
 
 pub fn codex_config_file() -> Option<PathBuf> {

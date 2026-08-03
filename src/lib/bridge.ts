@@ -264,6 +264,23 @@ export interface PickFolderOptions {
   title?: string;
 }
 
+export interface PickFilesOptions {
+  defaultPath?: string;
+  title?: string;
+}
+
+export async function pickFiles(opts: PickFilesOptions = {}): Promise<string[]> {
+  if (!isTauri) return [];
+  const result = await tauriOpen({
+    directory: false,
+    multiple: true,
+    defaultPath: opts.defaultPath,
+    title: opts.title,
+  });
+  if (!result) return [];
+  return Array.isArray(result) ? result : [result];
+}
+
 /// 选目录。
 ///   - Tauri 桌面端：走原生 dialog
 ///   - 浏览器（移动端 / LAN 客户端）：调 useFolderPickerStore.show() 弹自绘

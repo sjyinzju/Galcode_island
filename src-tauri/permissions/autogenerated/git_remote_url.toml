@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-git-remote-url"
+description = "Enables the git_remote_url command without any pre-configured scope."
+commands.allow = ["git_remote_url"]
+
+[[permission]]
+identifier = "deny-git-remote-url"
+description = "Denies the git_remote_url command without any pre-configured scope."
+commands.deny = ["git_remote_url"]

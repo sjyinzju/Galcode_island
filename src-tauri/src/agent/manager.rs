@@ -55,10 +55,7 @@ impl AgentSession {
         let stream_id = format!("stream-{}", session_id);
         Self {
             snapshot: Arc::new(Mutex::new(SessionSnapshot::new(
-                session_id,
-                agent_type,
-                cwd,
-                None,
+                session_id, agent_type, cwd, None,
             ))),
             logs: Arc::new(Mutex::new(Vec::new())),
             created_at: Instant::now(),
@@ -153,6 +150,11 @@ impl AgentManager {
             .get(&(agent_type.to_string(), run_id.to_string()))
             .cloned()
     }
+
+    fn forget_session(&mut self, agent_type: &str, run_id: &str) {
+        self.last_session_per_context
+            .remove(&(agent_type.to_string(), run_id.to_string()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +182,8 @@ pub fn launch_claude_agent(
     // 前端持久化的 tab.sessionId hint：用作 resume 候选。重启 app 后内存
     // last_session_per_context 空了，前端持久化的 sessionId 能续上下文。
     resume_hint: Option<String>,
+    imported_fallback_context: Option<String>,
+    attachment_paths: Vec<String>,
     // Claude Code permission mode：default / acceptEdits / plan / bypassPermissions。
     // None 时由 claude.rs 内部 fallback 到 acceptEdits（保留老行为）。
     permission_mode: Option<String>,
@@ -190,6 +194,7 @@ pub fn launch_claude_agent(
     if trimmed.is_empty() {
         return Err("任务内容不能为空".into());
     }
+    let attachment_paths = normalize_attachment_paths(attachment_paths)?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let sess = AgentSession::new(
@@ -230,6 +235,10 @@ pub fn launch_claude_agent(
     let user_zh = trimmed.clone();
     let cwd_owned = cwd.clone();
     let permission_mode_owned = permission_mode.clone();
+    let fallback_context = imported_fallback_context
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let attachment_paths_owned = attachment_paths;
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -237,13 +246,25 @@ pub fn launch_claude_agent(
         let llm = load_llm_config();
         eprintln!(
             "[claude] llm config: {}",
-            if llm.is_some() { "ok" } else { "MISSING (无 API Key, 跳过翻译)" }
+            if llm.is_some() {
+                "ok"
+            } else {
+                "MISSING (无 API Key, 跳过翻译)"
+            }
         );
         if llm.is_some() {
-            emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "翻译输入到英文…", 10.0);
+            emit_progress(
+                &app_handle,
+                Some(&run_id),
+                &sid,
+                AgentStatus::Processing,
+                "翻译输入到英文…",
+                10.0,
+            );
         }
         let t_tr_in_start = std::time::Instant::now();
-        let prompt_for_agent = translate_input(&llm, &user_zh);
+        let prompt_for_agent =
+            append_attachment_context(&translate_input(&llm, &user_zh), &attachment_paths_owned);
         let dur_tr_in = t_tr_in_start.elapsed();
         eprintln!(
             "[claude] timing: translate_in={}ms (prompt_len={})",
@@ -251,16 +272,35 @@ pub fn launch_claude_agent(
             prompt_for_agent.len()
         );
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Starting, "启动 Claude Code…", 30.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Starting,
+            "启动 Claude Code…",
+            30.0,
+        );
         let prefs = crate::agent::preferences::load_backend_preferences("claude-code");
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "Agent 工作中…", 50.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Processing,
+            "Agent 工作中…",
+            50.0,
+        );
         let t_turn_start = std::time::Instant::now();
-        let turn_result = claude_agent::run_claude_stream_turn(
+        let initial_prompt = initial_imported_prompt(
+            fallback_context.as_deref(),
+            resume_session_id.as_deref(),
+            &prompt_for_agent,
+        );
+        let mut turn_result = claude_agent::run_claude_stream_turn(
             &app_handle,
             runtime_clone.as_ref(),
             &run_id,
-            &prompt_for_agent,
+            &initial_prompt,
             &cwd_owned,
             resume_session_id.as_deref(),
             prefs.model.as_deref(),
@@ -270,6 +310,35 @@ pub fn launch_claude_agent(
             permission_mode_owned.as_deref(),
             Some(&stream_id),
         );
+        if let (Some(context), Some(_)) = (fallback_context.as_deref(), resume_session_id.as_ref())
+        {
+            let should_retry = turn_result
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_missing_resume_error(error));
+            if should_retry {
+                emit_resume_fallback(&app_handle, &run_id, &sid);
+                if let Ok(mut manager) = state_clone.manager.lock() {
+                    manager.forget_session("claude-code", &run_id);
+                }
+                claude_agent::discard_claude_stream_client(runtime_clone.as_ref(), &run_id);
+                let fallback_prompt = compose_imported_fallback_prompt(context, &prompt_for_agent);
+                turn_result = claude_agent::run_claude_stream_turn(
+                    &app_handle,
+                    runtime_clone.as_ref(),
+                    &run_id,
+                    &fallback_prompt,
+                    &cwd_owned,
+                    None,
+                    prefs.model.as_deref(),
+                    prefs.effort.as_deref(),
+                    prefs.binary.as_deref(),
+                    prefs.proxy.as_deref(),
+                    permission_mode_owned.as_deref(),
+                    Some(&stream_id),
+                );
+            }
+        }
 
         let dur_turn = t_turn_start.elapsed();
         match turn_result {
@@ -296,7 +365,14 @@ pub fn launch_claude_agent(
                         "userZh": user_zh,
                     }),
                 );
-                emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "翻译输出 + 总结…", 80.0);
+                emit_progress(
+                    &app_handle,
+                    Some(&run_id),
+                    &sid,
+                    AgentStatus::Processing,
+                    "翻译输出 + 总结…",
+                    80.0,
+                );
                 let t_post_start = std::time::Instant::now();
                 finalize_session(
                     &app_handle,
@@ -323,7 +399,13 @@ pub fn launch_claude_agent(
                     dur_turn.as_millis(),
                     error
                 );
-                fail_session(&app_handle, &state_clone, &sid, &error, "CLAUDE_TURN_FAILED");
+                fail_session(
+                    &app_handle,
+                    &state_clone,
+                    &sid,
+                    &error,
+                    "CLAUDE_TURN_FAILED",
+                );
             }
         }
     });
@@ -347,6 +429,8 @@ pub fn launch_codex_agent(
     task_zh: String,
     // 前端持久化的 tab.sessionId（codex 这里其实是 thread_id）hint：作 resume 候选。
     resume_hint: Option<String>,
+    imported_fallback_context: Option<String>,
+    attachment_paths: Vec<String>,
     // 桌宠社区图自定义"人设 prompt"
     prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
@@ -354,6 +438,7 @@ pub fn launch_codex_agent(
     if trimmed.is_empty() {
         return Err("任务内容不能为空".into());
     }
+    let attachment_paths = normalize_attachment_paths(attachment_paths)?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let sess = AgentSession::new(
@@ -382,7 +467,12 @@ pub fn launch_codex_agent(
         mgr.sessions.insert(session_id.clone(), sess);
     }
 
-    emit_status_running(&app, Some(&run_id), &session_id, "Codex App Server starting");
+    emit_status_running(
+        &app,
+        Some(&run_id),
+        &session_id,
+        "Codex App Server starting",
+    );
 
     let app_handle = app.clone();
     let state_clone = Arc::clone(&state);
@@ -390,6 +480,10 @@ pub fn launch_codex_agent(
     let sid = session_id.clone();
     let user_zh = trimmed.clone();
     let cwd_owned = cwd.clone();
+    let fallback_context = imported_fallback_context
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let attachment_paths_owned = attachment_paths;
 
     tauri::async_runtime::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
@@ -400,10 +494,18 @@ pub fn launch_codex_agent(
             if llm.is_some() { "ok" } else { "MISSING" }
         );
         if llm.is_some() {
-            emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "翻译输入到英文…", 10.0);
+            emit_progress(
+                &app_handle,
+                Some(&run_id),
+                &sid,
+                AgentStatus::Processing,
+                "翻译输入到英文…",
+                10.0,
+            );
         }
         let t_tr_in_start = std::time::Instant::now();
-        let prompt_for_agent = translate_input(&llm, &user_zh);
+        let prompt_for_agent =
+            append_attachment_context(&translate_input(&llm, &user_zh), &attachment_paths_owned);
         let dur_tr_in = t_tr_in_start.elapsed();
         eprintln!(
             "[codex] timing: translate_in={}ms (prompt_len={})",
@@ -411,25 +513,71 @@ pub fn launch_codex_agent(
             prompt_for_agent.len()
         );
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Starting, "启动 Codex App Server…", 30.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Starting,
+            "启动 Codex App Server…",
+            30.0,
+        );
         let prefs = crate::agent::preferences::load_backend_preferences("codex");
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "Agent 工作中…", 50.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Processing,
+            "Agent 工作中…",
+            50.0,
+        );
         let t_turn_start = std::time::Instant::now();
-        let turn_result = codex_agent::run_codex_app_server_turn(
+        let initial_prompt = initial_imported_prompt(
+            fallback_context.as_deref(),
+            resume_thread_id.as_deref(),
+            &prompt_for_agent,
+        );
+        let mut turn_result = codex_agent::run_codex_app_server_turn(
             &app_handle,
             runtime_clone.as_ref(),
             &run_id,
             &cwd_owned,
             resume_thread_id.as_deref(),
             None,
-            &prompt_for_agent,
+            &initial_prompt,
             prefs.model.as_deref(),
             prefs.effort.as_deref(),
             prefs.binary.as_deref(),
             prefs.proxy.as_deref(),
             Some(&stream_id),
         );
+        if let (Some(context), Some(_)) = (fallback_context.as_deref(), resume_thread_id.as_ref()) {
+            let should_retry = turn_result
+                .as_ref()
+                .err()
+                .is_some_and(|error| is_missing_resume_error(error));
+            if should_retry {
+                emit_resume_fallback(&app_handle, &run_id, &sid);
+                if let Ok(mut manager) = state_clone.manager.lock() {
+                    manager.forget_session("codex", &run_id);
+                }
+                let fallback_prompt = compose_imported_fallback_prompt(context, &prompt_for_agent);
+                turn_result = codex_agent::run_codex_app_server_turn(
+                    &app_handle,
+                    runtime_clone.as_ref(),
+                    &run_id,
+                    &cwd_owned,
+                    None,
+                    None,
+                    &fallback_prompt,
+                    prefs.model.as_deref(),
+                    prefs.effort.as_deref(),
+                    prefs.binary.as_deref(),
+                    prefs.proxy.as_deref(),
+                    Some(&stream_id),
+                );
+            }
+        }
 
         let dur_turn = t_turn_start.elapsed();
         match turn_result {
@@ -454,7 +602,14 @@ pub fn launch_codex_agent(
                         "userZh": user_zh,
                     }),
                 );
-                emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "翻译输出 + 总结…", 80.0);
+                emit_progress(
+                    &app_handle,
+                    Some(&run_id),
+                    &sid,
+                    AgentStatus::Processing,
+                    "翻译输出 + 总结…",
+                    80.0,
+                );
                 let t_post_start = std::time::Instant::now();
                 finalize_session(
                     &app_handle,
@@ -505,6 +660,7 @@ pub fn launch_opencode_agent(
     task_zh: String,
     // 前端持久化的 tab.sessionId（OpenCode 的 session id）hint：作 resume 候选。
     resume_hint: Option<String>,
+    attachment_paths: Vec<String>,
     // 桌宠社区图自定义"人设 prompt"
     prompt_override: Option<String>,
 ) -> Result<LaunchResult, String> {
@@ -512,6 +668,7 @@ pub fn launch_opencode_agent(
     if trimmed.is_empty() {
         return Err("任务内容不能为空".into());
     }
+    let attachment_paths = normalize_attachment_paths(attachment_paths)?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let sess = AgentSession::new(
@@ -558,7 +715,14 @@ pub fn launch_opencode_agent(
             if llm.is_some() { "ok" } else { "MISSING" }
         );
         if llm.is_some() {
-            emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "翻译输入到英文…", 10.0);
+            emit_progress(
+                &app_handle,
+                Some(&run_id),
+                &sid,
+                AgentStatus::Processing,
+                "翻译输入到英文…",
+                10.0,
+            );
         }
         let llm_for_blocking = llm.clone();
         let user_zh_for_blocking = user_zh.clone();
@@ -568,6 +732,7 @@ pub fn launch_opencode_agent(
         })
         .await
         .unwrap_or_else(|_| user_zh.clone());
+        let prompt_for_agent = append_attachment_context(&prompt_for_agent, &attachment_paths);
         let dur_tr_in = t_tr_in_start.elapsed();
         eprintln!(
             "[opencode] timing: translate_in={}ms (prompt_len={})",
@@ -575,13 +740,21 @@ pub fn launch_opencode_agent(
             prompt_for_agent.len()
         );
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Starting, "启动 OpenCode serve…", 25.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Starting,
+            "启动 OpenCode serve…",
+            25.0,
+        );
         let prefs = crate::agent::preferences::load_backend_preferences("opencode");
 
         // 用户在设置里把 authMode 选成 "key" 并填了 API Key 时，启动 serve 之前先把
         // 凭据写到 auth.json。OpenCode serve 启动后会从那里读认证，没有这步即便填
         // 了 key 也走不通；oauth 模式则依赖用户已经跑过 `opencode auth login`。
-        if let (Some(mode), Some(provider)) = (prefs.auth_mode.as_deref(), prefs.provider.as_deref())
+        if let (Some(mode), Some(provider)) =
+            (prefs.auth_mode.as_deref(), prefs.provider.as_deref())
         {
             if mode == "key" {
                 if let Err(error) = crate::agent::opencode::upsert_opencode_auth_entry(
@@ -621,7 +794,14 @@ pub fn launch_opencode_agent(
         let dur_serve = t_serve_start.elapsed();
         eprintln!("[opencode] timing: serve_ready={}ms", dur_serve.as_millis());
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "创建会话…", 40.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Processing,
+            "创建会话…",
+            40.0,
+        );
         let t_session_start = std::time::Instant::now();
         let session_for_turn = match resume_session_id {
             Some(existing) => existing,
@@ -650,9 +830,19 @@ pub fn launch_opencode_agent(
         };
 
         let dur_session = t_session_start.elapsed();
-        eprintln!("[opencode] timing: create_session={}ms", dur_session.as_millis());
+        eprintln!(
+            "[opencode] timing: create_session={}ms",
+            dur_session.as_millis()
+        );
 
-        emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "Agent 工作中…", 55.0);
+        emit_progress(
+            &app_handle,
+            Some(&run_id),
+            &sid,
+            AgentStatus::Processing,
+            "Agent 工作中…",
+            55.0,
+        );
         let t_turn_start = std::time::Instant::now();
         let turn_result = opencode_agent::run_opencode_turn(
             &app_handle,
@@ -689,7 +879,14 @@ pub fn launch_opencode_agent(
                         "userZh": user_zh,
                     }),
                 );
-                emit_progress(&app_handle, Some(&run_id), &sid, AgentStatus::Processing, "翻译输出 + 总结…", 80.0);
+                emit_progress(
+                    &app_handle,
+                    Some(&run_id),
+                    &sid,
+                    AgentStatus::Processing,
+                    "翻译输出 + 总结…",
+                    80.0,
+                );
                 let t_post_start = std::time::Instant::now();
                 let app_for_finalize = app_handle.clone();
                 let state_for_finalize = Arc::clone(&state_clone);
@@ -997,12 +1194,7 @@ fn fail_session(
     clear_active_session(state, session_id);
 }
 
-fn emit_status_running(
-    app: &AppHandle,
-    run_id: Option<&str>,
-    session_id: &str,
-    description: &str,
-) {
+fn emit_status_running(app: &AppHandle, run_id: Option<&str>, session_id: &str, description: &str) {
     let _ = app.emit(
         "agent://status-changed",
         events::StatusChangedPayload {
@@ -1043,13 +1235,7 @@ fn clear_active_session(state: &Arc<AppState>, session_id: &str) {
     }
 }
 
-fn emit_err(
-    app: &AppHandle,
-    run_id: Option<&str>,
-    session_id: &str,
-    message: &str,
-    code: &str,
-) {
+fn emit_err(app: &AppHandle, run_id: Option<&str>, session_id: &str, message: &str, code: &str) {
     let _ = app.emit(
         "agent://error",
         events::ErrorPayload {
@@ -1153,9 +1339,7 @@ pub async fn stop_session(
             }
         }
         "opencode" => {
-            if let Err(e) =
-                crate::agent::opencode::opencode_stop(&runtime_state, &run_id).await
-            {
+            if let Err(e) = crate::agent::opencode::opencode_stop(&runtime_state, &run_id).await {
                 eprintln!("[stop] opencode_stop failed for run_id={run_id}: {e}");
             }
         }
@@ -1268,4 +1452,175 @@ pub fn shutdown_runtime_clients(app: &AppHandle) {
 
 fn kill_claude_client(client: &ClaudeStreamClient) {
     crate::agent::claude::kill_claude_stream_client(client);
+}
+
+fn is_missing_resume_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_resume_target = lower.contains("session")
+        || lower.contains("thread")
+        || lower.contains("conversation")
+        || lower.contains("resume");
+    let explicitly_missing_or_invalid = lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("no conversation found")
+        || lower.contains("unknown thread")
+        || lower.contains("invalid session")
+        || lower.contains("invalid thread")
+        || lower.contains("invalid resume");
+    mentions_resume_target && explicitly_missing_or_invalid
+}
+
+fn compose_imported_fallback_prompt(transcript: &str, current_request: &str) -> String {
+    format!(
+        "The native session is unavailable. Continue from this imported transcript.\n\
+<imported_transcript>\n{}\n</imported_transcript>\n\
+<current_user_request>\n{}\n</current_user_request>",
+        transcript.trim(),
+        current_request.trim(),
+    )
+}
+
+fn initial_imported_prompt(
+    fallback_context: Option<&str>,
+    resume_target: Option<&str>,
+    current_request: &str,
+) -> String {
+    match (fallback_context, resume_target) {
+        (Some(context), None) => compose_imported_fallback_prompt(context, current_request),
+        _ => current_request.to_string(),
+    }
+}
+
+fn append_attachment_context(prompt: &str, attachment_paths: &[String]) -> String {
+    if attachment_paths.is_empty() {
+        return prompt.to_string();
+    }
+    let paths = attachment_paths
+        .iter()
+        .map(|path| format!("- {}", path.replace(['\r', '\n'], " ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n\n<galcode_attachments>\nThe user attached these local files. Inspect them only as needed:\n{}\n</galcode_attachments>",
+        prompt, paths,
+    )
+}
+
+fn normalize_attachment_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
+    paths
+        .into_iter()
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            let candidate = std::path::PathBuf::from(path.trim());
+            if !candidate.is_absolute() {
+                return Err(format!(
+                    "Attachment path must be absolute: {}",
+                    candidate.display()
+                ));
+            }
+            if !candidate.is_file() {
+                return Err(format!(
+                    "Attachment is unavailable: {}",
+                    candidate.display()
+                ));
+            }
+            Ok(candidate.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn emit_resume_fallback(app: &AppHandle, run_id: &str, session_id: &str) {
+    let _ = app.emit(
+        "agent://resume-fallback",
+        serde_json::json!({
+            "runId": run_id,
+            "sessionId": session_id,
+        }),
+    );
+}
+
+#[cfg(test)]
+mod imported_resume_tests {
+    use super::{
+        append_attachment_context, compose_imported_fallback_prompt, initial_imported_prompt,
+        is_missing_resume_error,
+    };
+
+    #[test]
+    fn retries_only_explicit_missing_or_invalid_resume_errors() {
+        for message in [
+            "RESUME_SESSION_FAILED: thread not found",
+            "No conversation found with session ID abc",
+            "Invalid resume session id",
+            "Unknown thread: thread-123",
+        ] {
+            assert!(is_missing_resume_error(message), "{message}");
+        }
+        for message in [
+            "network connection timed out",
+            "permission denied",
+            "Codex turn stream was closed unexpectedly",
+            "rate limit exceeded",
+        ] {
+            assert!(!is_missing_resume_error(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn fallback_prompt_keeps_transcript_and_current_request_separate() {
+        let prompt = compose_imported_fallback_prompt(
+            "[User] Earlier request\n[Assistant] Earlier answer",
+            "Current request",
+        );
+        assert!(prompt.contains("<imported_transcript>"));
+        assert!(prompt.contains("[Assistant] Earlier answer"));
+        assert!(prompt.contains("<current_user_request>\nCurrent request"));
+    }
+
+    #[test]
+    fn claude_uses_imported_context_immediately_without_a_resume_candidate() {
+        let prompt = initial_imported_prompt(
+            Some("[User] Earlier Claude request"),
+            None,
+            "Continue Claude work",
+        );
+        assert!(prompt.contains("[User] Earlier Claude request"));
+        assert!(prompt.contains("<current_user_request>\nContinue Claude work"));
+    }
+
+    #[test]
+    fn codex_uses_imported_context_immediately_without_a_resume_candidate() {
+        let prompt = initial_imported_prompt(
+            Some("[Assistant] Earlier Codex answer"),
+            None,
+            "Continue Codex work",
+        );
+        assert!(prompt.contains("[Assistant] Earlier Codex answer"));
+        assert!(prompt.contains("<current_user_request>\nContinue Codex work"));
+    }
+
+    #[test]
+    fn native_resume_attempt_does_not_duplicate_the_imported_transcript() {
+        let prompt = initial_imported_prompt(
+            Some("[User] Earlier request"),
+            Some("native-session"),
+            "Current request",
+        );
+        assert_eq!(prompt, "Current request");
+    }
+
+    #[test]
+    fn attachment_context_is_added_without_changing_the_visible_request() {
+        let prompt = append_attachment_context(
+            "Inspect the files",
+            &[
+                "C:\\work\\report.pdf".to_string(),
+                "C:\\work\\screen.png".to_string(),
+            ],
+        );
+        assert!(prompt.starts_with("Inspect the files"));
+        assert!(prompt.contains("C:\\work\\report.pdf"));
+        assert!(prompt.contains("C:\\work\\screen.png"));
+        assert!(prompt.contains("<galcode_attachments>"));
+    }
 }

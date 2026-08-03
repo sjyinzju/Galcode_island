@@ -35,12 +35,25 @@ struct ListDirectoryArgs {
 
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+struct ImportedConversationArgs {
+    id: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ImportedAssetArgs {
+    asset_id: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct StartAgentArgs {
     user_input_zh: String,
     cwd: Option<String>,
     agent: Option<String>,
     run_id: Option<String>,
     session_id: Option<String>,
+    imported_fallback_context: Option<String>,
     permission_mode: Option<String>,
     prompt_override: Option<String>,
 }
@@ -333,6 +346,27 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
             let p: ListDirectoryArgs = parse(args)?;
             to_value(commands::list_directory(p.path)?)
         }
+        "validate_directory" => {
+            let p: ListDirectoryArgs = parse(args)?;
+            commands::validate_directory(p.path.unwrap_or_default())?;
+            Ok(Value::Null)
+        }
+        "list_imported_conversations" => {
+            to_value(commands::list_imported_conversations(app.clone()).await?)
+        }
+        "load_imported_conversation" => {
+            let p: ImportedConversationArgs = parse(args)?;
+            to_value(commands::load_imported_conversation(app.clone(), p.id).await?)
+        }
+        "load_imported_asset" => {
+            let p: ImportedAssetArgs = parse(args)?;
+            to_value(commands::load_imported_asset(app.clone(), p.asset_id).await?)
+        }
+        "remove_imported_conversation" => {
+            let p: ImportedConversationArgs = parse(args)?;
+            commands::remove_imported_conversation(app.clone(), p.id).await?;
+            Ok(Value::Null)
+        }
         "list_sessions" => to_value(commands::list_sessions(app_state)?),
         "start_agent" => {
             let p: StartAgentArgs = parse(args)?;
@@ -346,6 +380,8 @@ pub async fn dispatch(app: AppHandle, cmd: &str, args: Value) -> Result<Value, S
                     p.agent,
                     p.run_id,
                     p.session_id,
+                    p.imported_fallback_context,
+                    None,
                     p.permission_mode,
                     p.prompt_override,
                 )

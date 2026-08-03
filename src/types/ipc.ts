@@ -34,6 +34,11 @@ export interface ErrorPayload {
   code?: string;
 }
 
+export interface ResumeFallbackPayload {
+  sessionId?: string;
+  runId?: string;
+}
+
 /// 后端 list_sessions 命令返回的会话摘要。
 /// 重启 / 多窗口共存 / 调试面板用来"对账"前端 tab 跟后端实际活跃会话。
 export interface SessionSummary {

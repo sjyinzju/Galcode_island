@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lan-sync-projects"
+description = "Enables the lan_sync_projects command without any pre-configured scope."
+commands.allow = ["lan_sync_projects"]
+
+[[permission]]
+identifier = "deny-lan-sync-projects"
+description = "Denies the lan_sync_projects command without any pre-configured scope."
+commands.deny = ["lan_sync_projects"]

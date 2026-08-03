@@ -15,16 +15,44 @@
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useActiveTabActions, useActiveTabField, useActiveTabId } from "../../hooks/useActiveTab";
+import { invoke, isTauri } from "../../lib/bridge";
 import { useTabsStore } from "../../stores/useTabsStore";
 import { useUiStore, type ActiveMatch } from "../../stores/useUiStore";
-import type { CliBlock } from "../../types/blocks";
+import type { CliBlock, CliBlockAttachment } from "../../types/blocks";
+import {
+  SafeMarkdownLink,
+  localFilePathFromHref,
+  requestOpenLocalFile,
+  safeMarkdownUrlTransform,
+} from "../SafeMarkdownLink";
 import { countOccurrences, highlightText } from "./highlight";
 import { ErrorDiagnosisCard } from "./ErrorDiagnosisCard";
+import {
+  ImportedAssetDownloadButton,
+  ImportedImage,
+  copyImageSource,
+  loadImportedAssetSource,
+} from "./ImportedImage";
+import { MessageJumpRail } from "./MessageJumpRail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
+import { PagedImportedValue } from "./PagedImportedValue";
 import { isNearBottom } from "./scrollUtils";
+import {
+  findActiveMessageJump,
+  jumpToMessage,
+  updateMessageJumps,
+  type MessageJumpItem,
+} from "./messageJumps";
+import {
+  formatSourceTime,
+  getPromptCopyMode,
+  getTurnSpacing,
+  requiresAttachmentEditWarning,
+  sourceRoleLabel,
+} from "./blockPresentation";
 
 /// 子组件公共的高亮上下文 prop —— 没 query 时所有子组件渲染行为退化为原状。
 interface HighlightCtx {
@@ -55,7 +83,7 @@ const MD_COMPONENTS: Parameters<typeof ReactMarkdown>[0]["components"] = {
     const isInline = !(className && /^language-/.test(className));
     if (isInline) {
       return (
-        <code className="rounded bg-zinc-200/60 px-1 py-0.5 font-mono text-[10px] text-rose-700 dark:bg-zinc-800/60 dark:text-rose-300">
+        <code className="break-all rounded bg-zinc-200/60 px-1 py-0.5 font-mono text-[10px] text-rose-700 dark:bg-zinc-800/60 dark:text-rose-300">
           {children}
         </code>
       );
@@ -72,15 +100,20 @@ const MD_COMPONENTS: Parameters<typeof ReactMarkdown>[0]["components"] = {
     </pre>
   ),
   a: ({ href, children }) => (
-    <a
+    <SafeMarkdownLink
       href={href}
-      target="_blank"
-      rel="noreferrer noopener"
-      className="text-sky-600 underline hover:text-sky-700 dark:text-sky-400 dark:hover:text-sky-300"
+      className="break-all text-sky-600 underline hover:text-sky-700 dark:text-sky-400 dark:hover:text-sky-300"
     >
       {children}
-    </a>
+    </SafeMarkdownLink>
   ),
+  img: ({ src, alt }) => src ? (
+    <ImportedImage
+      source={src}
+      alt={alt ?? null}
+      className="my-2 max-h-[420px] max-w-full rounded-lg object-contain"
+    />
+  ) : null,
   blockquote: ({ children }) => (
     <blockquote className="my-1 border-l-2 border-zinc-300 pl-2 text-zinc-500 dark:border-zinc-600 dark:text-zinc-400">
       {children}
@@ -107,10 +140,14 @@ const MD_COMPONENTS: Parameters<typeof ReactMarkdown>[0]["components"] = {
   ),
 };
 
-function MarkdownText({ content, className }: { content: string; className?: string }): JSX.Element {
+export function MarkdownText({ content, className }: { content: string; className?: string }): JSX.Element {
   return (
-    <div className={`text-xs leading-relaxed ${className ?? ""}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+    <div className={`min-w-0 text-xs leading-relaxed [overflow-wrap:anywhere] ${className ?? ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={MD_COMPONENTS}
+        urlTransform={safeMarkdownUrlTransform}
+      >
         {content}
       </ReactMarkdown>
     </div>
@@ -151,32 +188,53 @@ function UserPromptBlock({
   block: CliBlock;
   hl: HighlightCtx;
 }): JSX.Element | null {
-  const content = block.content?.trim();
+  const content = block.content?.trim() ?? "";
+  const hasImages = Boolean(block.images?.length);
+  const hasAttachments = Boolean(block.attachments?.length);
   const removeCliBlock = useTabsStore((s) => s.removeCliBlock);
   const activeTabId = useActiveTabId();
   const { update } = useActiveTabActions();
   const bumpInputFocus = useUiStore((s) => s.bumpInputFocus);
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   // 复制反馈：2s 后回到默认图标。useEffect 而不是 setTimeout 闭包，避免组件卸载时野定时器
   useEffect(() => {
-    if (!copied) return;
-    const id = window.setTimeout(() => setCopied(false), 2000);
+    if (copyState === "idle") return;
+    const id = window.setTimeout(() => setCopyState("idle"), 2000);
     return () => window.clearTimeout(id);
-  }, [copied]);
+  }, [copyState]);
 
-  if (!content) return null;
+  if (!content && !hasImages && !hasAttachments) return null;
 
   const handleCopy = async (): Promise<void> => {
+    const mode = getPromptCopyMode(block);
     try {
-      await navigator.clipboard.writeText(content);
-      setCopied(true);
+      let copied = false;
+      if (mode === "text") {
+        copied = await navigator.clipboard.writeText(content).then(() => true);
+      } else if (mode === "image" && block.images?.[0]) {
+        const image = block.images[0];
+        const imageSource = image.dataUrl ?? (
+          image.assetId ? await loadImportedAssetSource(image.assetId) : null
+        );
+        copied = imageSource ? await copyImageSource(imageSource) : false;
+      }
+      setCopyState(copied ? "copied" : "failed");
     } catch {
-      /* 某些 webview 没 clipboard 权限时失败；不弹错——用户能看出图标没变就当失败 */
+      setCopyState("failed");
     }
   };
 
   const handleEdit = (): void => {
+    if (requiresAttachmentEditWarning(block)) {
+      if (!content) {
+        window.alert("这条消息只有附件，当前无法在编辑框中安全重建附件。");
+        return;
+      }
+      if (!window.confirm("这条消息包含附件。继续只会把文字填回输入框，附件不会被静默删除，原消息仍会保留。是否继续？")) {
+        return;
+      }
+    }
     // 同时切回 idle 状态：MainView 在 done/error/running 状态下渲染的是 ResultCard /
     // RunningBubble 而非 InputBubble，光改 task 字段用户看不到回填。把 uiState/mode/
     // agentStatus 都切回 idle 强制让 InputBubble 重新挂载，bumpInputFocus 触发
@@ -199,19 +257,20 @@ function UserPromptBlock({
   };
 
   return (
-    <div className="group flex items-end justify-end gap-1">
+    <div className="group flex min-w-0 items-end justify-end gap-1">
       {/* 操作按钮 — hover 才出现，避免平时干扰阅读 */}
-      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+      <div className="flex items-center gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
         <button
           type="button"
           onClick={() => void handleCopy()}
           aria-label="复制"
-          title={copied ? "已复制" : "复制"}
-          className={`flex h-6 w-6 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-black/5 dark:text-zinc-500 dark:hover:bg-white/5 ${
-            copied ? "text-emerald-500 dark:text-emerald-400" : ""
+          disabled={getPromptCopyMode(block) === "none"}
+          title={copyState === "copied" ? "已复制" : copyState === "failed" ? "复制失败" : "复制"}
+          className={`flex h-9 w-9 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-35 dark:text-zinc-500 dark:hover:bg-white/5 ${
+            copyState === "copied" ? "text-emerald-500 dark:text-emerald-400" : copyState === "failed" ? "text-rose-500" : ""
           }`}
         >
-          {copied ? (
+          {copyState === "copied" ? (
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3 w-3">
               <path d="M2.5 6.5L5 9l4.5-5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
@@ -226,8 +285,8 @@ function UserPromptBlock({
           type="button"
           onClick={handleEdit}
           aria-label="编辑后重发"
-          title="编辑后重发（填回输入框）"
-          className="flex h-6 w-6 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-sky-400/15 hover:text-sky-600 dark:text-zinc-500 dark:hover:text-sky-300"
+          title={requiresAttachmentEditWarning(block) ? "编辑文字（附件会保留在原消息中）" : "编辑后重发（填回输入框）"}
+          className="flex h-9 w-9 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-sky-400/15 hover:text-sky-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-zinc-500 dark:hover:text-sky-300"
         >
           <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
             <path d="M2 10l1-3 5-5 2 2-5 5-3 1z" strokeLinejoin="round" />
@@ -239,34 +298,223 @@ function UserPromptBlock({
           onClick={handleDelete}
           aria-label="从视图删除"
           title="从视图中移除（不影响后端会话历史）"
-          className="flex h-6 w-6 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-rose-400/15 hover:text-rose-500 dark:text-zinc-500 dark:hover:text-rose-400"
+          className="flex h-9 w-9 items-center justify-center rounded text-zinc-400 transition-colors hover:bg-rose-400/15 hover:text-rose-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 dark:text-zinc-500 dark:hover:text-rose-400"
         >
           <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" className="h-3 w-3">
             <path d="M2.5 4h7M5 6.5v2M7 6.5v2M3.5 4l.5 5.5h4l.5-5.5M4.5 4V2.5h3V4" strokeLinecap="round" />
           </svg>
         </button>
       </div>
-      <div className="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-sky-400/35 bg-sky-400/15 px-3 py-1.5 text-[13px] leading-relaxed text-zinc-800 shadow-sm dark:border-sky-300/30 dark:bg-sky-400/15 dark:text-zinc-100">
-        {highlightText(content, hl.query, block.id, "content", hl.activeMatch)}
+      <div className="min-w-0 max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-tr-sm border border-sky-400/35 bg-sky-400/15 px-3 py-1.5 text-[13px] leading-relaxed text-zinc-800 shadow-sm [overflow-wrap:anywhere] dark:border-sky-300/30 dark:bg-sky-400/15 dark:text-zinc-100">
+        <BlockImages images={block.images} />
+        {content ? (
+          <div className={hasImages ? "mt-2" : undefined}>
+            {highlightText(content, hl.query, block.id, "content", hl.activeMatch)}
+          </div>
+        ) : null}
+        <BlockAttachments attachments={block.attachments} />
       </div>
     </div>
   );
 }
 
+export function AttachmentRow({ attachment }: { attachment: CliBlockAttachment }): JSX.Element {
+  const [openError, setOpenError] = useState(false);
+  const localPath = localFilePathFromHref(attachment.localPath ?? attachment.url);
+  const remoteUrl = !attachment.localPath && /^https?:\/\//i.test(attachment.url ?? "")
+    ? attachment.url ?? null
+    : null;
+  const browserRemoteUrl = !isTauri ? remoteUrl : null;
+  const desktopSource = localPath ?? remoteUrl;
+
+  const handleOpen = async (): Promise<void> => {
+    if (!desktopSource) return;
+    setOpenError(false);
+    try {
+      if (localPath) await requestOpenLocalFile(localPath, invoke);
+      else {
+        const opener = await import("@tauri-apps/plugin-opener");
+        await opener.openUrl(desktopSource);
+      }
+    } catch {
+      setOpenError(true);
+    }
+  };
+
+  return (
+    <div className="flex min-h-10 min-w-0 items-center gap-2 rounded-md border border-zinc-300/60 bg-zinc-100/70 px-2 py-1 text-[11px] text-zinc-700 dark:border-zinc-600/60 dark:bg-zinc-800/70 dark:text-zinc-200">
+      <span className="shrink-0" aria-hidden="true">▤</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium">{attachment.name}</span>
+        <span className="block truncate text-[9px] text-zinc-500 dark:text-zinc-400">
+          {openError ? "无法打开附件" : attachment.mediaType}
+        </span>
+      </span>
+      {attachment.dataUrl ? (
+        <a
+          href={attachment.dataUrl}
+          download={attachment.name}
+          className="flex min-h-9 shrink-0 items-center rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
+        >
+          保存
+        </a>
+      ) : attachment.assetId ? (
+        <ImportedAssetDownloadButton
+          assetId={attachment.assetId}
+          fileName={attachment.name}
+          className="min-h-9 shrink-0 rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60 dark:text-sky-300"
+        />
+      ) : browserRemoteUrl ? (
+        <a
+          href={browserRemoteUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          referrerPolicy="no-referrer"
+          className="flex min-h-9 shrink-0 items-center rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
+        >
+          打开
+        </a>
+      ) : isTauri && desktopSource ? (
+        <button
+          type="button"
+          onClick={() => void handleOpen()}
+          className="min-h-9 shrink-0 rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
+        >
+          打开
+        </button>
+      ) : (
+        <span className="shrink-0 text-[9px] text-zinc-400">仅元数据</span>
+      )}
+    </div>
+  );
+}
+
+function BlockAttachments({
+  attachments,
+}: {
+  attachments: CliBlock["attachments"];
+}): JSX.Element | null {
+  if (!attachments?.length) return null;
+  return (
+    <div className="mt-2 flex min-w-0 flex-col gap-1.5" aria-label="附件">
+      {attachments.map((attachment, index) => (
+        <AttachmentRow key={`${attachment.name}:${index}`} attachment={attachment} />
+      ))}
+    </div>
+  );
+}
+
+function BlockImages({ images }: { images: CliBlock["images"] }): JSX.Element | null {
+  if (!images?.length) return null;
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      {images.map((image, index) => (
+        <ImportedImage
+          key={`${image.assetId ?? image.dataUrl ?? index}-${image.alt ?? "image"}`}
+          source={image.dataUrl}
+          assetId={image.assetId}
+          alt={image.alt}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ImageBlock({ block }: { block: CliBlock }): JSX.Element | null {
+  if (!block.images?.length && !block.attachments?.length) return null;
+  return (
+    <div className="flex min-w-0 justify-start">
+      <div className="min-w-0 max-w-[80%]">
+        <BlockImages images={block.images} />
+        <BlockAttachments attachments={block.attachments} />
+      </div>
+    </div>
+  );
+}
+
+export function CollapsibleBlockContent({
+  label,
+  expanded,
+  onToggle,
+  children,
+}: {
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <div className="min-w-0 rounded-md border border-zinc-300/50 bg-zinc-100/45 px-2.5 py-1.5 text-zinc-600 dark:border-zinc-700/60 dark:bg-zinc-800/35 dark:text-zinc-300">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={onToggle}
+        className="flex min-h-7 w-full items-center gap-2 text-left text-[10px] font-medium text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-zinc-400"
+      >
+        <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+        <span>{expanded ? "收起" : "展开"}</span>
+      </button>
+      {expanded ? <div className="mt-1 min-w-0">{children}</div> : null}
+    </div>
+  );
+}
+
+function CollapsibleBlock({
+  label,
+  forceExpanded,
+  children,
+}: {
+  label: string;
+  forceExpanded: boolean;
+  children: React.ReactNode;
+}): JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const visible = forceExpanded || expanded;
+  return (
+    <CollapsibleBlockContent
+      label={label}
+      expanded={visible}
+      onToggle={() => setExpanded((current) => !current)}
+    >
+      {children}
+    </CollapsibleBlockContent>
+  );
+}
+
 function TextBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
   const content = block.content?.trim();
-  if (!content) return null;
+  if (!content && !block.attachments?.length) return null;
   const accent =
     block.tone === "file" ? "text-sky-700 dark:text-sky-300" : "text-zinc-800 dark:text-zinc-100";
-  // 搜索激活时退化为纯文本 + 高亮 mark；无搜索时正常 markdown
-  if (hl.query.trim()) {
+  const isInternalContext = block.sourceRole === "developer" || block.sourceRole === "system";
+  const collapsedLabel = block.collapsedLabel ?? (isInternalContext ? "内部上下文" : null);
+  const text = content
+    ? hl.query.trim()
+      ? (
+          <div className={`min-w-0 whitespace-pre-wrap text-xs leading-relaxed [overflow-wrap:anywhere] ${accent}`}>
+            {highlightText(content, hl.query, block.id, "content", hl.activeMatch)}
+          </div>
+        )
+      : <MarkdownText content={content} className={accent} />
+    : null;
+
+  if (collapsedLabel) {
     return (
-      <div className={`whitespace-pre-wrap text-xs leading-relaxed ${accent}`}>
-        {highlightText(content, hl.query, block.id, "content", hl.activeMatch)}
-      </div>
+      <CollapsibleBlock label={collapsedLabel} forceExpanded={hl.activeMatch?.blockId === block.id}>
+        {text}
+        <BlockAttachments attachments={block.attachments} />
+      </CollapsibleBlock>
     );
   }
-  return <MarkdownText content={content} className={accent} />;
+
+  // 搜索激活时退化为纯文本 + 高亮 mark；无搜索时正常 markdown
+  return (
+    <div className="min-w-0">
+      {text}
+      <BlockAttachments attachments={block.attachments} />
+    </div>
+  );
 }
 
 function ThoughtBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
@@ -274,15 +522,15 @@ function ThoughtBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX
   if (!content) return null;
   if (hl.query.trim()) {
     return (
-      <div className="rounded-md border-l-2 border-zinc-300 bg-zinc-100/40 px-2 py-1 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-800/30 dark:text-zinc-400">
-        <div className="whitespace-pre-wrap text-xs leading-relaxed">
+      <div className="min-w-0 rounded-md border-l-2 border-zinc-300 bg-zinc-100/40 px-2 py-1 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-800/30 dark:text-zinc-400">
+        <div className="whitespace-pre-wrap break-words text-xs leading-relaxed [overflow-wrap:anywhere]">
           {highlightText(content, hl.query, block.id, "content", hl.activeMatch)}
         </div>
       </div>
     );
   }
   return (
-    <div className="rounded-md border-l-2 border-zinc-300 bg-zinc-100/40 px-2 py-1 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-800/30 dark:text-zinc-400">
+    <div className="min-w-0 rounded-md border-l-2 border-zinc-300 bg-zinc-100/40 px-2 py-1 text-zinc-500 dark:border-zinc-700 dark:bg-zinc-800/30 dark:text-zinc-400">
       <MarkdownText content={content} className="text-zinc-500 dark:text-zinc-400" />
     </div>
   );
@@ -416,12 +664,12 @@ function TodoBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
 
 function ConfirmBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element {
   return (
-    <div className="rounded-md border border-amber-400/50 bg-amber-50/70 px-2 py-1.5 text-xs dark:border-amber-300/40 dark:bg-amber-400/10">
+    <div className="min-w-0 rounded-md border border-amber-400/50 bg-amber-50/70 px-2 py-1.5 text-xs dark:border-amber-300/40 dark:bg-amber-400/10">
       <div className="font-semibold text-amber-700 dark:text-amber-300">
         {highlightText(block.title || "需要确认", hl.query, block.id, "title", hl.activeMatch)}
       </div>
       {block.content ? (
-        <div className="mt-0.5 whitespace-pre-wrap text-zinc-700 dark:text-zinc-200">
+        <div className="mt-0.5 whitespace-pre-wrap break-words text-zinc-700 [overflow-wrap:anywhere] dark:text-zinc-200">
           {highlightText(block.content, hl.query, block.id, "content", hl.activeMatch)}
         </div>
       ) : null}
@@ -525,6 +773,7 @@ function ToolBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
   // Task / Skill running 时按秒刷新一次显示耗时；其它工具不需要走 ticker。
   const [now, setNow] = useState(() => Date.now());
   const [stopping, setStopping] = useState(false);
+  const [detailExpanded, setDetailExpanded] = useState(false);
   useEffect(() => {
     if (!isLongRunning || !isRunning) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
@@ -553,61 +802,84 @@ function ToolBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
 
   return (
     <div
-      className={`flex items-center gap-2 rounded-md px-2 py-1 text-[11px] ${palette.container} ${
+      className={`min-w-0 rounded-md px-2 py-1 text-[11px] ${palette.container} ${
         isRunning && isLongRunning ? "shadow-[0_0_12px_rgba(99,102,241,0.25)]" : ""
       }`}
     >
-      <span className={badge.cls}>{badge.label}</span>
-      {palette.icon && (
-        <span className={`shrink-0 ${isRunning && isLongRunning ? "animate-pulse" : ""}`} aria-hidden>
-          {palette.icon}
+      <div className="flex min-h-8 min-w-0 items-center gap-2">
+        <span className={`shrink-0 ${badge.cls}`}>{badge.label}</span>
+        {palette.icon && (
+          <span className={`shrink-0 ${isRunning && isLongRunning ? "animate-pulse" : ""}`} aria-hidden>
+            {palette.icon}
+          </span>
+        )}
+        {server && (
+          <span
+            className="shrink-0 rounded bg-violet-100/80 px-1 font-mono text-[9px] font-medium uppercase tracking-wider text-violet-700 dark:bg-violet-500/15 dark:text-violet-300"
+            title={`MCP server: ${server}`}
+          >
+            {server}
+          </span>
+        )}
+        <span className={`min-w-0 max-w-[35%] truncate font-medium ${palette.toolText}`}>
+          {highlightText(tool, hl.query, block.id, "tool", hl.activeMatch)}
         </span>
+        {block.detail ? (
+          <span className="min-w-0 flex-1 truncate text-zinc-500 dark:text-zinc-400">
+            {highlightText(block.detail, hl.query, block.id, "detail", hl.activeMatch)}
+          </span>
+        ) : null}
+        {block.message ? (
+          <span className="min-w-0 flex-1 truncate text-rose-600 dark:text-rose-400">
+            {highlightText(block.message, hl.query, block.id, "message", hl.activeMatch)}
+          </span>
+        ) : null}
+        {(block.detail || block.detailValue !== undefined) && (
+          <button
+            type="button"
+            aria-expanded={detailExpanded}
+            onClick={(event) => {
+              event.stopPropagation();
+              setDetailExpanded((value) => !value);
+            }}
+            className="min-h-8 shrink-0 rounded-md px-2 font-medium text-sky-700 hover:bg-sky-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:text-sky-300"
+          >
+            {detailExpanded ? "收起" : "查看完整结果"}
+          </button>
+        )}
+        {elapsedText && (
+          <span
+            className={`shrink-0 rounded px-1 font-mono text-[10px] tabular-nums ${
+              isRunning
+                ? "bg-amber-100/80 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300"
+                : "bg-zinc-100/80 text-zinc-500 dark:bg-zinc-700/40 dark:text-zinc-400"
+            }`}
+            title={isRunning ? "进行中耗时" : "总耗时"}
+          >
+            {isRunning ? "⏱ " : ""}{elapsedText}
+          </span>
+        )}
+        {isRunning && isLongRunning && (
+          <button
+            type="button"
+            onClick={() => void handleStop()}
+            disabled={stopping}
+            title="停止当前整个 turn（Claude SDK 暂不支持单独取消子代理）"
+            aria-label="Stop"
+            className="min-h-8 shrink-0 rounded-md border border-rose-300/60 bg-rose-50/80 px-2 text-[10px] font-bold text-rose-700 transition-colors hover:bg-rose-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-400/40 dark:bg-rose-500/15 dark:text-rose-300 dark:hover:bg-rose-500/25"
+          >
+            {stopping ? "…" : "✕"}
+          </button>
+        )}
+      </div>
+      {detailExpanded && (block.detail || block.detailValue !== undefined) && (
+        <PagedImportedValue
+          value={block.detailValue ?? block.detail ?? ""}
+          fileName="imported-tool-result.txt"
+          className="mt-1 border-t border-black/10 pt-1 dark:border-white/10"
+        />
       )}
-      {server && (
-        <span
-          className="shrink-0 rounded bg-violet-100/80 px-1 font-mono text-[9px] font-medium uppercase tracking-wider text-violet-700 dark:bg-violet-500/15 dark:text-violet-300"
-          title={`MCP server: ${server}`}
-        >
-          {server}
-        </span>
-      )}
-      <span className={`font-medium ${palette.toolText}`}>
-        {highlightText(tool, hl.query, block.id, "tool", hl.activeMatch)}
-      </span>
-      {block.detail ? (
-        <span className="truncate text-zinc-500 dark:text-zinc-400">
-          {highlightText(block.detail, hl.query, block.id, "detail", hl.activeMatch)}
-        </span>
-      ) : null}
-      {block.message ? (
-        <span className="truncate text-rose-600 dark:text-rose-400">
-          {highlightText(block.message, hl.query, block.id, "message", hl.activeMatch)}
-        </span>
-      ) : null}
-      {elapsedText && (
-        <span
-          className={`ml-auto shrink-0 rounded px-1 font-mono text-[10px] tabular-nums ${
-            isRunning
-              ? "bg-amber-100/80 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300"
-              : "bg-zinc-100/80 text-zinc-500 dark:bg-zinc-700/40 dark:text-zinc-400"
-          }`}
-          title={isRunning ? "进行中耗时" : "总耗时"}
-        >
-          {isRunning ? "⏱ " : ""}{elapsedText}
-        </span>
-      )}
-      {isRunning && isLongRunning && (
-        <button
-          type="button"
-          onClick={() => void handleStop()}
-          disabled={stopping}
-          title="停止当前整个 turn（Claude SDK 暂不支持单独取消子代理）"
-          aria-label="Stop"
-          className="shrink-0 rounded-md border border-rose-300/60 bg-rose-50/80 px-1.5 py-0.5 text-[10px] font-bold text-rose-700 transition-colors hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-400/40 dark:bg-rose-500/15 dark:text-rose-300 dark:hover:bg-rose-500/25"
-        >
-          {stopping ? "…" : "✕"}
-        </button>
-      )}
+      <BlockAttachments attachments={block.attachments} />
     </div>
   );
 }
@@ -694,13 +966,13 @@ function StderrBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.
 function FileBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element {
   const badge = statusBadge(block.status);
   return (
-    <div className="flex items-center gap-2 rounded-md border-l-2 border-sky-400/50 bg-sky-50/40 px-2 py-1 text-[11px] dark:border-sky-300/30 dark:bg-sky-400/5">
-      <span className={badge.cls}>{badge.label}</span>
-      <span className="font-medium text-zinc-700 dark:text-zinc-200">
+    <div className="flex min-w-0 items-center gap-2 rounded-md border-l-2 border-sky-400/50 bg-sky-50/40 px-2 py-1 text-[11px] dark:border-sky-300/30 dark:bg-sky-400/5">
+      <span className={`shrink-0 ${badge.cls}`}>{badge.label}</span>
+      <span className="shrink-0 font-medium text-zinc-700 dark:text-zinc-200">
         {highlightText(block.tool || "file", hl.query, block.id, "tool", hl.activeMatch)}
       </span>
       {block.path ? (
-        <span className="truncate font-mono text-sky-700 dark:text-sky-300">
+        <span className="min-w-0 flex-1 truncate font-mono text-sky-700 dark:text-sky-300">
           {highlightText(block.path, hl.query, block.id, "path", hl.activeMatch)}
         </span>
       ) : null}
@@ -711,8 +983,20 @@ function FileBlock({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
 function StatusLine({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
   const msg = block.message?.trim();
   if (!msg) return null;
+  if (block.collapsedLabel) {
+    return (
+      <CollapsibleBlock
+        label={block.collapsedLabel}
+        forceExpanded={hl.activeMatch?.blockId === block.id}
+      >
+        <div className="break-words text-[11px] italic text-zinc-500 [overflow-wrap:anywhere] dark:text-zinc-400">
+          {highlightText(msg, hl.query, block.id, "message", hl.activeMatch)}
+        </div>
+      </CollapsibleBlock>
+    );
+  }
   return (
-    <div className="text-[11px] italic text-zinc-500 dark:text-zinc-400">
+    <div className="break-words text-[11px] italic text-zinc-500 [overflow-wrap:anywhere] dark:text-zinc-400">
       {highlightText(msg, hl.query, block.id, "message", hl.activeMatch)}
     </div>
   );
@@ -732,7 +1016,39 @@ function ErrorLine({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.El
   );
 }
 
-function BlockRenderer({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JSX.Element | null {
+function shouldShowSourceMeta(block: CliBlock, previous: CliBlock | undefined): boolean {
+  if (!block.sourceRole && !block.sourceTimestamp && !block.importedConversationId) return false;
+  if (!previous) return true;
+  if (block.sourceTurnId) return block.sourceTurnId !== previous.sourceTurnId;
+  if (block.sourceMessageId) return block.sourceMessageId !== previous.sourceMessageId;
+  return block.sourceRole !== previous.sourceRole || block.sourceTimestamp !== previous.sourceTimestamp;
+}
+
+function BlockSourceMeta({ block }: { block: CliBlock }): JSX.Element | null {
+  const role = sourceRoleLabel(block.sourceRole);
+  const time = formatSourceTime(block.sourceTimestamp);
+  const origin = block.importedConversationId ? "导入" : block.backend;
+  if (!role && !time && !origin) return null;
+  return (
+    <div className={`mb-1 flex items-center gap-1 text-[9px] text-zinc-400 dark:text-zinc-500 ${
+      block.sourceRole === "user" ? "justify-end" : "justify-start"
+    }`}>
+      {[origin, role, time].filter(Boolean).map((value, index) => (
+        <span key={`${value}:${index}`}>
+          {index > 0 ? "· " : ""}{value}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const BlockRenderer = memo(function BlockRenderer({
+  block,
+  hl,
+}: {
+  block: CliBlock;
+  hl: HighlightCtx;
+}): JSX.Element | null {
   switch (block.type) {
     case "user-prompt":
       return <UserPromptBlock block={block} hl={hl} />;
@@ -758,12 +1074,14 @@ function BlockRenderer({ block, hl }: { block: CliBlock; hl: HighlightCtx }): JS
       return <ErrorLine block={block} hl={hl} />;
     case "stderr":
       return <StderrBlock block={block} hl={hl} />;
+    case "image":
+      return <ImageBlock block={block} />;
     case "permission-request":
       return <PermissionRequestBlock block={block} />;
     default:
       return null;
   }
-}
+});
 
 /// 单个 block 行的初始高度估计——只在 virtualizer 还没 measure 真实高度时用，
 /// 之后会被 ResizeObserver 自动校正。给个偏小的中位数让首屏渲染快一点，
@@ -780,8 +1098,37 @@ export function BlockStream(): JSX.Element | null {
   const detailBlockId = useUiStore((s) => s.detailBlock?.id ?? null);
   const searchQuery = useUiStore((s) => s.searchQuery);
   const activeMatch = useUiStore((s) => s.activeMatch);
+  const messageJumpCacheRef = useRef<{
+    tabId: string | null;
+    blocks: CliBlock[];
+    items: MessageJumpItem[];
+  }>({ tabId: null, blocks: [], items: [] });
+  const messageJumps = useMemo(() => {
+    const previous = messageJumpCacheRef.current;
+    const items = previous.tabId === activeTabId
+      ? updateMessageJumps(previous.blocks, previous.items, blocks)
+      : updateMessageJumps([], [], blocks);
+    messageJumpCacheRef.current = { tabId: activeTabId, blocks, items };
+    return items;
+  }, [activeTabId, blocks]);
+  const [activeMessageJumpId, setActiveMessageJumpId] = useState<string | null>(null);
 
-  const hl: HighlightCtx = searchQuery ? { query: searchQuery, activeMatch } : NO_HIGHLIGHT;
+  useEffect(() => {
+    if (messageJumps.length === 0) {
+      setActiveMessageJumpId(null);
+      return;
+    }
+    setActiveMessageJumpId((current) =>
+      current && messageJumps.some((item) => item.blockId === current)
+        ? current
+        : messageJumps[0]!.blockId
+    );
+  }, [messageJumps]);
+
+  const hl = useMemo<HighlightCtx>(
+    () => (searchQuery ? { query: searchQuery, activeMatch } : NO_HIGHLIGHT),
+    [searchQuery, activeMatch],
+  );
 
   // 虚拟列表滚动容器：parentRef 给 useVirtualizer 用，stickToBottomRef 跟踪
   // "用户是否仍在底部附近"——key={activeTabId} 让切 tab 时整个容器重挂载，
@@ -789,17 +1136,15 @@ export function BlockStream(): JSX.Element | null {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
 
-  /// blockId → 数组下标的反向索引，加速 cmd+f 跳转时的查找（O(1) 替代 findIndex 的 O(N)）。
-  /// 流式期间 blocks 数组每次都换引用，useMemo 会重建——但重建本身是 O(N) 跟 findIndex 一样，
-  /// 多次查找时仍有节省。
-  const blockIdToIndex = useMemo(() => {
-    const m = new Map<string, number>();
-    for (let i = 0; i < blocks.length; i += 1) {
-      const b = blocks[i];
-      if (b) m.set(b.id, i);
-    }
-    return m;
-  }, [blocks]);
+  // 只在 cmd+f 真有活动命中时查找。旧实现每个流式增量都会重建整张 Map，
+  // 即使搜索面板从未打开，也会白做一次 O(N) 遍历和分配。
+  const activeMatchBlockId = activeMatch?.blockId ?? null;
+  const activeMatchIndex = useMemo(
+    () => activeMatchBlockId
+      ? blocks.findIndex((block) => block.id === activeMatchBlockId)
+      : -1,
+    [blocks, activeMatchBlockId],
+  );
 
   const virtualizer = useVirtualizer({
     count: blocks.length,
@@ -811,15 +1156,24 @@ export function BlockStream(): JSX.Element | null {
     getItemKey: (index) => blocks[index]?.id ?? String(index),
   });
 
+  const handleMessageJump = (blockId: string): void => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (jumpToMessage(
+      blocks,
+      blockId,
+      (index, options) => virtualizer.scrollToIndex(index, options),
+      stickToBottomRef,
+      reducedMotion ? "auto" : "smooth",
+    )) setActiveMessageJumpId(blockId);
+  };
+
   // cmd+f 命中跳转：把按 ref scrollIntoView 改成 virtualizer.scrollToIndex —— virtualize
   // 后那个 block 可能不在 DOM 里，scrollIntoView 失效。useLayoutEffect 比 useEffect 早一帧，
   // 让滚动跟搜索结果显示同步（避免视觉上"先停一下才跳"）。
   useLayoutEffect(() => {
-    if (!activeMatch) return;
-    const idx = blockIdToIndex.get(activeMatch.blockId);
-    if (idx === undefined) return;
-    virtualizer.scrollToIndex(idx, { align: "center", behavior: "smooth" });
-  }, [activeMatch, blockIdToIndex, virtualizer]);
+    if (activeMatchIndex < 0) return;
+    virtualizer.scrollToIndex(activeMatchIndex, { align: "center", behavior: "smooth" });
+  }, [activeMatchIndex, virtualizer]);
 
   // Auto-scroll-to-bottom：流式 block 到达时，若用户没向上滚走，自动跟到最新。
   // 用 scrollToIndex(length-1, align:end) 让 virtualizer 帮我们处理动态高度——比直接
@@ -834,6 +1188,14 @@ export function BlockStream(): JSX.Element | null {
     const el = parentRef.current;
     if (!el) return;
     stickToBottomRef.current = isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight);
+    const anchor = el.scrollTop + Math.min(120, el.clientHeight * 0.3);
+    const rows = virtualizer.getVirtualItems();
+    const currentRow = rows.find((row) => row.start + row.size >= anchor) ?? rows.at(-1);
+    if (!currentRow) return;
+    const currentId = findActiveMessageJump(messageJumps, currentRow.index);
+    if (currentId) {
+      setActiveMessageJumpId((previous) => previous === currentId ? previous : currentId);
+    }
   };
 
   if (blocks.length === 0) return null;
@@ -844,17 +1206,21 @@ export function BlockStream(): JSX.Element | null {
   // key={activeTabId}：切 tab 时强制滚动容器 + virtualizer 重挂载，scrollTop 自然清零，
   // stickToBottomRef 回到 true（重新挂载默认值），切回该 tab 时自动滚到底。
   return (
-    <div
-      key={activeTabId ?? "no-tab"}
-      ref={parentRef}
-      onScroll={handleScroll}
-      className="h-full overflow-y-auto px-1 py-1 text-xs leading-relaxed"
-    >
+    <div className="relative h-full min-h-0">
+      <div
+        ref={parentRef}
+        onScroll={handleScroll}
+        className={`h-full overflow-x-hidden overflow-y-auto py-1 text-xs leading-relaxed ${
+          messageJumps.length > 1 ? "pl-6 pr-1" : "px-1"
+        }`}
+      >
       {/* 撑出整个虚拟列表的总高度（让滚动条比例正确）；内部 row 用 absolute 定位 */}
-      <div style={{ height: totalSize, position: "relative", width: "100%" }}>
-        {virtualItems.map((vRow) => {
+        <div style={{ height: totalSize, position: "relative", width: "100%" }}>
+          {virtualItems.map((vRow) => {
           const block = blocks[vRow.index];
           if (!block) return null;
+          const previousBlock = blocks[vRow.index - 1];
+          const nextBlock = blocks[vRow.index + 1];
           const clickable = shouldOpenDetailOnClick(block.type);
           const isOpenInRight = detailBlockId === block.id;
           const wrapperCls = [
@@ -882,14 +1248,21 @@ export function BlockStream(): JSX.Element | null {
                 transform: `translateY(${vRow.start}px)`,
                 // 原来用 flex-col gap-2 实现 row 间距；virtualize 后子元素 absolute 定位，
                 // gap 失效——用 paddingBottom 模拟 8px 间距，measureElement 会把这部分算进总高度
-                paddingBottom: "8px",
+                paddingBottom: `${getTurnSpacing(block, nextBlock)}px`,
               }}
             >
+              {shouldShowSourceMeta(block, previousBlock) && <BlockSourceMeta block={block} />}
               <BlockRenderer block={block} hl={hl} />
             </div>
           );
-        })}
+          })}
+        </div>
       </div>
+      <MessageJumpRail
+        items={messageJumps}
+        activeBlockId={activeMessageJumpId}
+        onJump={handleMessageJump}
+      />
     </div>
   );
 }

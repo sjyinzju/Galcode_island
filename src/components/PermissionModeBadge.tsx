@@ -7,10 +7,10 @@
 // 仅 claude-code backend 渲染；其它 backend 不显示（hidden / null 由调用方决定）。
 // 切到 bypassPermissions 时给出一次性提示，避免误触。
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
-import { useActiveTab, useActiveTabActions } from "../hooks/useActiveTab";
+import { useActiveTabActions, useActiveTabField } from "../hooks/useActiveTab";
 import { useAppStore } from "../stores/useAppStore";
 import type { PermissionMode } from "../types/agent";
 
@@ -71,8 +71,11 @@ interface PermissionModeBadgeProps {
   compact?: boolean;
 }
 
-export function PermissionModeBadge({ compact = false }: PermissionModeBadgeProps): JSX.Element | null {
-  const tab = useActiveTab();
+export const PermissionModeBadge = memo(function PermissionModeBadge({
+  compact = false,
+}: PermissionModeBadgeProps): JSX.Element | null {
+  const agent = useActiveTabField("agent");
+  const permissionMode = useActiveTabField("permissionMode");
   const { activeTabId, update } = useActiveTabActions();
   const addLogEntry = useAppStore((s) => s.addLogEntry);
   const [open, setOpen] = useState(false);
@@ -169,9 +172,9 @@ export function PermissionModeBadge({ compact = false }: PermissionModeBadgeProp
   );
 
   // 仅 claude-code 渲染
-  if (!activeTabId || tab.agent !== "claude-code") return null;
+  if (!activeTabId || agent !== "claude-code") return null;
 
-  const current = MODE_META.find((m) => m.value === tab.permissionMode) ?? MODE_META[0];
+  const current = MODE_META.find((m) => m.value === permissionMode) ?? MODE_META[0];
 
   return (
     <div ref={containerRef} className="relative inline-flex">
@@ -253,4 +256,4 @@ export function PermissionModeBadge({ compact = false }: PermissionModeBadgeProp
         )}
     </div>
   );
-}
+});

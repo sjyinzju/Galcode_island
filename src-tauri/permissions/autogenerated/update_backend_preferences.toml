@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-backend-preferences"
+description = "Enables the update_backend_preferences command without any pre-configured scope."
+commands.allow = ["update_backend_preferences"]
+
+[[permission]]
+identifier = "deny-update-backend-preferences"
+description = "Denies the update_backend_preferences command without any pre-configured scope."
+commands.deny = ["update_backend_preferences"]

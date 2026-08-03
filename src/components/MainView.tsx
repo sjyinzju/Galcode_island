@@ -10,30 +10,88 @@
 // 下半部分：InputBubble / RunningBubble / ResultCard 跟过去一致。
 
 import { AnimatePresence, motion } from "framer-motion";
-import { useActiveTab, useActiveTabId } from "../hooks/useActiveTab";
+import { Suspense } from "react";
+import { useActiveTabField, useActiveTabId } from "../hooks/useActiveTab";
 import { PetCharacter } from "./pet-character/PetCharacter";
 
 import { InputBubble } from "./chat-bubble/InputBubble";
 import { ResultCard } from "./chat-bubble/ResultCard";
 import { RunningBubble } from "./chat-bubble/RunningBubble";
-import { StatusMonitor } from "./status-monitor/StatusMonitor";
 import { GlobalOverview } from "./overview/GlobalOverview";
 import { ProjectOverview } from "./overview/ProjectOverview";
 import { useSettingsStore } from "../stores/useSettingsStore";
+import { useTabsStore } from "../stores/useTabsStore";
+import { lazyNamed } from "../lib/lazyNamed";
+import { canContinueImportedConversation } from "../lib/importedConversation";
 
-export function MainView(): JSX.Element {
-  const tab = useActiveTab();
-  const activeTabId = useActiveTabId();
-  const petEnabled = useSettingsStore((s) => s.petEnabled);
-  const uiState = tab.uiState;
-  const mode = tab.mode;
-  const cliBlockCount = tab.cliBlocks.length;
-  // 完成后保留 StatusMonitor 让 BlockStream 历史可见，跟 ResultCard 共存。
-  const showStatus =
-    uiState === "running" ||
+const StatusMonitor = lazyNamed(
+  () => import("./status-monitor/StatusMonitor"),
+  "StatusMonitor",
+);
+
+export function shouldShowConversationStatus(
+  uiState: string,
+  mode: string,
+  cliBlockCount: number,
+  importedConversationId: string | null,
+  hasFullImportedHistory: boolean,
+): boolean {
+  return uiState === "running" ||
     mode === "working" ||
     mode === "thinking" ||
-    cliBlockCount > 0;
+    cliBlockCount > 0 ||
+    Boolean(importedConversationId && !hasFullImportedHistory);
+}
+
+export type ImportedHistoryControlState = "ready" | "loading" | "error";
+
+export function importedHistoryControlState(
+  importedConversationId: string | null,
+  hasFullImportedHistory: boolean,
+  importedHistoryError: string | null,
+): ImportedHistoryControlState {
+  if (canContinueImportedConversation(importedConversationId, hasFullImportedHistory)) {
+    return "ready";
+  }
+  return importedHistoryError ? "error" : "loading";
+}
+
+export function MainView(): JSX.Element {
+  const activeTabId = useActiveTabId();
+  const petEnabled = useSettingsStore((s) => s.petEnabled);
+  const uiState = useActiveTabField("uiState");
+  const mode = useActiveTabField("mode");
+  const importedConversationId = useActiveTabField("importedConversationId");
+  const hasFullImportedHistory = useActiveTabField("hasFullImportedHistory");
+  const importedHistoryError = useActiveTabField("importedHistoryError");
+  const cliBlockCount = useTabsStore((state) => {
+    const tab = state.activeTabId ? state.tabs[state.activeTabId] : null;
+    return tab?.cliBlocks.length ?? 0;
+  });
+  // 完成后保留 StatusMonitor 让 BlockStream 历史可见，跟 ResultCard 共存。
+  const showStatus = shouldShowConversationStatus(
+    uiState,
+    mode,
+    cliBlockCount,
+    importedConversationId,
+    hasFullImportedHistory,
+  );
+  const historyControlState = importedHistoryControlState(
+    importedConversationId,
+    hasFullImportedHistory,
+    importedHistoryError,
+  );
+  const canContinueConversation = historyControlState === "ready";
+  const retryImportedHistory = (): void => {
+    if (!activeTabId) return;
+    const state = useTabsStore.getState();
+    const tab = state.tabs[activeTabId];
+    if (!tab?.importedConversationId || tab.hasFullImportedHistory) return;
+    state.updateTab(activeTabId, {
+      importedHistoryError: null,
+      importedHistoryRevision: tab.importedHistoryRevision + 1,
+    });
+  };
   // 没有活动 tab → 走全局概览（替代旧 WelcomeView 整屏画面）；
   // 此时下方的 InputBubble / RunningBubble / ResultCard 都不渲染，
   // 用户通过 Overview 内置的"选择项目目录"按钮启动第一个 tab。
@@ -88,7 +146,9 @@ export function MainView(): JSX.Element {
             transition={{ duration: 0.3 }}
             className="flex min-h-0 flex-1 flex-col overflow-hidden"
           >
-            <StatusMonitor />
+            <Suspense fallback={null}>
+              <StatusMonitor />
+            </Suspense>
           </motion.div>
         )}
       </AnimatePresence>
@@ -97,7 +157,7 @@ export function MainView(): JSX.Element {
           桌面端：外层桌宠 + 气泡横排；移动端：外层桌宠隐藏（嵌入卡片头部）。
           卡片内部 summary 自带 max-h-[35vh] cap，避免长内容撑爆。
           没有活动 tab 时整块隐藏 —— 此时由 GlobalOverview 提供启动入口。 */}
-      {!showGlobalOverview && (
+      {!showGlobalOverview && (canContinueConversation ? (
         // sm:min-h-[220px] 是给桌宠立绘留的高度，萌宠关闭时去掉，避免气泡上方一段空白
         <div className={`relative flex w-full shrink-0 flex-col items-stretch gap-2 sm:flex-row sm:items-end sm:gap-3 ${petEnabled ? "sm:min-h-[220px]" : ""}`}>
           {/* 戳戳气泡 absolute 在 PetCharacter 内部，z-50。但 ResultCard 外层
@@ -128,7 +188,32 @@ export function MainView(): JSX.Element {
             </AnimatePresence>
           </div>
         </div>
-      )}
+      ) : (
+        <div
+          role={historyControlState === "error" ? "alert" : "status"}
+          aria-live="polite"
+          className={`flex min-h-16 w-full shrink-0 items-center justify-center rounded-xl border px-4 py-3 text-center text-sm ${
+            historyControlState === "error"
+              ? "border-rose-300/50 bg-rose-50/70 text-rose-700 dark:border-rose-300/20 dark:bg-rose-400/10 dark:text-rose-200"
+              : "border-sky-400/20 bg-sky-400/[0.06] text-zinc-600 dark:border-sky-300/15 dark:text-zinc-300"
+          }`}
+        >
+          {historyControlState === "error" ? (
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <span>{importedHistoryError}</span>
+              <button
+                type="button"
+                onClick={retryImportedHistory}
+                className="min-h-10 rounded-lg border border-rose-400/40 px-3 py-2 font-medium transition-colors hover:bg-rose-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+              >
+                重新加载
+              </button>
+            </div>
+          ) : (
+            "正在加载完整历史，加载完成后即可继续对话…"
+          )}
+        </div>
+      ))}
     </motion.section>
   );
 }

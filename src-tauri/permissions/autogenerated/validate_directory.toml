@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-validate-directory"
+description = "Enables the validate_directory command without any pre-configured scope."
+commands.allow = ["validate_directory"]
+
+[[permission]]
+identifier = "deny-validate-directory"
+description = "Denies the validate_directory command without any pre-configured scope."
+commands.deny = ["validate_directory"]

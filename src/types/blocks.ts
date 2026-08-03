@@ -26,6 +26,7 @@ export type CliBlockType =
   | "status"
   | "error"
   | "stderr"
+  | "image"
   /// 用户原始 prompt：前端启动 turn 时自己 append 进去（不来自 backend），
   /// 流式区右对齐渲染成蓝色气泡。多轮会话能看清"用户 / agent"交替顺序。
   | "user-prompt"
@@ -39,6 +40,21 @@ export interface CliTodoItem {
   status: string;         // "pending" | "running" | "success" | ...
 }
 
+export interface CliBlockImage {
+  dataUrl?: string;
+  assetId?: string;
+  alt: string | null;
+}
+
+export interface CliBlockAttachment {
+  name: string;
+  mediaType: string;
+  dataUrl?: string;
+  assetId?: string;
+  url?: string;
+  localPath?: string;
+}
+
 export interface CliBlock {
   id: string;
   type: CliBlockType;
@@ -49,6 +65,17 @@ export interface CliBlock {
   content?: string;
   message?: string;
   tone?: string;          // text (file 标记)
+  collapsedLabel?: string; // 长内部上下文 / 导入事件默认折叠时显示的短标签
+  isApiError?: boolean; // 导入源明确标记的 API 失败，不应注入续聊上下文
+  images?: CliBlockImage[];
+  attachments?: CliBlockAttachment[];
+
+  // 导入记录的稳定来源信息，用于重导入去重、导航筛选和分轮展示。
+  sourceMessageId?: string;
+  sourceTimestamp?: number;
+  sourceRole?: string;
+  sourceTurnId?: string;
+  importedConversationId?: string;
 
   // command
   command?: string;
@@ -68,6 +95,8 @@ export interface CliBlock {
   tool?: string;
   path?: string;
   detail?: string;
+  /// Imported tool payload kept in its original shape and formatted only after expansion.
+  detailValue?: unknown;
 
   // diff (Claude Edit/MultiEdit/Write)
   diff?: string;          // unified-ish: 行首 +/-/空格

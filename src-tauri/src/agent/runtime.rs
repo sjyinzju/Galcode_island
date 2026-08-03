@@ -290,6 +290,42 @@ pub fn drain_claude_clients(state: &RuntimeState) -> Vec<Arc<ClaudeStreamClient>
     out
 }
 
+/// 只取走「空闲」（无进行中 turn）的 Claude client；正忙的留在 map 里不动。
+///
+/// 用于 cc-switch 等外部工具改写 `~/.claude/settings.json` 后就近重启长驻
+/// 进程：只重置空闲 tab，不打断进行中的对话。检查 `pending_turn` 与 take
+/// 在同一把 map 锁内完成，避免与 ensure_claude_stream_client 竞态。
+///
+/// 返回 `(取走的空闲 client, 是否已无正忙 client 残留)`。后者为 false 时
+/// 说明还有 tab 在跑，调用方应稍后重试。
+pub fn drain_idle_claude_clients(state: &RuntimeState) -> (Vec<Arc<ClaudeStreamClient>>, bool) {
+    let mut out = Vec::new();
+    let mut all_idle = true;
+    let mut map = match state.claude.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for (_, claude) in map.iter_mut() {
+        let busy = claude
+            .client
+            .as_ref()
+            .map(|client| {
+                client
+                    .pending_turn
+                    .lock()
+                    .map(|turn| turn.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if busy {
+            all_idle = false;
+        } else if let Some(client) = claude.client.take() {
+            out.push(client);
+        }
+    }
+    (out, all_idle)
+}
+
 /// 为指定 run_id 分配一个 OpenCode 端口。如指定 requested 端口直接使用并占位；
 /// 否则从 OPENCODE_BASE_PORT 起线性扫描首个未占用端口。
 pub fn allocate_opencode_port(state: &RuntimeState, requested: Option<u16>) -> u16 {

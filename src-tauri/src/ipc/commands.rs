@@ -3,12 +3,18 @@ use crate::agent::codex::{self as codex_agent, CodexModelsResult, CodexStatus, C
 use crate::agent::manager::{self, LaunchResult};
 use crate::agent::opencode::{self as opencode_agent, OpencodeStatus};
 use crate::agent::runtime::{RuntimeState, DEFAULT_RUN_ID};
+use crate::external_history::{
+    self, ExternalSessionPreview, ExternalSessionRef, ImportExternalSessionsResult,
+    ImportedConversation, ImportedConversationSummary,
+};
 use crate::AppState;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +68,139 @@ pub fn list_sessions(state: State<Arc<AppState>>) -> Result<Vec<SessionSummary>,
     // 按最近创建（elapsed 越小越新）排在前面
     summaries.sort_by_key(|s| s.created_at_ms);
     Ok(summaries)
+}
+
+/// Scan the local Codex and Claude Code folders without modifying either source.
+#[tauri::command]
+pub async fn scan_external_sessions() -> Result<Vec<ExternalSessionPreview>, String> {
+    tauri::async_runtime::spawn_blocking(external_history::scan_external_sessions)
+        .await
+        .map_err(|error| format!("External history scan task failed: {error}"))?
+}
+
+/// Copy selected external transcripts into Galcode's own app-data file.
+#[tauri::command]
+pub async fn import_external_sessions(
+    app: AppHandle,
+    selections: Vec<ExternalSessionRef>,
+) -> Result<ImportExternalSessionsResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::import_external_sessions(&app, selections)
+    })
+    .await
+    .map_err(|error| format!("External history import task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn list_imported_conversations(
+    app: AppHandle,
+) -> Result<Vec<ImportedConversationSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::list_imported_conversations(&app)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation list task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn load_imported_conversation(
+    app: AppHandle,
+    id: String,
+) -> Result<ImportedConversation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::load_imported_conversation(&app, &id)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation load task failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn load_imported_asset(app: AppHandle, asset_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::load_imported_asset(&app, &asset_id)
+    })
+    .await
+    .map_err(|error| format!("Imported asset load task failed: {error}"))?
+}
+
+fn is_verbatim_local_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 7
+        && bytes.starts_with(b"\\\\?\\")
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && matches!(bytes[6], b'\\' | b'/')
+}
+
+fn validated_local_file_path(path: &str) -> Result<PathBuf, String> {
+    const SAFE_EXTENSIONS: &[&str] = &[
+        "bmp", "csv", "doc", "docx", "flac", "gif", "jpeg", "jpg", "json", "jsonl", "log", "m4a",
+        "markdown", "md", "mkv", "mov", "mp3", "mp4", "odp", "ods", "odt", "ogg", "pdf", "png",
+        "ppt", "pptx", "rtf", "toml", "tsv", "txt", "wav", "webm", "webp", "xls", "xlsx", "xml",
+        "yaml", "yml",
+    ];
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Local file path must not be empty".to_string());
+    }
+    if path.starts_with(r"\\") || path.starts_with("//") {
+        return Err("Remote and device file paths are not allowed".to_string());
+    }
+    let candidate = PathBuf::from(path);
+    if !candidate.is_absolute() {
+        return Err("Local file path must be absolute".to_string());
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve local file: {error}"))?;
+    let canonical_text = canonical.to_string_lossy();
+    if (canonical_text.starts_with(r"\\") && !is_verbatim_local_drive_path(&canonical_text))
+        || canonical_text.starts_with("//")
+    {
+        return Err("Remote and device file paths are not allowed".to_string());
+    }
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("Could not inspect local file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Local file path must point to a regular file".to_string());
+    }
+    let extension = canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "Local file type is not allowed".to_string())?;
+    if !SAFE_EXTENSIONS.contains(&extension.as_str()) {
+        return Err("Local file type is not allowed".to_string());
+    }
+    #[cfg(windows)]
+    if is_verbatim_local_drive_path(&canonical_text) {
+        return Ok(PathBuf::from(&canonical_text[4..]));
+    }
+    Ok(canonical)
+}
+
+/// Open an existing local file from the desktop webview.
+///
+/// This command is deliberately not exposed through the LAN dispatcher: a browser client must
+/// never be able to ask the host machine to open an arbitrary path.
+#[tauri::command]
+pub async fn open_local_file(app: AppHandle, path: String) -> Result<(), String> {
+    let path = tauri::async_runtime::spawn_blocking(move || validated_local_file_path(&path))
+        .await
+        .map_err(|error| format!("Local file validation task failed: {error}"))??;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<String>)
+        .map_err(|error| format!("Could not open local file: {error}"))
+}
+
+#[tauri::command]
+pub async fn remove_imported_conversation(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        external_history::remove_imported_conversation(&app, &id)
+    })
+    .await
+    .map_err(|error| format!("Imported conversation removal task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -146,6 +285,18 @@ pub fn list_directory(path: Option<String>) -> Result<DirectoryListing, String> 
         parent,
         entries,
     })
+}
+
+#[tauri::command]
+pub fn validate_directory(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(path.trim());
+    if !target.exists() {
+        return Err(format!("Directory does not exist: {}", target.display()));
+    }
+    if !target.is_dir() {
+        return Err(format!("Path is not a directory: {}", target.display()));
+    }
+    Ok(())
 }
 
 /// 项目 / 用户 / 插件级斜杠命令元数据。
@@ -409,6 +560,8 @@ pub async fn start_agent(
     // 可选：前端持久化的 tab.sessionId（重启 app 后内存 last_session_per_context
     // 是空的，前端 localStorage 留着 sessionId，传过来当 resume hint）。
     session_id: Option<String>,
+    imported_fallback_context: Option<String>,
+    attachment_paths: Option<Vec<String>>,
     // 仅 claude-code 使用：Claude CLI 的 --permission-mode 参数值，
     // 来自 tab.permissionMode（Shift+Tab 切换 / 全局默认）。其它 backend 忽略此参数。
     permission_mode: Option<String>,
@@ -456,6 +609,8 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            imported_fallback_context,
+            attachment_paths.unwrap_or_default(),
             permission_mode,
             prompt_override,
         ),
@@ -467,6 +622,7 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            attachment_paths.unwrap_or_default(),
             prompt_override,
         ),
         "codex" => manager::launch_codex_agent(
@@ -477,6 +633,8 @@ pub async fn start_agent(
             cwd,
             user_input_zh,
             session_id,
+            imported_fallback_context,
+            attachment_paths.unwrap_or_default(),
             prompt_override,
         ),
         _ => Err(format!("暂不支持的 agent 类型: {}", agent_type)),
@@ -1491,4 +1649,36 @@ pub fn lan_remove_storage(
     }
     crate::lan::shared_storage::schedule_save(&app, lan.inner());
     Ok(())
+}
+
+#[cfg(test)]
+mod local_file_tests {
+    use super::validated_local_file_path;
+    use std::fs;
+
+    #[test]
+    fn validates_only_existing_absolute_regular_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "galcode-local-file-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&directory).expect("create test directory");
+        let file = directory.join("report.pdf");
+        fs::write(&file, b"pdf").expect("create test file");
+        let executable = directory.join("run.exe");
+        fs::write(&executable, b"not executable").expect("create blocked file");
+
+        let validated =
+            validated_local_file_path(file.to_string_lossy().as_ref()).expect("valid file");
+        #[cfg(windows)]
+        assert_eq!(validated, file);
+        #[cfg(not(windows))]
+        assert_eq!(validated, file.canonicalize().expect("canonical file"));
+        assert!(validated_local_file_path("report.pdf").is_err());
+        assert!(validated_local_file_path(directory.to_string_lossy().as_ref()).is_err());
+        assert!(validated_local_file_path(executable.to_string_lossy().as_ref()).is_err());
+        assert!(validated_local_file_path(r"\\server\share\report.pdf").is_err());
+
+        fs::remove_dir_all(directory).ok();
+    }
 }
